@@ -60,6 +60,50 @@ CREATE TABLE silver.sap_knkk (
     CONSTRAINT PK_silver_sap_knkk PRIMARY KEY (mandante, cliente_id, area_control_credito)
 );
 
+
+
+-- ==========================================================
+-- 4. DATOS AREA DE VENTAS (silver.sap_knvv)
+-- ==========================================================
+IF OBJECT_ID('silver.sap_knvv', 'U') IS NOT NULL DROP TABLE silver.sap_knvv;
+CREATE TABLE silver.sap_knvv (
+    mandante               VARCHAR(3)   NOT NULL,
+    cliente_id             VARCHAR(10)  NOT NULL,
+    organizacion_ventas    VARCHAR(4)   NOT NULL,
+    canal_distribucion     VARCHAR(2)   NOT NULL,
+    sector                 VARCHAR(2)   NOT NULL,
+    
+    -- Organización y Estructura Comercial
+    oficina_ventas         VARCHAR(4),   -- VKBUR (Oficina de ventas)
+    grupo_ventas           VARCHAR(3),   -- VKGRP (Grupo de vendedores)
+    distrito_ventas        VARCHAR(6),   -- BZIRK (Distrito / Región de ventas)
+    centro_suministrador   VARCHAR(4),   -- VWERK (Centro / Almacén por defecto)
+    
+    -- Clasificación y Categorías
+    grupo_clientes         VARCHAR(2),   -- KDGRP (Grupo de clientes)
+    esquema_precios        VARCHAR(2),   -- PLTYP (Tipo de tarifa/lista de precios)
+    grupo_condiciones      VARCHAR(2),   -- KONDA (Grupo de condiciones)
+    clasificacion_abc      VARCHAR(2),   -- KLABC (Clasificación ABC de cliente)
+    
+    -- Condiciones Financieras y Crédito
+    condicion_pago         VARCHAR(4),   -- ZTERM (Condiciones de pago / Días de crédito)
+    moneda                 VARCHAR(5),   -- WAERS (Moneda del área de ventas)
+    area_control_credito   VARCHAR(4),   -- KKBER (Área de control de crédito asociada)
+    
+    -- Bloqueos y Marcas de Control
+    bloqueo_entrega        VARCHAR(2),   -- LIFSD (Bloqueo de entrega)
+    bloqueo_factura        VARCHAR(2),   -- FAKSD (Bloqueo de facturación)
+    bloqueo_pedido         VARCHAR(2),   -- AUFSD (Bloqueo de pedidos)
+    peticion_borrado       VARCHAR(1),   -- LOEVM (Petición de borrado a nivel área ventas)
+    
+    -- Fechas y Auditoría
+    fecha_creacion         DATE,         -- ERDAT (Fecha de alta)
+    creado_por             VARCHAR(12),  -- ERNAM (Usuario creador)
+    fecha_carga            DATETIME DEFAULT GETDATE(),
+    
+    CONSTRAINT PK_silver_sap_knvv PRIMARY KEY (mandante, cliente_id, organizacion_ventas, canal_distribucion, sector)
+);
+    
 -- ==========================================================
 -- 4. PARTIDAS ABIERTAS (silver.sap_bsid)
 -- ==========================================================
