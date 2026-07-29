@@ -109,7 +109,7 @@ BEGIN
             TRIM(MANDT), -- mandante
             TRIM(KUNNR), -- codigo cliente
             TRIM(KNKLI), -- codigo padre
-            TRIM(KKBER), --
+            TRIM(KKBER), -- sociedad
             ISNULL(KLIMK, 0), --limite de credito
             ISNULL(SKFOR, 0), -- monto de facturas abiertas 
             ISNULL(SAUFT, 0), -- monto de pedidos aun no facturados
@@ -122,11 +122,10 @@ BEGIN
             TRIM(NXTRV), -- fecha de proxima revision limite de credito
             TRIM(KRAUS), -- etiqueta creditoc, contadoloc, etc
             TRIM(SBGRT), --investigacion cliente (revisar si cuenta con propiedades)
-            TRIM(REVDB), 
+            TRIM(REVDB), --fecha que se cambio a credito o a contado
             TRIM(AEDAT), -- fecha de ultima modicacion en datos de credito de cliente
-            TRIM(AETXT),
             TRIM(AENAM), -- persona que hizo la ultima modificacion en datos de credito de cliente
-            TRIM(SBDAT),
+            TRIM(SBDAT), -- fecha proxima verificacion (se vence el pagare)
             TRIM(KDGRP), -- pagare, contrato, negativa, etc
             TRIM(CASHD), -- fecha de ultimo pago 
             TRIM(CASHA), -- monto del ultimo pago
