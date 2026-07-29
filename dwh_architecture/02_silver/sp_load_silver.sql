@@ -142,8 +142,8 @@ BEGIN
 
 
 
-    -- ==========================================
-    -- 4. LIMPIEZA: KNVV (Límites de Crédito)
+-- ==========================================
+    -- LIMPIEZA Y CARGA: KNVV (Ventas por Cliente)
     -- ==========================================
     BEGIN TRY
         SET @start_time = GETDATE();
@@ -152,16 +152,58 @@ BEGIN
         TRUNCATE TABLE silver.sap_knvv;
 
         INSERT INTO silver.sap_knvv (
- 
+            mandante,
+            cliente_id,
+            organizacion_ventas,
+            canal_distribucion,
+            sector,
+            oficina_ventas,
+            grupo_ventas,
+            distrito_ventas,
+            centro_suministrador,
+            grupo_clientes,
+            esquema_precios,
+            grupo_condiciones,
+            clasificacion_abc,
+            condicion_pago,
+            moneda,
+            area_control_credito,
+            bloqueo_entrega,
+            bloqueo_factura,
+            bloqueo_pedido,
+            peticion_borrado,
+            fecha_creacion,
+            creado_por
         )
         SELECT 
-            TRIM(MANDT), -- mandante
-            TRIM(KUNNR), -- codigo cliente
-            TRIM(VKORG), --
-            TRIM(VTWEG), --
+            TRIM(MANDT) AS mandante, --mandante
+            TRIM(KUNNR) AS cliente_id, -- id cliente
+            TRIM(VKORG) AS organizacion_ventas, -- organizacion de ventas
+            TRIM(VTWEG) AS canal_distribucion, -- canal
+            TRIM(SPART) AS sector, -- sector
+            TRIM(VKBUR) AS oficina_ventas, -- oficina de ventas
+            TRIM(VKGRP) AS grupo_vendedores, -- grupo vendedores
+            TRIM(BZIRK) AS region, --region
+            TRIM(KGR1) AS ruta, --codigo sap de la ruta
+            TRIM(VWERK) AS centro_suministrador, -- centro suministrador
+            TRIM(KDGRP) AS grupo_clientes, -- grupo de clientes
+            TRIM(KONDA) AS grupo_precios, -- grupo preciosa
+            TRIM(PLTYP) AS lista_precios, -- lista preciosa
+            TRIM(INCO1) AS  incoterm, -- incoterm codigo
+            TRIM(INCO2) AS incoterm_descripcion, --incoterm_descripcion
+            TRIM(ANTLF) AS entregas_parciales_max, -- entregas parciales maximas
+            TRIM(LPRIO) AS prioridad_entrega, -- prioridad entrrga
+            TRIM(ZTERM) AS condicion_pago, --condicion pago
+            TRIM(WAERS) AS moneda, --moneda
+            TRIM(KVGR2) AS tiempo_entrega, -- tiempo de entrega
+            TRIM(KVGR3) AS tipo_servicio, --tipo de servicio paqueteria
+            TRIM(KVGR4) AS tipo_servicio_2, -- tipo de servicio paqueteria 2
+            TRIM(LIFSD) AS bloqueo_entrega, --bloqueo de entrega
+            TRIM(FAKSD) AS bloqueo_factura, -- bloqueo de facturacion
+            TRIM(AUFSD) AS bloqueo_pedido, -- bloqueo de pedido
             
-
-            
+            TRY_CONVERT(DATE, NULLIF(TRIM(ERDAT), '00000000'), 112) AS fecha_creacion,
+            TRIM(ERNAM) AS creado_por
         FROM bronze.sap_knvv WITH (NOLOCK);
 
         SET @end_time = GETDATE();
