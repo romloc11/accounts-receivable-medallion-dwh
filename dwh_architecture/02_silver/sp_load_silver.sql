@@ -230,21 +230,27 @@ BEGIN
             asignacion, condicion_pago
         )
         SELECT 
-            TRIM(MANDT),
-            TRIM(BUKRS),
-            TRIM(KUNNR),
-            GJAHR,
-            TRIM(BELNR),
-            BUZEI,
-            TRY_CONVERT(DATE, NULLIF(TRIM(BUDAT), '00000000'), 112),
-            TRY_CONVERT(DATE, NULLIF(TRIM(BLDAT), '00000000'), 112),
-            TRY_CONVERT(DATE, NULLIF(TRIM(ZFBDT), '00000000'), 112),
-            TRIM(BLART),
-            ISNULL(DMBTR, 0),
-            ISNULL(WRBTR, 0),
-            TRIM(WAERS),
-            TRIM(ZUONR),
-            TRIM(ZTERM)
+            TRIM(MANDT), -- mandante 
+            TRIM(BUKRS), -- sociedad
+            TRIM(KUNNR), -- id cliente
+            GJAHR, --año del documento
+            MONAT, -- mes del documento 
+            TRIM(BELNR), -- id del documento no compensado
+            TRIM(ZUONR), --id del documento de donde nacio (aplica para notas de credito) 
+            TRIM(XBLNR), --id referencia 
+            BUZEI, --conteo de BELNR 
+            TRY_CONVERT(DATE, NULLIF(TRIM(BUDAT), '00000000'), 112), --fecha contabilizacion
+            TRY_CONVERT(DATE, NULLIF(TRIM(BLDAT), '00000000'), 112), -- fecha documento
+            TRY_CONVERT(DATE, NULLIF(TRIM(CPUDT), '00000000'), 112), -- fecha registro sistema
+            TRY_CONVERT(DATE, NULLIF(TRIM(ZFBDT), '00000000'), 112), -- fecha vencimiento
+            TRIM(BLART), -- tipo documento (dz, f4, c1, etc)
+            TRIM(SHKZG), -- Debe o haber 
+            ISNULL(DMBTR, 0), -- monto en moneda mexicana
+            ISNULL(WRBTR, 0), -- monto en moneda original
+            TRIM(WAERS), -- moneda
+            TRIM(ZTERM), -- condicion de pago 
+            TRIM(ZBD1T), -- dias plazo 
+            
         FROM bronze.sap_bsid WITH (NOLOCK);
 
         SET @end_time = GETDATE();
