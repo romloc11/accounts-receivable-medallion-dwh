@@ -6,12 +6,21 @@ GO
 PROJECT: Enterprise Data Warehouse (dwh-ciosa)
 LAYER: Gold - load procedures for the star schema.
 
-STYLE: one stored procedure per dimension/fact for now (not a single combined
-gold.load_gold like silver's), so each piece can be built and tested in
-isolation before combining - same reasoning as the rest of this project given
-how many unexplained compilation issues this SQL Server 2012 instance has
-produced when things got batched together. May consolidate later once every
-piece is proven.
+STYLE: one stored procedure per dimension/fact, kept separate for isolated
+testing/debugging - same reasoning as the rest of this project given how many
+unexplained compilation issues this SQL Server 2012 instance has produced
+when things got batched together.
+
+CONSOLIDATED 2026-08-20 via gold.load_gold at the bottom of this file - an
+orchestrator that just EXECs the individual procedures below in the correct
+dependency order, so a full refresh is one EXEC instead of remembering 6.
+The individual procedures still exist and can still be run standalone for
+debugging - gold.load_gold adds no logic of its own, only sequencing. This
+EXEC-calling-proc pattern has NOT been tested before on this server (the
+only confirmed-broken proc-calling-proc pattern is control.sp_log_load, a
+different and more complex case with named params - see
+dwh-ciosa-sqlserver-constraints in memory) - if gold.load_gold ever fails to
+compile or run with a hard-to-trace error, this pattern is the first suspect.
 
 gold.dim_fecha is NOT loaded here - it's static, populated once via
 populate_dim_fecha.sql, not part of the regular refresh cycle.
@@ -447,6 +456,15 @@ BEGIN
         -- deposito, no la del documento que aplico). Sin filas "sin match":
         -- a diferencia de fact_aplicacion_pagos, aqui solo existen pares ya
         -- resueltos, por construccion (INNER JOIN en toda la cadena).
+        -- FIX 2026-08-20: agregado el filtro grupo_rfc_unico (copiado de
+        -- gold.vw_pago_factura_simple, agregado ahi el 2026-08-20, un dia
+        -- despues de escribirse este bloque - nunca se habia sincronizado).
+        -- Sin esto, un grupo de compensacion con 1 solo pago candidato pero
+        -- facturas de 2+ RFC reales distintos (lotes de liquidacion tipo
+        -- Mercado Libre/pasarelas de pago que mezclan varias empresas) le
+        -- atribuia ese pago a facturas que no necesariamente cubrio,
+        -- contaminando dpp_*/pct_pagos_*. Medido en la vista: ~0.12% del
+        -- monto historico de pagos cae en grupos asi.
         IF OBJECT_ID('tempdb..#dpp_cliente') IS NOT NULL
             DROP TABLE #dpp_cliente;
 
@@ -454,6 +472,13 @@ BEGIN
             SELECT documento_compensacion, ejercicio_compensacion, COUNT(*) AS num_pagos_candidatos
             FROM gold.fact_pagos
             GROUP BY documento_compensacion, ejercicio_compensacion
+        ),
+        grupo_rfc_unico AS (
+            SELECT b.documento_compensacion, b.ejercicio_compensacion
+            FROM silver.sap_bsad b
+            INNER JOIN gold.dim_cliente k ON k.cliente_id = b.cliente_id
+            GROUP BY b.documento_compensacion, b.ejercicio_compensacion
+            HAVING COUNT(DISTINCT k.rfc) = 1
         ),
         pago_factura AS (
             SELECT
@@ -466,6 +491,9 @@ BEGIN
                 ON g.documento_compensacion = p.documento_compensacion
                AND g.ejercicio_compensacion = p.ejercicio_compensacion
                AND g.num_pagos_candidatos = 1
+            INNER JOIN grupo_rfc_unico gr
+                ON gr.documento_compensacion = p.documento_compensacion
+               AND gr.ejercicio_compensacion = p.ejercicio_compensacion
             INNER JOIN gold.fact_facturas f
                 ON f.documento_compensacion = p.documento_compensacion
                AND f.ejercicio_compensacion = p.ejercicio_compensacion
@@ -673,4 +701,75 @@ END;
 GO
 
 PRINT 'Procedure gold.load_fact_facturas created successfully.';
+GO
+
+-- ==========================================================
+-- gold.load_gold (orquestador)
+-- Un solo EXEC para correr todo el refresh de gold, en el orden correcto.
+-- No tiene logica propia, solo encadena los 6 procedimientos de arriba via
+-- EXEC - cada uno sigue existiendo y se puede seguir corriendo suelto para
+-- debug/pruebas aisladas.
+--
+-- ORDEN (fijo, no cambiar sin entender las dependencias):
+--   1. gold.load_dim_cliente           - SCD1, sin dependencias.
+--   2. gold.load_dim_cliente_comercial - SCD2, sin dependencias.
+--   3. gold.load_dim_cliente_credito   - SCD2, requiere que (2) ya haya
+--      corrido en este refresh (usa su version vigente para resolver
+--      analista/cobrador en el mismo canal que (2) eligio).
+--   4. gold.load_fact_pagos            - MERGE incremental, sin dependencias.
+--   5. gold.load_fact_facturas         - MERGE incremental, sin dependencias.
+--   6. gold.load_fact_saldo_cartera    - requiere (1)-(5) ya corridos: el
+--      saldo por cliente tiene FK a dim_cliente (si un cliente de bsid no
+--      esta todavia en dim_cliente, el INSERT completo del snapshot falla),
+--      y el DPP lee de fact_pagos/fact_facturas - si no se refrescaron antes
+--      en esta misma corrida, el DPP queda calculado con datos viejos, sin
+--      error visible.
+--
+-- NO PROBADO ANTES en esta instancia de SQL Server 2012: nunca se habia
+-- llamado un procedimiento gold/dq desde DENTRO de otro. El unico patron
+-- proc-llama-a-proc confirmado como roto en este servidor es
+-- control.sp_log_load (ver dwh-ciosa-sqlserver-constraints en memoria), que
+-- toma ~8 parametros con nombre - EXEC simple sin parametros como los de
+-- abajo es un patron mucho mas simple, pero no esta probado. Si este
+-- procedimiento falla en compilar o en correr con un error dificil de
+-- rastrear, este patron es el primer sospechoso - probarlo aislado (un solo
+-- EXEC a un solo procedimiento vacio de prueba) antes de seguir
+-- investigando cualquier otra causa.
+-- ==========================================================
+IF OBJECT_ID('gold.load_gold', 'P') IS NOT NULL
+    DROP PROCEDURE gold.load_gold;
+GO
+
+CREATE PROCEDURE gold.load_gold
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @start_time DATETIME, @end_time DATETIME;
+
+    BEGIN TRY
+        SET @start_time = GETDATE();
+        PRINT '===================================================';
+        PRINT '>> Iniciando refresh completo de gold...';
+        PRINT '===================================================';
+
+        EXEC gold.load_dim_cliente;
+        EXEC gold.load_dim_cliente_comercial;
+        EXEC gold.load_dim_cliente_credito;
+        EXEC gold.load_fact_pagos;
+        EXEC gold.load_fact_facturas;
+        EXEC gold.load_fact_saldo_cartera;
+
+        SET @end_time = GETDATE();
+        PRINT '===================================================';
+        PRINT '>> Refresh completo de gold terminado. Duration total: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
+        PRINT '===================================================';
+    END TRY
+    BEGIN CATCH
+        PRINT 'ERROR en gold.load_gold: ' + ERROR_MESSAGE();
+        THROW;
+    END CATCH;
+END;
+GO
+
+PRINT 'Procedure gold.load_gold created successfully.';
 GO
