@@ -22,10 +22,100 @@ different and more complex case with named params - see
 dwh-ciosa-sqlserver-constraints in memory) - if gold.load_gold ever fails to
 compile or run with a hard-to-trace error, this pattern is the first suspect.
 
-gold.dim_fecha is NOT loaded here - it's static, populated once via
-populate_dim_fecha.sql, not part of the regular refresh cycle.
+gold.dim_fecha IS loaded here (gold.load_dim_fecha, first procedure below) -
+2026-08-20: changed from a static one-time-populated calendar to a growing
+one, extended by this procedure on every gold.load_gold run. Retires the old
+populate_dim_fecha.sql (its bootstrap logic - what to do when the table is
+empty - is now just the NULL case inside this procedure).
 ===============================================================================
 */
+
+-- ==========================================================
+-- gold.load_dim_fecha (Calendario, sin SCD)
+-- REDISEÑADO 2026-08-20: gold.dim_fecha paso de estatica (2020-01-01 a
+-- 2035-12-31, poblada una sola vez) a creciente - limite inferior fijo en
+-- 2022-01-01 (arranque real de bronze.sap_bsad), limite superior = hoy + 1
+-- año (colchon para fechas de vencimiento futuras tipo NET-90), extendido
+-- automaticamente en cada corrida. Motivo: el rango estatico ofrecia años
+-- sin ninguna transaccion real (ej. el filtro de Año del reporte de Power
+-- BI mostraba 2020-2035 completos aunque solo hubiera datos reales desde
+-- 2022) - ver dwh-ciosa-project-status en memoria para el detalle completo.
+--
+-- Idempotente y seguro de correr todos los dias: si ya esta al corriente
+-- (MAX(fecha) >= hoy+1 año), el WHILE no itera nada. Si la tabla esta vacia
+-- (primera vez, base de datos nueva), arranca desde el limite inferior fijo
+-- - esto reemplaza el bootstrap que antes hacia populate_dim_fecha.sql (ya
+-- retirado). NUNCA borra filas existentes - solo agrega dias nuevos al
+-- final, nunca usa TRUNCATE (gold.fact_saldo_cartera ya tiene una FK real
+-- hacia esta tabla con datos - TRUNCATE fallaria, mismo motivo que ya
+-- obligo a rediseñar gold.load_dim_cliente).
+-- ==========================================================
+IF OBJECT_ID('gold.load_dim_fecha', 'P') IS NOT NULL
+    DROP PROCEDURE gold.load_dim_fecha;
+GO
+
+CREATE PROCEDURE gold.load_dim_fecha
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @start_time DATETIME, @end_time DATETIME, @rows_count INT = 0;
+    DECLARE @fecha_max_actual DATE, @fecha_max_objetivo DATE, @fecha_cursor DATE;
+
+    BEGIN TRY
+        SET @start_time = GETDATE();
+        PRINT '>> Cargando gold.dim_fecha...';
+
+        SET DATEFIRST 7;  -- domingo = 1, explicito para no depender de la configuracion del servidor
+
+        SELECT @fecha_max_actual = MAX(fecha) FROM gold.dim_fecha;
+        SET @fecha_max_objetivo = DATEADD(YEAR, 1, CAST(GETDATE() AS DATE));
+
+        IF @fecha_max_actual IS NULL
+            SET @fecha_cursor = '20220101';
+        ELSE
+            SET @fecha_cursor = DATEADD(DAY, 1, @fecha_max_actual);
+
+        WHILE @fecha_cursor <= @fecha_max_objetivo
+        BEGIN
+            INSERT INTO gold.dim_fecha (
+                fecha, anio, mes, nombre_mes, trimestre, dia,
+                dia_semana, nombre_dia_semana, es_fin_de_semana, semana_anio
+            )
+            VALUES (
+                @fecha_cursor,
+                YEAR(@fecha_cursor),
+                MONTH(@fecha_cursor),
+                CASE MONTH(@fecha_cursor)
+                    WHEN 1 THEN 'Enero' WHEN 2 THEN 'Febrero' WHEN 3 THEN 'Marzo' WHEN 4 THEN 'Abril'
+                    WHEN 5 THEN 'Mayo' WHEN 6 THEN 'Junio' WHEN 7 THEN 'Julio' WHEN 8 THEN 'Agosto'
+                    WHEN 9 THEN 'Septiembre' WHEN 10 THEN 'Octubre' WHEN 11 THEN 'Noviembre' WHEN 12 THEN 'Diciembre'
+                END,
+                DATEPART(QUARTER, @fecha_cursor),
+                DAY(@fecha_cursor),
+                DATEPART(WEEKDAY, @fecha_cursor),
+                CASE DATEPART(WEEKDAY, @fecha_cursor)
+                    WHEN 1 THEN 'Domingo' WHEN 2 THEN 'Lunes' WHEN 3 THEN 'Martes' WHEN 4 THEN 'Miercoles'
+                    WHEN 5 THEN 'Jueves' WHEN 6 THEN 'Viernes' WHEN 7 THEN 'Sabado'
+                END,
+                CASE WHEN DATEPART(WEEKDAY, @fecha_cursor) IN (1, 7) THEN 1 ELSE 0 END,
+                DATEPART(ISO_WEEK, @fecha_cursor)
+            );
+            SET @rows_count = @rows_count + 1;
+            SET @fecha_cursor = DATEADD(DAY, 1, @fecha_cursor);
+        END
+
+        SET @end_time = GETDATE();
+        PRINT 'Dias nuevos agregados: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
+    END TRY
+    BEGIN CATCH
+        PRINT 'ERROR en gold.dim_fecha: ' + ERROR_MESSAGE();
+        THROW;
+    END CATCH;
+END;
+GO
+
+PRINT 'Procedure gold.load_dim_fecha created successfully.';
+GO
 
 -- ==========================================================
 -- gold.load_dim_cliente (SCD Tipo 1)
@@ -711,14 +801,17 @@ GO
 -- debug/pruebas aisladas.
 --
 -- ORDEN (fijo, no cambiar sin entender las dependencias):
---   1. gold.load_dim_cliente           - SCD1, sin dependencias.
---   2. gold.load_dim_cliente_comercial - SCD2, sin dependencias.
---   3. gold.load_dim_cliente_credito   - SCD2, requiere que (2) ya haya
+--   1. gold.load_dim_fecha             - creciente, sin dependencias. Va
+--      primero porque gold.fact_saldo_cartera (paso 7) tiene una FK real
+--      hacia esta tabla - debe estar al corriente antes de insertar ahi.
+--   2. gold.load_dim_cliente           - SCD1, sin dependencias.
+--   3. gold.load_dim_cliente_comercial - SCD2, sin dependencias.
+--   4. gold.load_dim_cliente_credito   - SCD2, requiere que (3) ya haya
 --      corrido en este refresh (usa su version vigente para resolver
---      analista/cobrador en el mismo canal que (2) eligio).
---   4. gold.load_fact_pagos            - MERGE incremental, sin dependencias.
---   5. gold.load_fact_facturas         - MERGE incremental, sin dependencias.
---   6. gold.load_fact_saldo_cartera    - requiere (1)-(5) ya corridos: el
+--      analista/cobrador en el mismo canal que (3) eligio).
+--   5. gold.load_fact_pagos            - MERGE incremental, sin dependencias.
+--   6. gold.load_fact_facturas         - MERGE incremental, sin dependencias.
+--   7. gold.load_fact_saldo_cartera    - requiere (1)-(6) ya corridos: el
 --      saldo por cliente tiene FK a dim_cliente (si un cliente de bsid no
 --      esta todavia en dim_cliente, el INSERT completo del snapshot falla),
 --      y el DPP lee de fact_pagos/fact_facturas - si no se refrescaron antes
@@ -752,6 +845,7 @@ BEGIN
         PRINT '>> Iniciando refresh completo de gold...';
         PRINT '===================================================';
 
+        EXEC gold.load_dim_fecha;
         EXEC gold.load_dim_cliente;
         EXEC gold.load_dim_cliente_comercial;
         EXEC gold.load_dim_cliente_credito;

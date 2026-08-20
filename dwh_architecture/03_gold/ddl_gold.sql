@@ -10,12 +10,19 @@ LAYER: Gold (Presentation / Star Schema)
 
 -- ==========================================================
 -- 1. DIMENSION: gold.dim_fecha (Calendario)
--- Estatica, SIN SCD. Rango fijo 2020-01-01 a 2035-12-31 (cubre de sobra el
--- historico real, que arranca en 2022-01-01 segun bronze.sap_bsad, y deja
--- margen para fechas de vencimiento futuras). Se puebla UNA SOLA VEZ via
--- populate_dim_fecha.sql - no se repuebla en cada carga de gold. Si el rango
--- se queda corto en el futuro, extender con un script de mantenimiento
--- puntual, no convertirla en dinamica.
+-- SIN SCD. Rango CRECIENTE (no estatico): limite inferior fijo en
+-- 2022-01-01 (arranque real de bronze.sap_bsad) y limite superior = hoy +
+-- 1 año, extendido automaticamente por gold.load_dim_fecha en cada corrida
+-- de gold.load_gold (ver sp_load_gold.sql) - el colchon de 1 año adelante
+-- cubre fechas de vencimiento futuras (plazos de pago tipo NET-90) sin
+-- necesidad de un rango fijo hasta 2035. REDISEÑADO 2026-08-20: antes era
+-- estatico 2020-01-01/2035-12-31, poblado una sola vez via
+-- populate_dim_fecha.sql (retirado, su logica de bootstrap ahora vive
+-- dentro de gold.load_dim_fecha) - el usuario prefirio que el calendario
+-- reflejara el periodo real de datos en vez de mostrar años sin ninguna
+-- transaccion real (esto se notaba, por ejemplo, en el filtro de Año del
+-- reporte de Power BI, que ofrecia 2020-2035 completos sin importar que
+-- solo hubiera datos reales desde 2022).
 -- ==========================================================
 IF OBJECT_ID('gold.dim_fecha', 'U') IS NOT NULL
     DROP TABLE gold.dim_fecha;

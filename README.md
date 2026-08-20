@@ -39,7 +39,6 @@ dwh_architecture/
 │   ├── ddl_gold.sql                  star schema: dimensions + facts
 │   ├── sp_load_gold.sql              load procedures (SCD1/SCD2, incremental MERGE) + orchestrator
 │   ├── vw_pago_factura_simple.sql    payment-to-invoice reconciliation view
-│   ├── populate_dim_fecha.sql        one-time calendar dimension seed
 │   └── backfill_fact_pagos_facturas.sql  one-time historical backfill
 └── 04_dq/
     ├── ddl_dq.sql          data-quality flag tables
@@ -53,7 +52,7 @@ dwh_architecture/
 **Silver** — 8 cleansed tables. `mandante`/organization-code scoping, null normalization, and leading-zero stripping happen here; cross-entity joins are deliberately kept out (silver stays one-bronze-table-to-one-silver-table).
 
 **Gold** — star schema:
-- `dim_fecha` — static calendar dimension.
+- `dim_fecha` — calendar dimension, self-extending (lower bound fixed at 2022-01-01, upper bound rolls forward to today+1 year on every load).
 - `dim_cliente` — customer identity, **SCD Type 1**.
 - `dim_cliente_comercial` / `dim_cliente_credito` — commercial and credit attributes, **SCD Type 2** (hash-based change detection, temporal joins from facts).
 - `fact_pagos` / `fact_facturas` — incrementally-merged mirrors of customer payments and invoices.
