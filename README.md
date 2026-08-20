@@ -58,7 +58,7 @@ dwh_architecture/
 - `dim_cliente_comercial` / `dim_cliente_credito` — commercial and credit attributes, **SCD Type 2** (hash-based change detection, temporal joins from facts).
 - `fact_pagos` / `fact_facturas` — incrementally-merged mirrors of customer payments and invoices.
 - `fact_saldo_cartera` — daily periodic-snapshot fact of open AR balance and aging, plus rolling payment-behavior metrics (days-to-pay, % on-time).
-- `vw_cliente_canal_estatus` / `vw_pago_factura_simple` — business-rule views: customer commercial status classification, and payment-to-invoice reconciliation (SAP settles payments and invoices as compensation groups, not a native 1:1 relationship — this view reconstructs that relationship for groups that can be resolved unambiguously).
+- `vw_cliente_canal_estatus` / `vw_pago_factura_simple` — business-rule views: customer commercial status classification, and payment-to-invoice reconciliation (SAP settles payments and invoices as compensation groups, not a native 1:1 relationship — this view reconstructs that relationship for groups that can be resolved unambiguously). The reconciliation view also classifies each settled invoice as overdue, due-this-month, or paid-early (`clasificacion_cobranza`), the basis for the customer payment-behavior reporting built on this model.
 
 **DQ** — standalone monitors (e.g. customers flagged with more than one simultaneously-active commercial channel) that don't block the gold load, just surface data issues upstream in SAP.
 
@@ -68,6 +68,12 @@ dwh_architecture/
 - **SCD Type 2** implemented as explicit sequential steps (stage → close changed versions → insert new versions) rather than a single `MERGE`, for straightforward debugging on the target SQL Server version.
 - **Data-quality safeguards baked into the model**: ambiguous-customer detection, and a same-RFC safeguard that prevents a payment from being attributed to another company's invoices when SAP batches unrelated settlements into the same compensation group.
 - Built and tested against **SQL Server 2012 SP1**, which constrains several patterns (no `CREATE OR ALTER`, limited transaction log headroom on large loads, etc.) — load procedures are written accordingly.
+
+## Known limitations
+
+- **SCD Type 2 history is only reliable from when each dimension's load procedure started running regularly.** A customer's first-ever captured version is backdated so older facts can still join to it, but that's a join-compatibility mechanism, not a claim that the attribute was actually true that far back — classifications that depend on projecting a *current* SCD2 attribute onto old transactions should be treated with that in mind.
+- **`fact_saldo_cartera` cannot be backfilled.** Its source (`silver.sap_bsid`) is a full daily mirror with no history retained, so the snapshot fact only accumulates forward from the day its load started running.
+- **Payment-to-invoice matching is deliberately incomplete.** `vw_pago_factura_simple` only resolves settlement groups with exactly one payment candidate and a single real company involved; ambiguous groups are left unmatched rather than guessed.
 
 ## Status
 
