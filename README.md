@@ -1,2 +1,74 @@
 # dwh-ciosa
-Enterprise Data Warehouse for Ciosa. Built in SQL Server using SSMS, implementing a Medallion Architecture to pipeline, cleanse, and centralize SAP S/4HANA data into unified star schemas for corporate-wide analytics.
+
+Enterprise Data Warehouse for CIOSA, built on SQL Server (T-SQL) using a **Medallion Architecture** (Bronze → Silver → Gold) to pipeline, cleanse, and model SAP ECC data (FI/SD modules) for Accounts Receivable / Credit & Collections analytics.
+
+## Architecture
+
+```
+SAP ECC (linked server)
+    │  raw mirror, no transformations
+    ▼
+BRONZE  ── 10 tables, customer master + AR line items
+    │  cleansing, standardization, business-scope filters
+    ▼
+SILVER  ── 8 tables, one bronze table → one silver table
+    │  integration, star schema, business logic
+    ▼
+GOLD    ── dimensions (SCD1/SCD2) + facts + reporting views
+    │
+    ├──► DQ  ── ongoing data-quality monitors
+    └──► Power BI
+```
+
+Each layer is loaded by its own stored procedure (`bronze.load_bronze`, `silver.load_silver`, `gold.load_gold`, `dq.load_clientes_ambiguos`), run in that order. `gold.load_gold` is a thin orchestrator that chains the individual gold load procedures — each of those still runs standalone for isolated testing.
+
+## Repository structure
+
+```
+dwh_architecture/
+├── init_database.sql        schema creation (bronze/silver/gold/control/dq)
+├── 01_bronze/
+│   ├── ddl_bronze.sql        raw tables, 1:1 mirror of SAP source fields
+│   ├── sp_load_bronze.sql    daily load (truncate+insert, incremental merge for high-volume tables)
+│   └── sp_backfill_bsad.sql  one-time historical backfill
+├── 02_silver/
+│   ├── ddl_silver.sql         cleaned/standardized tables
+│   ├── sp_load_silver.sql     daily load (type casting, null handling, scope filters)
+│   └── backfill_bsad_historico.sql  one-time historical backfill
+├── 03_gold/
+│   ├── ddl_gold.sql                  star schema: dimensions + facts
+│   ├── sp_load_gold.sql              load procedures (SCD1/SCD2, incremental MERGE) + orchestrator
+│   ├── vw_pago_factura_simple.sql    payment-to-invoice reconciliation view
+│   ├── populate_dim_fecha.sql        one-time calendar dimension seed
+│   └── backfill_fact_pagos_facturas.sql  one-time historical backfill
+└── 04_dq/
+    ├── ddl_dq.sql          data-quality flag tables
+    └── sp_load_dq.sql      data-quality monitor load
+```
+
+## Data model
+
+**Bronze** — raw mirror of 10 SAP tables (customer master, sales/credit views, open and cleared AR line items, plus lookup tables for route names and employee names).
+
+**Silver** — 8 cleansed tables. `mandante`/organization-code scoping, null normalization, and leading-zero stripping happen here; cross-entity joins are deliberately kept out (silver stays one-bronze-table-to-one-silver-table).
+
+**Gold** — star schema:
+- `dim_fecha` — static calendar dimension.
+- `dim_cliente` — customer identity, **SCD Type 1**.
+- `dim_cliente_comercial` / `dim_cliente_credito` — commercial and credit attributes, **SCD Type 2** (hash-based change detection, temporal joins from facts).
+- `fact_pagos` / `fact_facturas` — incrementally-merged mirrors of customer payments and invoices.
+- `fact_saldo_cartera` — daily periodic-snapshot fact of open AR balance and aging, plus rolling payment-behavior metrics (days-to-pay, % on-time).
+- `vw_cliente_canal_estatus` / `vw_pago_factura_simple` — business-rule views: customer commercial status classification, and payment-to-invoice reconciliation (SAP settles payments and invoices as compensation groups, not a native 1:1 relationship — this view reconstructs that relationship for groups that can be resolved unambiguously).
+
+**DQ** — standalone monitors (e.g. customers flagged with more than one simultaneously-active commercial channel) that don't block the gold load, just surface data issues upstream in SAP.
+
+## Engineering notes
+
+- **Incremental loads**: high-volume tables (`sap_bsad`, `fact_pagos`, `fact_facturas`) use `MERGE` scoped to a rolling current+previous-month window, with one-time backfill scripts kept separate from the daily incremental procedures.
+- **SCD Type 2** implemented as explicit sequential steps (stage → close changed versions → insert new versions) rather than a single `MERGE`, for straightforward debugging on the target SQL Server version.
+- **Data-quality safeguards baked into the model**: ambiguous-customer detection, and a same-RFC safeguard that prevents a payment from being attributed to another company's invoices when SAP batches unrelated settlements into the same compensation group.
+- Built and tested against **SQL Server 2012 SP1**, which constrains several patterns (no `CREATE OR ALTER`, limited transaction log headroom on large loads, etc.) — load procedures are written accordingly.
+
+## Status
+
+Bronze, Silver, and Gold layers are stable and reconciled against independent external reports. A Power BI report on top of this model exists in a separate, private repository (excluded here to avoid exposing internal network details).
