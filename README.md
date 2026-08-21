@@ -1,6 +1,6 @@
-# dwh-ciosa
+# Accounts Receivable Medallion Data Warehouse
 
-Enterprise Data Warehouse for CIOSA, built on SQL Server (T-SQL) using a **Medallion Architecture** (Bronze → Silver → Gold) to pipeline, cleanse, and model SAP ECC data (FI/SD modules) for Accounts Receivable / Credit & Collections analytics.
+Enterprise Data Warehouse built on SQL Server (T-SQL) using a **Medallion Architecture** (Bronze → Silver → Gold) to pipeline, cleanse, and model SAP ECC data (FI/SD modules) for Accounts Receivable / Credit & Collections analytics.
 
 ## Architecture
 
