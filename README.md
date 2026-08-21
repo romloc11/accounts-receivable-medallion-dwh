@@ -61,6 +61,8 @@ dwh_architecture/
 
 **DQ** — standalone monitors (e.g. customers flagged with more than one simultaneously-active commercial channel) that don't block the gold load, just surface data issues upstream in SAP.
 
+See [DESIGN.md](DESIGN.md) for the full reasoning behind every table/view — why each dimension is shaped the way it is, when a table vs. a view was the right call, and what got tried and retired along the way.
+
 ## Engineering notes
 
 - **Incremental loads**: high-volume tables (`sap_bsad`, `fact_pagos_compensados`, `fact_facturas_compensadas`) use `MERGE` scoped to a rolling current+previous-month window, with one-time backfill scripts kept separate from the daily incremental procedures.
