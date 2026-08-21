@@ -76,4 +76,4 @@ dwh_architecture/
 
 ## Status
 
-Bronze, Silver, and Gold layers are stable and reconciled against independent external reports. A Power BI report on top of this model exists in a separate, private repository (excluded here to avoid exposing internal network details).
+Bronze, Silver, and Gold layers are stable and reconciled against independent external reports. A Power BI report on top of this model is published in a separate public repository, [comportamiento-pago-credito](https://github.com/romloc11/comportamiento-pago-credito) — that copy runs on embedded sample data rather than a live connection to this warehouse, built specifically for portfolio use.
