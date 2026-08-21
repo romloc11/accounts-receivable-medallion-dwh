@@ -39,6 +39,15 @@ CREATE TABLE gold.dim_fecha (
     nombre_dia_semana    VARCHAR(15) NOT NULL,
     es_fin_de_semana     BIT NOT NULL,
     semana_anio          INT NOT NULL,           -- semana ISO del anio
+
+    -- Agregadas 2026-08-20 para el eje "mes calendario real" del reporte de
+    -- Power BI (Tendencia de monto total recibido) - sin esto, agrupar por
+    -- nombre_mes junta Agosto-2025 con Agosto-2026 en una sola barra.
+    -- Columnas CALCULADAS (AS ... PERSISTED): se autopueblan a partir de
+    -- anio/mes/nombre_mes, no requieren logica extra en gold.load_dim_fecha.
+    anio_mes_num  AS (anio * 100 + mes) PERSISTED NOT NULL,               -- ej. 202608, para ordenar cronologicamente
+    anio_mes_texto AS (LEFT(nombre_mes, 3) + ' ' + CAST(anio AS VARCHAR(4))) PERSISTED NOT NULL, -- ej. 'Ago 2026'
+
     CONSTRAINT PK_dim_fecha PRIMARY KEY CLUSTERED (fecha)
 );
 GO
