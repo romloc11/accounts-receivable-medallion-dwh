@@ -39,7 +39,7 @@ dwh_architecture/
 │   ├── ddl_gold.sql                  star schema: dimensions + facts
 │   ├── sp_load_gold.sql              load procedures (SCD1/SCD2, incremental MERGE) + orchestrator
 │   ├── vw_pago_factura_simple.sql    payment-to-invoice reconciliation view
-│   └── backfill_fact_pagos_facturas.sql  one-time historical backfill
+│   └── backfill_fact_pagos_facturas_compensados.sql  one-time historical backfill
 └── 04_dq/
     ├── ddl_dq.sql          data-quality flag tables
     └── sp_load_dq.sql      data-quality monitor load
@@ -55,7 +55,7 @@ dwh_architecture/
 - `dim_fecha` — calendar dimension, self-extending (lower bound fixed at 2022-01-01, upper bound rolls forward to today+1 year on every load).
 - `dim_cliente` — customer identity, **SCD Type 1**.
 - `dim_cliente_comercial` / `dim_cliente_credito` — commercial and credit attributes, **SCD Type 2** (hash-based change detection, temporal joins from facts).
-- `fact_pagos` / `fact_facturas` — incrementally-merged mirrors of customer payments and invoices.
+- `fact_pagos_compensados` / `fact_facturas_compensadas` — incrementally-merged mirrors of customer payments and invoices.
 - `fact_saldo_cartera` — daily periodic-snapshot fact of open AR balance and aging, plus rolling payment-behavior metrics (days-to-pay, % on-time).
 - `vw_cliente_canal_estatus` / `vw_pago_factura_simple` — business-rule views: customer commercial status classification, and payment-to-invoice reconciliation (SAP settles payments and invoices as compensation groups, not a native 1:1 relationship — this view reconstructs that relationship for groups that can be resolved unambiguously). The reconciliation view also classifies each settled invoice as overdue, due-this-month, or paid-early (`clasificacion_cobranza`), the basis for the customer payment-behavior reporting built on this model.
 
@@ -63,7 +63,7 @@ dwh_architecture/
 
 ## Engineering notes
 
-- **Incremental loads**: high-volume tables (`sap_bsad`, `fact_pagos`, `fact_facturas`) use `MERGE` scoped to a rolling current+previous-month window, with one-time backfill scripts kept separate from the daily incremental procedures.
+- **Incremental loads**: high-volume tables (`sap_bsad`, `fact_pagos_compensados`, `fact_facturas_compensadas`) use `MERGE` scoped to a rolling current+previous-month window, with one-time backfill scripts kept separate from the daily incremental procedures.
 - **SCD Type 2** implemented as explicit sequential steps (stage → close changed versions → insert new versions) rather than a single `MERGE`, for straightforward debugging on the target SQL Server version.
 - **Data-quality safeguards baked into the model**: ambiguous-customer detection, and a same-RFC safeguard that prevents a payment from being attributed to another company's invoices when SAP batches unrelated settlements into the same compensation group.
 - Built and tested against **SQL Server 2012 SP1**, which constrains several patterns (no `CREATE OR ALTER`, limited transaction log headroom on large loads, etc.) — load procedures are written accordingly.

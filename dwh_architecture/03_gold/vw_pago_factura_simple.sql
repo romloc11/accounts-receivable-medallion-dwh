@@ -1,6 +1,6 @@
 -- ==========================================================
 -- gold.vw_pago_factura_simple : relacion pago virgen <-> factura
--- Fuente: gold.fact_pagos / gold.fact_facturas (formalizadas en ddl_gold.sql
+-- Fuente: gold.fact_pagos_compensados / gold.fact_facturas_compensadas (formalizadas en ddl_gold.sql
 -- / sp_load_gold.sql 2026-08-19 - reemplazan a las vistas prototipo
 -- gold.vw_pago_virgen / gold.vw_factura, ya retiradas).
 --
@@ -74,7 +74,7 @@ WITH pagos_por_grupo AS (
         documento_compensacion,
         ejercicio_compensacion,
         COUNT(*) AS num_pagos_candidatos
-    FROM gold.fact_pagos
+    FROM gold.fact_pagos_compensados
     GROUP BY documento_compensacion, ejercicio_compensacion
 ),
 grupo_rfc_unico AS (
@@ -102,7 +102,7 @@ SELECT
         WHEN f.fecha_vencimiento <= EOMONTH(p.fecha_documento) THEN 'CARTERA_DEL_MES'
         ELSE 'PAGO_ANTICIPADO'
     END AS clasificacion_cobranza
-FROM gold.fact_pagos p
+FROM gold.fact_pagos_compensados p
 INNER JOIN pagos_por_grupo g
     ON g.documento_compensacion = p.documento_compensacion
    AND g.ejercicio_compensacion = p.ejercicio_compensacion
@@ -110,7 +110,7 @@ INNER JOIN pagos_por_grupo g
 INNER JOIN grupo_rfc_unico gr
     ON gr.documento_compensacion = p.documento_compensacion
    AND gr.ejercicio_compensacion = p.ejercicio_compensacion
-INNER JOIN gold.fact_facturas f
+INNER JOIN gold.fact_facturas_compensadas f
     ON f.documento_compensacion = p.documento_compensacion
    AND f.ejercicio_compensacion = p.ejercicio_compensacion
 INNER JOIN gold.dim_cliente_comercial dc

@@ -528,8 +528,8 @@ BEGIN
 
         -- Paso 2: DPP / DPP ponderado / % a tiempo-tarde, ventanas de 3 y 12
         -- meses hacia atras desde @hoy.
-        -- MIGRADO 2026-08-19 de gold.fact_aplicacion_pagos a gold.fact_pagos/
-        -- gold.fact_facturas - la logica de matching de fact_aplicacion_pagos
+        -- MIGRADO 2026-08-19 de gold.fact_aplicacion_pagos a gold.fact_pagos_compensados/
+        -- gold.fact_facturas_compensadas - la logica de matching de fact_aplicacion_pagos
         -- (3 niveles: REBZG/GRUPO_INAMBIGUO/sin match) resulto tener bugs
         -- reales de sobre-atribucion (un candidato podia "explicar" facturas
         -- por mucho mas de lo que realmente vale - ej. un documento de $137
@@ -560,7 +560,7 @@ BEGIN
 
         ;WITH pagos_por_grupo AS (
             SELECT documento_compensacion, ejercicio_compensacion, COUNT(*) AS num_pagos_candidatos
-            FROM gold.fact_pagos
+            FROM gold.fact_pagos_compensados
             GROUP BY documento_compensacion, ejercicio_compensacion
         ),
         grupo_rfc_unico AS (
@@ -576,7 +576,7 @@ BEGIN
                 p.fecha_documento AS fecha_pago,
                 f.monto_moneda_local AS monto_factura,
                 DATEDIFF(DAY, f.fecha_vencimiento, p.fecha_documento) AS dias_pago
-            FROM gold.fact_pagos p
+            FROM gold.fact_pagos_compensados p
             INNER JOIN pagos_por_grupo g
                 ON g.documento_compensacion = p.documento_compensacion
                AND g.ejercicio_compensacion = p.ejercicio_compensacion
@@ -584,7 +584,7 @@ BEGIN
             INNER JOIN grupo_rfc_unico gr
                 ON gr.documento_compensacion = p.documento_compensacion
                AND gr.ejercicio_compensacion = p.ejercicio_compensacion
-            INNER JOIN gold.fact_facturas f
+            INNER JOIN gold.fact_facturas_compensadas f
                 ON f.documento_compensacion = p.documento_compensacion
                AND f.ejercicio_compensacion = p.ejercicio_compensacion
         )
@@ -657,18 +657,18 @@ GO
 -- gold.load_fact_aplicacion_pagos fue ELIMINADO 2026-08-19 junto con la
 -- tabla gold.fact_aplicacion_pagos - ver nota en ddl_gold.sql (bugs reales
 -- de sobre-atribucion en el matching de 3 niveles). Reemplazado por
--- gold.load_fact_pagos / gold.load_fact_facturas de abajo, mas
+-- gold.load_fact_pagos_compensados / gold.load_fact_facturas_compensadas de abajo, mas
 -- gold.vw_pago_factura_simple para la relacion.
 -- ==========================================================
 
 -- ==========================================================
--- gold.load_fact_pagos
+-- gold.load_fact_pagos_compensados
 -- ==========================================================
-IF OBJECT_ID('gold.load_fact_pagos', 'P') IS NOT NULL
-    DROP PROCEDURE gold.load_fact_pagos;
+IF OBJECT_ID('gold.load_fact_pagos_compensados', 'P') IS NOT NULL
+    DROP PROCEDURE gold.load_fact_pagos_compensados;
 GO
 
-CREATE PROCEDURE gold.load_fact_pagos
+CREATE PROCEDURE gold.load_fact_pagos_compensados
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -676,11 +676,11 @@ BEGIN
 
     BEGIN TRY
         SET @start_time = GETDATE();
-        PRINT '>> Cargando gold.fact_pagos (Merge Incremental)...';
+        PRINT '>> Cargando gold.fact_pagos_compensados (Merge Incremental)...';
 
         DECLARE @mes_anterior_inicio DATE = DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()) - 1, 0);
 
-        MERGE gold.fact_pagos AS tgt
+        MERGE gold.fact_pagos_compensados AS tgt
         USING (
             SELECT
                 sociedad, cliente_id, ejercicio, documento_id, posicion,
@@ -719,23 +719,23 @@ BEGIN
         PRINT 'Filas: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
     END TRY
     BEGIN CATCH
-        PRINT 'ERROR en gold.fact_pagos: ' + ERROR_MESSAGE();
+        PRINT 'ERROR en gold.fact_pagos_compensados: ' + ERROR_MESSAGE();
         THROW;
     END CATCH;
 END;
 GO
 
-PRINT 'Procedure gold.load_fact_pagos created successfully.';
+PRINT 'Procedure gold.load_fact_pagos_compensados created successfully.';
 GO
 
 -- ==========================================================
--- gold.load_fact_facturas
+-- gold.load_fact_facturas_compensadas
 -- ==========================================================
-IF OBJECT_ID('gold.load_fact_facturas', 'P') IS NOT NULL
-    DROP PROCEDURE gold.load_fact_facturas;
+IF OBJECT_ID('gold.load_fact_facturas_compensadas', 'P') IS NOT NULL
+    DROP PROCEDURE gold.load_fact_facturas_compensadas;
 GO
 
-CREATE PROCEDURE gold.load_fact_facturas
+CREATE PROCEDURE gold.load_fact_facturas_compensadas
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -743,11 +743,11 @@ BEGIN
 
     BEGIN TRY
         SET @start_time = GETDATE();
-        PRINT '>> Cargando gold.fact_facturas (Merge Incremental)...';
+        PRINT '>> Cargando gold.fact_facturas_compensadas (Merge Incremental)...';
 
         DECLARE @mes_anterior_inicio DATE = DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()) - 1, 0);
 
-        MERGE gold.fact_facturas AS tgt
+        MERGE gold.fact_facturas_compensadas AS tgt
         USING (
             SELECT
                 sociedad, cliente_id, ejercicio, documento_id, posicion,
@@ -784,13 +784,13 @@ BEGIN
         PRINT 'Filas: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
     END TRY
     BEGIN CATCH
-        PRINT 'ERROR en gold.fact_facturas: ' + ERROR_MESSAGE();
+        PRINT 'ERROR en gold.fact_facturas_compensadas: ' + ERROR_MESSAGE();
         THROW;
     END CATCH;
 END;
 GO
 
-PRINT 'Procedure gold.load_fact_facturas created successfully.';
+PRINT 'Procedure gold.load_fact_facturas_compensadas created successfully.';
 GO
 
 -- ==========================================================
@@ -809,12 +809,12 @@ GO
 --   4. gold.load_dim_cliente_credito   - SCD2, requiere que (3) ya haya
 --      corrido en este refresh (usa su version vigente para resolver
 --      analista/cobrador en el mismo canal que (3) eligio).
---   5. gold.load_fact_pagos            - MERGE incremental, sin dependencias.
---   6. gold.load_fact_facturas         - MERGE incremental, sin dependencias.
+--   5. gold.load_fact_pagos_compensados            - MERGE incremental, sin dependencias.
+--   6. gold.load_fact_facturas_compensadas         - MERGE incremental, sin dependencias.
 --   7. gold.load_fact_saldo_cartera    - requiere (1)-(6) ya corridos: el
 --      saldo por cliente tiene FK a dim_cliente (si un cliente de bsid no
 --      esta todavia en dim_cliente, el INSERT completo del snapshot falla),
---      y el DPP lee de fact_pagos/fact_facturas - si no se refrescaron antes
+--      y el DPP lee de fact_pagos_compensados/fact_facturas_compensadas - si no se refrescaron antes
 --      en esta misma corrida, el DPP queda calculado con datos viejos, sin
 --      error visible.
 --
@@ -849,8 +849,8 @@ BEGIN
         EXEC gold.load_dim_cliente;
         EXEC gold.load_dim_cliente_comercial;
         EXEC gold.load_dim_cliente_credito;
-        EXEC gold.load_fact_pagos;
-        EXEC gold.load_fact_facturas;
+        EXEC gold.load_fact_pagos_compensados;
+        EXEC gold.load_fact_facturas_compensadas;
         EXEC gold.load_fact_saldo_cartera;
 
         SET @end_time = GETDATE();

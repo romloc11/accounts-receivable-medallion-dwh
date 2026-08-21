@@ -361,14 +361,14 @@ GO
 -- la foto de saldo actual. Dos ventanas moviles (3 y 12 meses hacia atras
 -- desde fecha_snapshot), cada una simple y ponderada por monto (las facturas
 -- de mayor importe pesan mas en el promedio).
--- 2026-08-19: DPP y % a tiempo/tarde se calculan desde gold.fact_pagos/
--- gold.fact_facturas (ver gold.load_fact_saldo_cartera Paso 2) - migrado de
+-- 2026-08-19: DPP y % a tiempo/tarde se calculan desde gold.fact_pagos_compensados/
+-- gold.fact_facturas_compensadas (ver gold.load_fact_saldo_cartera Paso 2) - migrado de
 -- gold.fact_aplicacion_pagos, cuya logica de matching de 3 niveles (REBZG/
 -- GRUPO_INAMBIGUO/sin match) resulto tener bugs reales de sobre-atribucion
 -- (un candidato de match podia "explicar" facturas por mucho mas de lo que
 -- realmente vale - confirmado con casos reales, ej. un documento de $137
 -- atribuido a $2.5M en facturas dentro de un grupo de compensacion masivo).
--- fact_pagos/fact_facturas usan un diseño deliberadamente mas simple: solo
+-- fact_pagos_compensados/fact_facturas_compensadas usan un diseño deliberadamente mas simple: solo
 -- relacionan grupos de compensacion con EXACTAMENTE 1 pago virgen candidato,
 -- sin niveles de match ni particion de aplicaciones parciales. Solo cubre
 -- pagos reales (no NC/devolucion/ajuste/anulacion, fuera del alcance de este
@@ -417,8 +417,8 @@ CREATE TABLE gold.fact_saldo_cartera (
     documentos_con_reclamacion   INT NOT NULL,
     nivel_reclamacion_max        CHAR(1) NULL,
 
-    -- comportamiento historico de pago (desde gold.fact_pagos/
-    -- gold.fact_facturas via gold.load_fact_saldo_cartera Paso 2 - ver nota
+    -- comportamiento historico de pago (desde gold.fact_pagos_compensados/
+    -- gold.fact_facturas_compensadas via gold.load_fact_saldo_cartera Paso 2 - ver nota
     -- arriba del CREATE TABLE. Historial: esta migro 2026-08-19 desde
     -- gold.fact_aplicacion_pagos por los bugs de sobre-atribucion ya
     -- documentados arriba).
@@ -456,13 +456,13 @@ GO
 -- mucho mas de lo que realmente vale - ej. un documento Z1 de $137
 -- atribuido a $2.5M en 4,724 facturas dentro de un grupo de compensacion
 -- masivo; confirmado en varios casos reales antes de decidir el retiro).
--- Reemplazada por el diseño simple gold.fact_pagos/gold.fact_facturas +
+-- Reemplazada por el diseño simple gold.fact_pagos_compensados/gold.fact_facturas_compensadas +
 -- gold.vw_pago_factura_simple (solo relaciona grupos con EXACTAMENTE 1 pago
 -- candidato, sin niveles de match ni aplicacion parcial). El bloque de DPP
 -- de gold.fact_saldo_cartera que dependia de esta tabla ya fue migrado antes
 -- del retiro (ver gold.load_fact_saldo_cartera Paso 2).
 -- ==========================================================
--- 6. FACT: gold.fact_pagos
+-- 6. FACT: gold.fact_pagos_compensados
 -- Grano: 1 fila = 1 deposito "virgen" (silver.sap_bsad, clase_documento='DZ'
 -- AND sgtxt='Asignación Aut. Deposito' AND debe_haber<>'S' AND
 -- monto_moneda_local>0) - un pago del cliente aun sin repartir entre
@@ -494,15 +494,15 @@ GO
 -- requeriria la logica "propia vs externa" que ya causo varias rondas de
 -- bugs en el diseño de fact_aplicacion_pagos, no vale la pena para un
 -- residuo de ~0.17% del universo.
--- Carga: gold.load_fact_pagos (sp_load_gold.sql) - incremental, mes actual +
+-- Carga: gold.load_fact_pagos_compensados (sp_load_gold.sql) - incremental, mes actual +
 -- mes anterior por fecha_compensacion, mismo patron que silver.load_silver
--- usa para bsad. Backfill historico: 03_gold/backfill_fact_pagos_facturas.sql.
+-- usa para bsad. Backfill historico: 03_gold/backfill_fact_pagos_facturas_compensados.sql.
 -- ==========================================================
-IF OBJECT_ID('gold.fact_pagos', 'U') IS NOT NULL
-    DROP TABLE gold.fact_pagos;
+IF OBJECT_ID('gold.fact_pagos_compensados', 'U') IS NOT NULL
+    DROP TABLE gold.fact_pagos_compensados;
 GO
 
-CREATE TABLE gold.fact_pagos (
+CREATE TABLE gold.fact_pagos_compensados (
     sociedad                VARCHAR(4)    NOT NULL,
     cliente_id               VARCHAR(10)   NOT NULL,
     ejercicio                 INT           NOT NULL,
@@ -514,7 +514,7 @@ CREATE TABLE gold.fact_pagos (
     documento_compensacion      VARCHAR(10), -- grupo de compensacion compartido con las facturas que cubre
     ejercicio_compensacion      INT,
     fecha_carga                 DATETIME DEFAULT GETDATE(),
-    CONSTRAINT PK_fact_pagos PRIMARY KEY CLUSTERED (sociedad, cliente_id, ejercicio, documento_id, posicion)
+    CONSTRAINT PK_fact_pagos_compensados PRIMARY KEY CLUSTERED (sociedad, cliente_id, ejercicio, documento_id, posicion)
 );
 GO
 
@@ -522,26 +522,26 @@ GO
 -- cualquier analisis ad-hoc) agrupa/junta por esta pareja de columnas todo
 -- el tiempo - sin este indice es un escaneo completo de la tabla cada vez
 -- (confirmado 2026-08-19, consulta de reconciliacion se tardaba mucho).
-CREATE INDEX IX_fact_pagos_grupo ON gold.fact_pagos (documento_compensacion, ejercicio_compensacion);
+CREATE INDEX IX_fact_pagos_compensados_grupo ON gold.fact_pagos_compensados (documento_compensacion, ejercicio_compensacion);
 GO
 
-PRINT 'Table gold.fact_pagos created successfully.';
+PRINT 'Table gold.fact_pagos_compensados created successfully.';
 GO
 
 -- ==========================================================
--- 7. FACT: gold.fact_facturas
+-- 7. FACT: gold.fact_facturas_compensadas
 -- Grano: 1 fila = 1 factura ya compensada (silver.sap_bsad,
--- clase_documento IN F1-F6). Mismo espejo filtrado que fact_pagos, sin
+-- clase_documento IN F1-F6). Mismo espejo filtrado que fact_pagos_compensados, sin
 -- logica de matching.
--- Carga: gold.load_fact_facturas (sp_load_gold.sql) - incremental, mismo
--- patron. Backfill historico: 03_gold/backfill_fact_pagos_facturas.sql
+-- Carga: gold.load_fact_facturas_compensadas (sp_load_gold.sql) - incremental, mismo
+-- patron. Backfill historico: 03_gold/backfill_fact_pagos_facturas_compensados.sql
 -- (corrido 2026-08-19, historico completo desde 2022-01-01).
 -- ==========================================================
-IF OBJECT_ID('gold.fact_facturas', 'U') IS NOT NULL
-    DROP TABLE gold.fact_facturas;
+IF OBJECT_ID('gold.fact_facturas_compensadas', 'U') IS NOT NULL
+    DROP TABLE gold.fact_facturas_compensadas;
 GO
 
-CREATE TABLE gold.fact_facturas (
+CREATE TABLE gold.fact_facturas_compensadas (
     sociedad                VARCHAR(4)    NOT NULL,
     cliente_id               VARCHAR(10)   NOT NULL,
     ejercicio                 INT           NOT NULL,
@@ -554,14 +554,14 @@ CREATE TABLE gold.fact_facturas (
     documento_compensacion      VARCHAR(10),
     ejercicio_compensacion      INT,
     fecha_carga                 DATETIME DEFAULT GETDATE(),
-    CONSTRAINT PK_fact_facturas PRIMARY KEY CLUSTERED (sociedad, cliente_id, ejercicio, documento_id, posicion)
+    CONSTRAINT PK_fact_facturas_compensadas PRIMARY KEY CLUSTERED (sociedad, cliente_id, ejercicio, documento_id, posicion)
 );
 GO
 
--- Mismo motivo que gold.fact_pagos: gold.vw_pago_factura_simple junta por
+-- Mismo motivo que gold.fact_pagos_compensados: gold.vw_pago_factura_simple junta por
 -- esta pareja de columnas constantemente.
-CREATE INDEX IX_fact_facturas_grupo ON gold.fact_facturas (documento_compensacion, ejercicio_compensacion);
+CREATE INDEX IX_fact_facturas_compensadas_grupo ON gold.fact_facturas_compensadas (documento_compensacion, ejercicio_compensacion);
 GO
 
-PRINT 'Table gold.fact_facturas created successfully.';
+PRINT 'Table gold.fact_facturas_compensadas created successfully.';
 GO
