@@ -84,7 +84,7 @@ BEGIN
         PRINT '=================================================='
 
         /* ==========================================================
-           1. MAESTRO DE CLIENTES (KNA1) - Full Truncate & Load
+           1. CUSTOMER MASTER (KNA1) - Full Truncate & Load
         ========================================================== */
         SET @current_table = 'bronze.sap_kna1'
         SET @start_time = GETDATE()
@@ -100,7 +100,7 @@ BEGIN
 
 
         /* ==========================================================
-           2. INTERLOCUTORES DE CLIENTE (KNVP) - Full Truncate & Load
+           2. CUSTOMER PARTNER FUNCTIONS (KNVP) - Full Truncate & Load
         ========================================================== */
         SET @current_table = 'bronze.sap_knvp'
         SET @start_time = GETDATE()
@@ -116,7 +116,7 @@ BEGIN
 
 
         /* ==========================================================
-           3. CONTROL DE CREDITO (KNKK) - Full Truncate & Load
+           3. CREDIT CONTROL (KNKK) - Full Truncate & Load
         ========================================================== */
         SET @current_table = 'bronze.sap_knkk'
         SET @start_time = GETDATE()
@@ -132,7 +132,7 @@ BEGIN
 
 
         /* ==========================================================
-           4. DATOS DE VENTAS DE CLIENTE (KNVV) - Full Truncate & Load
+           4. CUSTOMER SALES DATA (KNVV) - Full Truncate & Load
         ========================================================== */
         SET @current_table = 'bronze.sap_knvv'
         SET @start_time = GETDATE()
@@ -148,8 +148,8 @@ BEGIN
 
 
         /* ==========================================================
-           5. PARTIDAS ABIERTAS (BSID) - Full Truncate & Load
-           (Se vacia diario porque las facturas pagadas desaparecen de aqui)
+           5. OPEN ITEMS (BSID) - Full Truncate & Load
+           (Emptied daily because paid invoices disappear from here)
         ========================================================== */
         SET @current_table = 'bronze.sap_bsid'
         SET @start_time = GETDATE()
@@ -165,9 +165,9 @@ BEGIN
 
 
         /* ==========================================================
-           6. PARTIDAS COMPENSADAS (BSAD) - Incremental Merge
-           (Procesa solo compensaciones del mes actual + mes anterior.
-            El historico completo se cargo aparte via sp_backfill_bsad.sql)
+           6. CLEARED ITEMS (BSAD) - Incremental Merge
+           (Only processes settlements from the current + previous month.
+            The complete history was loaded separately via sp_backfill_bsad.sql)
         ========================================================== */
         SET @current_table = 'bronze.sap_bsad'
         SET @start_time = GETDATE()
@@ -266,7 +266,7 @@ BEGIN
 
 
         /* ==========================================================
-           7. DATOS DE SOCIEDAD DEL CLIENTE (KNB1) - Full Truncate & Load
+           7. CUSTOMER COMPANY CODE DATA (KNB1) - Full Truncate & Load
         ========================================================== */
         SET @current_table = 'bronze.sap_knb1'
         SET @start_time = GETDATE()
@@ -282,7 +282,7 @@ BEGIN
 
 
         /* ==========================================================
-           8. DATOS DE RECLAMACION DEL CLIENTE (KNB5) - Full Truncate & Load
+           8. CUSTOMER DUNNING DATA (KNB5) - Full Truncate & Load
         ========================================================== */
         SET @current_table = 'bronze.sap_knb5'
         SET @start_time = GETDATE()
@@ -298,8 +298,8 @@ BEGIN
 
 
         /* ==========================================================
-           9. TEXTO DE RUTAS - GRUPO DE CLIENTES 1 (TVV1T) - Full Truncate & Load
-           (Tabla de texto estandar SAP, resuelve KVGR1 -> nombre legible BEZEI)
+           9. ROUTE TEXT - CUSTOMER GROUP 1 (TVV1T) - Full Truncate & Load
+           (Standard SAP text table, resolves KVGR1 -> readable name BEZEI)
         ========================================================== */
         SET @current_table = 'bronze.sap_tvv1t'
         SET @start_time = GETDATE()
@@ -315,8 +315,8 @@ BEGIN
 
 
         /* ==========================================================
-           10. INFOTIPO 0001 - ASIGNACION ORGANIZATIVA RRHH (PA0001) - Full Truncate & Load
-           (Resuelve PERNR -> nombre real del empleado, ENAME)
+           10. INFOTYPE 0001 - HR ORGANIZATIONAL ASSIGNMENT (PA0001) - Full Truncate & Load
+           (Resolves PERNR -> the employee's real name, ENAME)
         ========================================================== */
         SET @current_table = 'bronze.sap_pa0001'
         SET @start_time = GETDATE()
@@ -331,7 +331,7 @@ BEGIN
         PRINT 'Duration: ' + CAST(DATEDIFF(second,@start_time,@end_time) AS NVARCHAR) + ' seconds'
 
 
-        -- FIN DEL PROCESO COMPLETO
+        -- END OF FULL PROCESS
         SET @batch_end_time = GETDATE()
 
         PRINT '=================================================='

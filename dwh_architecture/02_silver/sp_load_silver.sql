@@ -6,26 +6,26 @@ GO
 PROJECT: Enterprise Data Warehouse (dwh-ciosa)
 LAYER: Silver (Clean Data Staging)
 
-NOTA DE COMPATIBILIDAD:
-TRIM() no existe antes de SQL Server 2017 / Azure SQL. Todo el limpiado de
-espacios en este procedimiento usa LTRIM(RTRIM(...)) en su lugar, que es
-equivalente y compatible con cualquier version de SQL Server.
+COMPATIBILITY NOTE:
+TRIM() doesn't exist before SQL Server 2017 / Azure SQL. All whitespace
+cleanup in this procedure uses LTRIM(RTRIM(...)) instead, which is
+equivalent and compatible with any SQL Server version.
 
-Los campos de fecha en SAP llegan como texto de 8 digitos (YYYYMMDD, ej.
-'20260702') o '00000000' cuando no tienen valor. Se convierten con
-TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(campo)), '00000000'), 112).
+Date fields in SAP arrive as 8-digit text (YYYYMMDD, e.g. '20260702') or
+'00000000' when there's no value. They're converted with
+TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(field)), '00000000'), 112).
 
-NOTA SOBRE AUDITORIA: este procedimiento ya NO llama a control.sp_log_load.
-Confirmado en bronze.load_bronze que llamar a ese proc desde DENTRO de otro
-procedimiento rompe la compilacion en esta instancia de SQL Server 2012 (ver
-ddl_bronze.sql, seccion 10, y sp_load_bronze.sql). silver.load_silver
-originalmente llamaba a sp_log_load 16 veces (TRY+CATCH x 8 tablas) sin que
-nadie hubiera confirmado si eso compilaba o no; se quito preventivamente por
-el mismo motivo, sin esperar a que fallara en produccion. control.sap_load_control
-por lo tanto tampoco se llena desde aqui - el unico rastro de cada corrida es
-el PRINT (filas cargadas + duracion) visible mientras se ejecuta. THROW sigue
-activo en cada CATCH, asi que un fallo real se sigue propagando a quien haya
-llamado al procedimiento.
+NOTE ON AUDITING: this procedure no longer calls control.sp_log_load.
+Confirmed in bronze.load_bronze that calling that proc from INSIDE another
+procedure breaks compilation on this SQL Server 2012 instance (see
+ddl_bronze.sql, section 10, and sp_load_bronze.sql). silver.load_silver
+originally called sp_log_load 16 times (TRY+CATCH x 8 tables) without
+anyone having confirmed whether that compiled or not; it was removed
+preemptively for the same reason, without waiting for it to fail in
+production. control.sap_load_control is therefore also not populated from
+here - the only trace of each run is the PRINT output (rows loaded +
+duration) visible while it executes. THROW is still active in every CATCH,
+so a real failure still propagates to whoever called the procedure.
 ===============================================================================
 */
 
@@ -40,11 +40,11 @@ BEGIN
     DECLARE @start_time DATETIME, @end_time DATETIME, @rows_count INT;
 
     -- ==========================================
-    -- 1. LIMPIEZA: KNA1 (Clientes)
+    -- 1. CLEANING: KNA1 (Customers)
     -- ==========================================
     BEGIN TRY
         SET @start_time = GETDATE();
-        PRINT '>> Cargando y limpiando silver.sap_kna1...';
+        PRINT '>> Loading and cleaning silver.sap_kna1...';
 
         TRUNCATE TABLE silver.sap_kna1;
 
@@ -57,53 +57,53 @@ BEGIN
             tiempo_entrega_paq1, tiempo_entrega_paq2, tiempo_entrega_paq3
         )
         SELECT
-            LTRIM(RTRIM(MANDT)),  -- mandante
-            CAST(CAST(NULLIF(LTRIM(RTRIM(KUNNR)), '') AS BIGINT) AS VARCHAR(10)),  -- clave cliente (sin ceros a la izquierda)
+            LTRIM(RTRIM(MANDT)),  -- client (SAP mandante)
+            CAST(CAST(NULLIF(LTRIM(RTRIM(KUNNR)), '') AS BIGINT) AS VARCHAR(10)),  -- customer key (no leading zeros)
             NULLIF(LTRIM(RTRIM(STCD1)), ''),  -- rfc
-            NULLIF(LTRIM(RTRIM(NAME1)), ''),  -- nombre
-            NULLIF(LTRIM(RTRIM(NAME2)), ''),  -- nombre 2 (cuando es muy largo)
-            NULLIF(LTRIM(RTRIM(LAND1)), ''),  -- pais
-            NULLIF(LTRIM(RTRIM(REGIO)), ''),  -- estado abreviado
-            NULLIF(LTRIM(RTRIM(ORT01)), ''),  -- ciudad
-            NULLIF(LTRIM(RTRIM(PSTLZ)), ''),  -- codigo postal
-            NULLIF(LTRIM(RTRIM(STRAS)), ''),  -- calle y numero
-            NULLIF(LTRIM(RTRIM(AUFSD)), ''),  -- bloqueo de pedido
-            NULLIF(LTRIM(RTRIM(SORTL)), ''),  -- regimen fiscal
-            NULLIF(LTRIM(RTRIM(TELF1)), ''),  -- telefono
-            NULLIF(LTRIM(RTRIM(TELF2)), ''),  -- telefono extra
+            NULLIF(LTRIM(RTRIM(NAME1)), ''),  -- name
+            NULLIF(LTRIM(RTRIM(NAME2)), ''),  -- name 2 (when too long)
+            NULLIF(LTRIM(RTRIM(LAND1)), ''),  -- country
+            NULLIF(LTRIM(RTRIM(REGIO)), ''),  -- state abbreviation
+            NULLIF(LTRIM(RTRIM(ORT01)), ''),  -- city
+            NULLIF(LTRIM(RTRIM(PSTLZ)), ''),  -- postal code
+            NULLIF(LTRIM(RTRIM(STRAS)), ''),  -- street and number
+            NULLIF(LTRIM(RTRIM(AUFSD)), ''),  -- order block
+            NULLIF(LTRIM(RTRIM(SORTL)), ''),  -- tax regime
+            NULLIF(LTRIM(RTRIM(TELF1)), ''),  -- phone
+            NULLIF(LTRIM(RTRIM(TELF2)), ''),  -- extra phone
             NULLIF(LTRIM(RTRIM(TELFX)), ''),  -- whatsapp
-            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(ERDAT)), '00000000'), 112), -- fecha de alta
-            NULLIF(LTRIM(RTRIM(KTOKD)), ''),  -- clave grupo de cuentas
-            NULLIF(LTRIM(RTRIM(LIFNR)), ''),  -- proveedor vinculado
-            CASE WHEN LTRIM(RTRIM(SPERR)) = 'X' THEN 1 ELSE 0 END,  -- flag bloqueado
-            CASE WHEN LTRIM(RTRIM(XCPDK)) = 'X' THEN 1 ELSE 0 END,  -- flag cliente ocasional
-            CASE WHEN LTRIM(RTRIM(STKZN)) = 'X' THEN 1 ELSE 0 END,  -- flag persona fisica
-            CASE WHEN LTRIM(RTRIM(STKZU)) = 'X' THEN 1 ELSE 0 END,  -- flag sujeto a iva
-            NULLIF(LTRIM(RTRIM(KATR1)), ''),  -- tipo de servicio paqueteria 1
-            NULLIF(LTRIM(RTRIM(KATR2)), ''),  -- tipo de servicio paqueteria 2
-            NULLIF(LTRIM(RTRIM(KATR3)), ''),  -- tipo de servicio paqueteria 3
-            NULLIF(LTRIM(RTRIM(KATR6)), ''),  -- tiempo de entrega paqueteria 1
-            NULLIF(LTRIM(RTRIM(KATR7)), ''),  -- tiempo de entrega paqueteria 2
-            NULLIF(LTRIM(RTRIM(KATR8)), '')   -- tiempo de entrega paqueteria 3
+            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(ERDAT)), '00000000'), 112), -- creation date
+            NULLIF(LTRIM(RTRIM(KTOKD)), ''),  -- account group code
+            NULLIF(LTRIM(RTRIM(LIFNR)), ''),  -- linked vendor
+            CASE WHEN LTRIM(RTRIM(SPERR)) = 'X' THEN 1 ELSE 0 END,  -- blocked flag
+            CASE WHEN LTRIM(RTRIM(XCPDK)) = 'X' THEN 1 ELSE 0 END,  -- one-time customer flag
+            CASE WHEN LTRIM(RTRIM(STKZN)) = 'X' THEN 1 ELSE 0 END,  -- individual (natural person) flag
+            CASE WHEN LTRIM(RTRIM(STKZU)) = 'X' THEN 1 ELSE 0 END,  -- VAT-liable flag
+            NULLIF(LTRIM(RTRIM(KATR1)), ''),  -- carrier service type 1
+            NULLIF(LTRIM(RTRIM(KATR2)), ''),  -- carrier service type 2
+            NULLIF(LTRIM(RTRIM(KATR3)), ''),  -- carrier service type 3
+            NULLIF(LTRIM(RTRIM(KATR6)), ''),  -- carrier delivery time 1
+            NULLIF(LTRIM(RTRIM(KATR7)), ''),  -- carrier delivery time 2
+            NULLIF(LTRIM(RTRIM(KATR8)), '')   -- carrier delivery time 3
         FROM bronze.sap_kna1 WITH (NOLOCK)
         WHERE MANDT = '400'
-          AND LTRIM(RTRIM(LOEVM)) <> 'X';  -- excluye clientes marcados para borrado en SAP
+          AND LTRIM(RTRIM(LOEVM)) <> 'X';  -- excludes customers flagged for deletion in SAP
         SET @rows_count = @@ROWCOUNT;
 
         SET @end_time = GETDATE();
-        PRINT 'Filas: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
+        PRINT 'Rows: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
     END TRY
     BEGIN CATCH
-        PRINT 'ERROR en silver.sap_kna1: ' + ERROR_MESSAGE();
+        PRINT 'ERROR in silver.sap_kna1: ' + ERROR_MESSAGE();
         THROW;
     END CATCH;
 
     -- ==========================================
-    -- 2. LIMPIEZA: KNVP (Interlocutores)
+    -- 2. CLEANING: KNVP (Partner Functions)
     -- ==========================================
     BEGIN TRY
         SET @start_time = GETDATE();
-        PRINT '>> Cargando y limpiando silver.sap_knvp...';
+        PRINT '>> Loading and cleaning silver.sap_knvp...';
 
         TRUNCATE TABLE silver.sap_knvp;
 
@@ -113,12 +113,12 @@ BEGIN
             cliente_asociado, id_interlocutor, nombre_interlocutor, id_paqueteria, flag_default
         )
         SELECT
-            LTRIM(RTRIM(p.MANDT)),  -- mandante
-            CAST(CAST(NULLIF(LTRIM(RTRIM(p.KUNNR)), '') AS BIGINT) AS VARCHAR(10)),  -- codigo cliente (sin ceros a la izquierda)
-            LTRIM(RTRIM(p.VKORG)),  -- organizacion de ventas
-            LTRIM(RTRIM(p.VTWEG)),  -- canal de distribucion
+            LTRIM(RTRIM(p.MANDT)),  -- client (SAP mandante)
+            CAST(CAST(NULLIF(LTRIM(RTRIM(p.KUNNR)), '') AS BIGINT) AS VARCHAR(10)),  -- customer code (no leading zeros)
+            LTRIM(RTRIM(p.VKORG)),  -- sales organization
+            LTRIM(RTRIM(p.VTWEG)),  -- distribution channel
             LTRIM(RTRIM(p.SPART)),  -- sector
-            LTRIM(RTRIM(p.PARVW)),  -- funcion de interlocutor
+            LTRIM(RTRIM(p.PARVW)),  -- partner function
             CASE LTRIM(RTRIM(p.PARVW))
                 WHEN 'AG' THEN 'Solicitante'
                 WHEN 'RE' THEN 'Receptor de Factura'
@@ -135,34 +135,34 @@ BEGIN
                 WHEN 'Z3' THEN 'Paqueteria 3'
                 WHEN 'Z4' THEN 'Paqueteria 4'
                 ELSE NULL
-            END,  -- descripcion_funcion (catalogo de negocio confirmado)
-            LTRIM(RTRIM(p.PARZA)),  -- contador (completa la PK junto con funcion_interlocutor)
-            CAST(CAST(NULLIF(LTRIM(RTRIM(p.KUNN2)), '') AS BIGINT) AS VARCHAR(10)),  -- cliente asociado / hijo (sin ceros a la izquierda)
-            NULLIF(LTRIM(RTRIM(p.PERNR)), ''),  -- id interlocutor
-            NULLIF(LTRIM(RTRIM(e.ENAME)), ''),  -- nombre real del interlocutor (resuelto via bronze.sap_pa0001, solo aplica a roles que son empleados)
-            NULLIF(LTRIM(RTRIM(p.LIFNR)), ''),  -- id paqueteria
-            CASE WHEN LTRIM(RTRIM(p.DEFPA)) = 'X' THEN 1 ELSE 0 END  -- flag defecto (preferencia)
+            END,  -- descripcion_funcion (confirmed business catalog; Spanish business labels kept as-is, they're report-facing data)
+            LTRIM(RTRIM(p.PARZA)),  -- counter (completes the PK together with funcion_interlocutor)
+            CAST(CAST(NULLIF(LTRIM(RTRIM(p.KUNN2)), '') AS BIGINT) AS VARCHAR(10)),  -- associated/child customer (no leading zeros)
+            NULLIF(LTRIM(RTRIM(p.PERNR)), ''),  -- partner id
+            NULLIF(LTRIM(RTRIM(e.ENAME)), ''),  -- partner's real name (resolved via bronze.sap_pa0001, only applies to roles that are employees)
+            NULLIF(LTRIM(RTRIM(p.LIFNR)), ''),  -- carrier id
+            CASE WHEN LTRIM(RTRIM(p.DEFPA)) = 'X' THEN 1 ELSE 0 END  -- default flag (preference)
         FROM bronze.sap_knvp p WITH (NOLOCK)
         LEFT JOIN bronze.sap_pa0001 e WITH (NOLOCK)
             ON e.MANDT = p.MANDT AND e.PERNR = p.PERNR AND e.ENDDA = '99991231'
         WHERE p.MANDT = '400'
-          AND LTRIM(RTRIM(p.VKORG)) = '2000';  -- organizacion de ventas real (2000=316,085 filas vs 4000=800, ruido/prueba)
+          AND LTRIM(RTRIM(p.VKORG)) = '2000';  -- real sales organization (2000=316,085 rows vs 4000=800, noise/test)
         SET @rows_count = @@ROWCOUNT;
 
         SET @end_time = GETDATE();
-        PRINT 'Filas: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
+        PRINT 'Rows: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
     END TRY
     BEGIN CATCH
-        PRINT 'ERROR en silver.sap_knvp: ' + ERROR_MESSAGE();
+        PRINT 'ERROR in silver.sap_knvp: ' + ERROR_MESSAGE();
         THROW;
     END CATCH;
 
     -- ==========================================
-    -- 3. LIMPIEZA: KNKK (Límites de Crédito)
+    -- 3. CLEANING: KNKK (Credit Limits)
     -- ==========================================
     BEGIN TRY
         SET @start_time = GETDATE();
-        PRINT '>> Cargando y limpiando silver.sap_knkk...';
+        PRINT '>> Loading and cleaning silver.sap_knkk...';
 
         TRUNCATE TABLE silver.sap_knkk;
 
@@ -178,54 +178,54 @@ BEGIN
             fecha_ultima_modificacion_texto, grupo_credito, indicador_pago_db, limite_credito_recomendado_db
         )
         SELECT
-            LTRIM(RTRIM(MANDT)),  -- mandante
-            CAST(CAST(NULLIF(LTRIM(RTRIM(KUNNR)), '') AS BIGINT) AS VARCHAR(10)),  -- codigo cliente (sin ceros a la izquierda)
-            CAST(CAST(NULLIF(LTRIM(RTRIM(KNKLI)), '') AS BIGINT) AS VARCHAR(10)),  -- codigo padre (sin ceros a la izquierda)
-            LTRIM(RTRIM(KKBER)),  -- area de control de credito
-            ISNULL(KLIMK, 0),     -- limite de credito
-            ISNULL(SKFOR, 0),     -- monto de facturas abiertas
-            ISNULL(SAUFT, 0),     -- monto de pedidos aun no facturados
-            ISNULL(SSOBL, 0),     -- especiales/pagares
-            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(UEDAT)), '00000000'), 112), -- fecha ultima revision limite credito
-            NULLIF(LTRIM(RTRIM(ERNAM)), ''),  -- usuario que creo el registro de credito en sap
-            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(ERDAT)), '00000000'), 112), -- fecha en la que se creo el registro de credito en sap
-            NULLIF(LTRIM(RTRIM(CTLPC)), ''),  -- prioridad
-            NULLIF(LTRIM(RTRIM(CRBLB)), ''),  -- bloqueo de pedido temporal
-            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(NXTRV)), '00000000'), 112), -- fecha de proxima revision limite de credito
-            NULLIF(LTRIM(RTRIM(KRAUS)), ''),  -- etiqueta credito, contado, etc
-            NULLIF(LTRIM(RTRIM(SBGRP)), ''),  -- grupo de responsables de credito
-            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(REVDB)), '00000000'), 112), -- fecha que se cambio a credito o a contado
-            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(AEDAT)), '00000000'), 112), -- fecha de ultima modificacion en datos de credito de cliente
-            NULLIF(LTRIM(RTRIM(AENAM)), ''),  -- persona que hizo la ultima modificacion en datos de credito de cliente
-            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(SBDAT)), '00000000'), 112), -- fecha proxima verificacion (se vence el pagare)
-            NULLIF(LTRIM(RTRIM(KDGRP)), ''),  -- pagare, contrato, negativa, etc
-            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(CASHD)), '00000000'), 112), -- fecha de ultimo pago
-            ISNULL(CASHA, 0),     -- monto del ultimo pago
-            NULLIF(LTRIM(RTRIM(CASHC)), ''),  -- tipo de moneda de ultimo pago
-            NULLIF(LTRIM(RTRIM(DBRTG)), ''),  -- clasificacion de riesgo (ADN)
-            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(AETXT)), '00000000'), 112), -- fecha ultima modificacion del texto del registro (seguimiento de pagares, entre otros usos)
-            NULLIF(LTRIM(RTRIM(GRUPP)), ''),  -- grupo/estado especial de credito
-            NULLIF(LTRIM(RTRIM(DBPAY)), ''),  -- indicador de pago D&B
-            NULLIF(DBEKR, 0)      -- limite de credito recomendado D&B
+            LTRIM(RTRIM(MANDT)),  -- client (SAP mandante)
+            CAST(CAST(NULLIF(LTRIM(RTRIM(KUNNR)), '') AS BIGINT) AS VARCHAR(10)),  -- customer code (no leading zeros)
+            CAST(CAST(NULLIF(LTRIM(RTRIM(KNKLI)), '') AS BIGINT) AS VARCHAR(10)),  -- parent code (no leading zeros)
+            LTRIM(RTRIM(KKBER)),  -- credit control area
+            ISNULL(KLIMK, 0),     -- credit limit
+            ISNULL(SKFOR, 0),     -- open invoices amount
+            ISNULL(SAUFT, 0),     -- amount of orders not yet invoiced
+            ISNULL(SSOBL, 0),     -- specials/promissory notes
+            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(UEDAT)), '00000000'), 112), -- date of last credit-limit review
+            NULLIF(LTRIM(RTRIM(ERNAM)), ''),  -- user who created the credit record in SAP
+            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(ERDAT)), '00000000'), 112), -- date the credit record was created in SAP
+            NULLIF(LTRIM(RTRIM(CTLPC)), ''),  -- priority
+            NULLIF(LTRIM(RTRIM(CRBLB)), ''),  -- temporary order block
+            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(NXTRV)), '00000000'), 112), -- date of next credit-limit review
+            NULLIF(LTRIM(RTRIM(KRAUS)), ''),  -- credit/cash tag, etc.
+            NULLIF(LTRIM(RTRIM(SBGRP)), ''),  -- credit officers group
+            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(REVDB)), '00000000'), 112), -- date it switched to credit or to cash
+            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(AEDAT)), '00000000'), 112), -- date of last modification to the customer's credit data
+            NULLIF(LTRIM(RTRIM(AENAM)), ''),  -- person who made the last modification to the customer's credit data
+            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(SBDAT)), '00000000'), 112), -- next verification date (the promissory note comes due)
+            NULLIF(LTRIM(RTRIM(KDGRP)), ''),  -- promissory note, contract, refusal, etc.
+            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(CASHD)), '00000000'), 112), -- last payment date
+            ISNULL(CASHA, 0),     -- last payment amount
+            NULLIF(LTRIM(RTRIM(CASHC)), ''),  -- last payment currency type
+            NULLIF(LTRIM(RTRIM(DBRTG)), ''),  -- risk classification (D&B)
+            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(AETXT)), '00000000'), 112), -- date of last modification to the record's text (promissory-note tracking, among other uses)
+            NULLIF(LTRIM(RTRIM(GRUPP)), ''),  -- special credit group/status
+            NULLIF(LTRIM(RTRIM(DBPAY)), ''),  -- D&B payment indicator
+            NULLIF(DBEKR, 0)      -- D&B recommended credit limit
         FROM bronze.sap_knkk WITH (NOLOCK)
         WHERE MANDT = '400'
-          AND LTRIM(RTRIM(KKBER)) = '2000';  -- area de control de credito real (2000=23,788 filas vs 1000=14/0001=1, ruido/prueba)
+          AND LTRIM(RTRIM(KKBER)) = '2000';  -- real credit control area (2000=23,788 rows vs 1000=14/0001=1, noise/test)
         SET @rows_count = @@ROWCOUNT;
 
         SET @end_time = GETDATE();
-        PRINT 'Filas: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
+        PRINT 'Rows: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
     END TRY
     BEGIN CATCH
-        PRINT 'ERROR en silver.sap_knkk: ' + ERROR_MESSAGE();
+        PRINT 'ERROR in silver.sap_knkk: ' + ERROR_MESSAGE();
         THROW;
     END CATCH;
 
     -- ==========================================
-    -- 4. LIMPIEZA Y CARGA: KNVV (Ventas por Cliente)
+    -- 4. CLEANING AND LOAD: KNVV (Customer Sales)
     -- ==========================================
     BEGIN TRY
         SET @start_time = GETDATE();
-        PRINT '>> Cargando y limpiando silver.sap_knvv...';
+        PRINT '>> Loading and cleaning silver.sap_knvv...';
 
         TRUNCATE TABLE silver.sap_knvv;
 
@@ -240,58 +240,58 @@ BEGIN
             fecha_creacion, creado_por
         )
         SELECT
-            LTRIM(RTRIM(v.MANDT)),   -- mandante
-            CAST(CAST(NULLIF(LTRIM(RTRIM(v.KUNNR)), '') AS BIGINT) AS VARCHAR(10)),   -- id cliente (sin ceros a la izquierda)
-            LTRIM(RTRIM(v.VKORG)),   -- organizacion de ventas
-            LTRIM(RTRIM(v.VTWEG)),   -- canal
+            LTRIM(RTRIM(v.MANDT)),   -- client (SAP mandante)
+            CAST(CAST(NULLIF(LTRIM(RTRIM(v.KUNNR)), '') AS BIGINT) AS VARCHAR(10)),   -- customer id (no leading zeros)
+            LTRIM(RTRIM(v.VKORG)),   -- sales organization
+            LTRIM(RTRIM(v.VTWEG)),   -- channel
             LTRIM(RTRIM(v.SPART)),   -- sector
-            NULLIF(LTRIM(RTRIM(v.VKBUR)), ''),   -- oficina de ventas
-            NULLIF(LTRIM(RTRIM(v.VKGRP)), ''),   -- grupo vendedores
+            NULLIF(LTRIM(RTRIM(v.VKBUR)), ''),   -- sales office
+            NULLIF(LTRIM(RTRIM(v.VKGRP)), ''),   -- salesperson group
             NULLIF(LTRIM(RTRIM(v.BZIRK)), ''),   -- region
-            NULLIF(LTRIM(RTRIM(v.KVGR1)), ''),   -- codigo sap de la ruta
-            NULLIF(LTRIM(RTRIM(t.BEZEI)), ''),  -- nombre real de la ruta (resuelto via bronze.sap_tvv1t)
-            NULLIF(LTRIM(RTRIM(v.VWERK)), ''),   -- centro suministrador
-            NULLIF(LTRIM(RTRIM(v.KDGRP)), ''),   -- grupo de clientes
-            NULLIF(LTRIM(RTRIM(v.KONDA)), ''),   -- grupo de precios
-            NULLIF(LTRIM(RTRIM(v.PLTYP)), ''),   -- lista de precios
-            NULLIF(LTRIM(RTRIM(v.INCO1)), ''),   -- incoterm codigo
-            NULLIF(LTRIM(RTRIM(v.INCO2)), ''),   -- incoterm descripcion
-            v.ANTLF,                 -- entregas parciales maximas
-            NULLIF(LTRIM(RTRIM(v.LPRIO)), ''),   -- prioridad entrega
-            NULLIF(LTRIM(RTRIM(v.KVGR2)), ''),   -- tiempo de entrega
-            NULLIF(LTRIM(RTRIM(v.KVGR3)), ''),   -- tipo de servicio paqueteria
-            NULLIF(LTRIM(RTRIM(v.KVGR4)), ''),   -- tipo de servicio paqueteria 2
-            CASE WHEN LEN(LTRIM(RTRIM(v.VSBED))) = 1 THEN '0' + LTRIM(RTRIM(v.VSBED)) ELSE NULLIF(LTRIM(RTRIM(v.VSBED)), '') END, -- condicion de expedicion (normalizada a 2 digitos)
-            NULLIF(LTRIM(RTRIM(v.ZTERM)), ''),   -- condicion pago
-            NULLIF(LTRIM(RTRIM(v.WAERS)), ''),   -- moneda
-            NULLIF(LTRIM(RTRIM(v.LIFSD)), ''),   -- bloqueo de entrega
-            NULLIF(LTRIM(RTRIM(v.FAKSD)), ''),   -- bloqueo de facturacion
-            NULLIF(LTRIM(RTRIM(v.AUFSD)), ''),   -- bloqueo de pedido
-            NULLIF(LTRIM(RTRIM(v.CASSD)), ''),  -- bloqueo de contacto para deudores (area de ventas)
-            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(v.ERDAT)), '00000000'), 112), -- fecha de alta
-            NULLIF(LTRIM(RTRIM(v.ERNAM)), '')    -- creado por
+            NULLIF(LTRIM(RTRIM(v.KVGR1)), ''),   -- SAP route code
+            NULLIF(LTRIM(RTRIM(t.BEZEI)), ''),  -- route's real name (resolved via bronze.sap_tvv1t)
+            NULLIF(LTRIM(RTRIM(v.VWERK)), ''),   -- supplying plant
+            NULLIF(LTRIM(RTRIM(v.KDGRP)), ''),   -- customer group
+            NULLIF(LTRIM(RTRIM(v.KONDA)), ''),   -- price group
+            NULLIF(LTRIM(RTRIM(v.PLTYP)), ''),   -- price list
+            NULLIF(LTRIM(RTRIM(v.INCO1)), ''),   -- incoterm code
+            NULLIF(LTRIM(RTRIM(v.INCO2)), ''),   -- incoterm description
+            v.ANTLF,                 -- maximum partial deliveries
+            NULLIF(LTRIM(RTRIM(v.LPRIO)), ''),   -- delivery priority
+            NULLIF(LTRIM(RTRIM(v.KVGR2)), ''),   -- delivery time
+            NULLIF(LTRIM(RTRIM(v.KVGR3)), ''),   -- carrier service type
+            NULLIF(LTRIM(RTRIM(v.KVGR4)), ''),   -- carrier service type 2
+            CASE WHEN LEN(LTRIM(RTRIM(v.VSBED))) = 1 THEN '0' + LTRIM(RTRIM(v.VSBED)) ELSE NULLIF(LTRIM(RTRIM(v.VSBED)), '') END, -- shipping condition (normalized to 2 digits)
+            NULLIF(LTRIM(RTRIM(v.ZTERM)), ''),   -- payment terms
+            NULLIF(LTRIM(RTRIM(v.WAERS)), ''),   -- currency
+            NULLIF(LTRIM(RTRIM(v.LIFSD)), ''),   -- delivery block
+            NULLIF(LTRIM(RTRIM(v.FAKSD)), ''),   -- billing block
+            NULLIF(LTRIM(RTRIM(v.AUFSD)), ''),   -- order block
+            NULLIF(LTRIM(RTRIM(v.CASSD)), ''),  -- dunning contact block (sales area)
+            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(v.ERDAT)), '00000000'), 112), -- creation date
+            NULLIF(LTRIM(RTRIM(v.ERNAM)), '')    -- created by
         FROM bronze.sap_knvv v WITH (NOLOCK)
         LEFT JOIN bronze.sap_tvv1t t WITH (NOLOCK)
             ON t.MANDT = v.MANDT AND t.SPRAS = 'S' AND t.KVGR1 = v.KVGR1
         WHERE v.MANDT = '400'
-          AND LTRIM(RTRIM(v.LOEVM)) <> 'X'  -- excluye areas de venta marcadas para borrado en SAP
-          AND LTRIM(RTRIM(v.VKORG)) = '2000';  -- organizacion de ventas real (2000=29,114 filas vs 4000=185, ruido/prueba)
+          AND LTRIM(RTRIM(v.LOEVM)) <> 'X'  -- excludes sales areas flagged for deletion in SAP
+          AND LTRIM(RTRIM(v.VKORG)) = '2000';  -- real sales organization (2000=29,114 rows vs 4000=185, noise/test)
         SET @rows_count = @@ROWCOUNT;
 
         SET @end_time = GETDATE();
-        PRINT 'Filas: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
+        PRINT 'Rows: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
     END TRY
     BEGIN CATCH
-        PRINT 'ERROR en silver.sap_knvv: ' + ERROR_MESSAGE();
+        PRINT 'ERROR in silver.sap_knvv: ' + ERROR_MESSAGE();
         THROW;
     END CATCH;
 
     -- ==========================================
-    -- 5. LIMPIEZA: BSID (Partidas Abiertas)
+    -- 5. CLEANING: BSID (Open Items)
     -- ==========================================
     BEGIN TRY
         SET @start_time = GETDATE();
-        PRINT '>> Cargando y limpiando silver.sap_bsid...';
+        PRINT '>> Loading and cleaning silver.sap_bsid...';
 
         TRUNCATE TABLE silver.sap_bsid;
 
@@ -305,58 +305,58 @@ BEGIN
             bloqueo_reclamacion_temporal, fecha_ultima_reclamacion
         )
         SELECT
-            LTRIM(RTRIM(MANDT)),  -- mandante
-            LTRIM(RTRIM(BUKRS)),  -- sociedad
-            CAST(CAST(NULLIF(LTRIM(RTRIM(KUNNR)), '') AS BIGINT) AS VARCHAR(10)),  -- id cliente (sin ceros a la izquierda)
-            GJAHR,                -- año del documento
-            NULLIF(LTRIM(RTRIM(MONAT)), ''),  -- mes del documento
-            LTRIM(RTRIM(BELNR)),  -- id del documento no compensado
-            NULLIF(LTRIM(RTRIM(ZUONR)), ''),  -- id del documento de donde nacio (aplica para notas de credito)
-            NULLIF(LTRIM(RTRIM(XBLNR)), ''),  -- id referencia
-            NULLIF(LTRIM(RTRIM(VBELN)), ''),  -- documento de ventas (SD)
-            BUZEI,                -- conteo de BELNR
-            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(BUDAT)), '00000000'), 112), -- fecha contabilizacion
-            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(BLDAT)), '00000000'), 112), -- fecha documento
-            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(CPUDT)), '00000000'), 112), -- fecha registro sistema
-            DATEADD(DAY, ISNULL(ZBD1T, 0), TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(ZFBDT)), '00000000'), 112)), -- fecha vencimiento real = ZFBDT (fecha base de descuento) + dias_plazo, NO ZFBDT solo (bug corregido 2026-08-13, confirmado contra SAP: ZFBDT=13.05.2026 + 30 dias plazo = vencimiento real 12.06.2026)
-            NULLIF(LTRIM(RTRIM(BLART)), ''),  -- tipo documento (dz, f4, c1, etc)
-            NULLIF(LTRIM(RTRIM(MWSKZ)), ''),  -- codigo de impuesto (IVA)
-            NULLIF(LTRIM(RTRIM(SHKZG)), ''),  -- debe o haber
-            ISNULL(DMBTR, 0),     -- monto en moneda local
-            ISNULL(WRBTR, 0),     -- monto en moneda original
-            NULLIF(LTRIM(RTRIM(WAERS)), ''),  -- moneda
-            NULLIF(LTRIM(RTRIM(ZTERM)), ''),  -- condicion de pago
-            ISNULL(ZBD1T, 0),     -- dias plazo
-            NULLIF(LTRIM(RTRIM(MABER)), ''),  -- area de reclamacion
-            NULLIF(LTRIM(RTRIM(MANST)), ''),  -- nivel de reclamacion
-            NULLIF(LTRIM(RTRIM(MSCHL)), ''),  -- clave de reclamacion legal
-            NULLIF(LTRIM(RTRIM(MANSP)), ''),  -- bloqueo de reclamacion temporal
-            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(MADAT)), '00000000'), 112) -- fecha de la ultima reclamacion
+            LTRIM(RTRIM(MANDT)),  -- client (SAP mandante)
+            LTRIM(RTRIM(BUKRS)),  -- company code
+            CAST(CAST(NULLIF(LTRIM(RTRIM(KUNNR)), '') AS BIGINT) AS VARCHAR(10)),  -- customer id (no leading zeros)
+            GJAHR,                -- document fiscal year
+            NULLIF(LTRIM(RTRIM(MONAT)), ''),  -- document month
+            LTRIM(RTRIM(BELNR)),  -- uncleared document id
+            NULLIF(LTRIM(RTRIM(ZUONR)), ''),  -- id of the document it originated from (applies to credit notes)
+            NULLIF(LTRIM(RTRIM(XBLNR)), ''),  -- reference id
+            NULLIF(LTRIM(RTRIM(VBELN)), ''),  -- sales document (SD)
+            BUZEI,                -- BELNR line count
+            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(BUDAT)), '00000000'), 112), -- posting date
+            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(BLDAT)), '00000000'), 112), -- document date
+            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(CPUDT)), '00000000'), 112), -- system entry date
+            DATEADD(DAY, ISNULL(ZBD1T, 0), TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(ZFBDT)), '00000000'), 112)), -- real due date = ZFBDT (discount base date) + dias_plazo, NOT ZFBDT alone (bug fixed 2026-08-13, confirmed against SAP: ZFBDT=13.05.2026 + 30-day term = real due date 12.06.2026)
+            NULLIF(LTRIM(RTRIM(BLART)), ''),  -- document type (dz, f4, c1, etc.)
+            NULLIF(LTRIM(RTRIM(MWSKZ)), ''),  -- tax code (VAT)
+            NULLIF(LTRIM(RTRIM(SHKZG)), ''),  -- debit or credit
+            ISNULL(DMBTR, 0),     -- amount in local currency
+            ISNULL(WRBTR, 0),     -- amount in original currency
+            NULLIF(LTRIM(RTRIM(WAERS)), ''),  -- currency
+            NULLIF(LTRIM(RTRIM(ZTERM)), ''),  -- payment terms
+            ISNULL(ZBD1T, 0),     -- term days
+            NULLIF(LTRIM(RTRIM(MABER)), ''),  -- dunning area
+            NULLIF(LTRIM(RTRIM(MANST)), ''),  -- dunning level
+            NULLIF(LTRIM(RTRIM(MSCHL)), ''),  -- legal dunning key
+            NULLIF(LTRIM(RTRIM(MANSP)), ''),  -- temporary dunning block
+            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(MADAT)), '00000000'), 112) -- date of the last dunning notice
         FROM bronze.sap_bsid WITH (NOLOCK)
         WHERE MANDT = '400';
         SET @rows_count = @@ROWCOUNT;
 
         SET @end_time = GETDATE();
-        PRINT 'Filas: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
+        PRINT 'Rows: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
     END TRY
     BEGIN CATCH
-        PRINT 'ERROR en silver.sap_bsid: ' + ERROR_MESSAGE();
+        PRINT 'ERROR in silver.sap_bsid: ' + ERROR_MESSAGE();
         THROW;
     END CATCH;
 
     -- ==========================================
-    -- 6. LIMPIEZA: BSAD (Partidas Compensadas)
+    -- 6. CLEANING: BSAD (Cleared Items)
     -- ==========================================
     BEGIN TRY
         SET @start_time = GETDATE();
-        PRINT '>> Cargando y limpiando silver.sap_bsad (Merge Incremental)...';
+        PRINT '>> Loading and cleaning silver.sap_bsad (Incremental Merge)...';
 
-        -- Definimos ventana de refresco para Silver (mes actual + mes anterior)
+        -- Set the refresh window for Silver (current month + previous month)
         DECLARE @mes_anterior_inicio DATE = DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()) - 1, 0);
-        -- Version en texto 'YYYYMMDD' para poder comparar contra AUGDT (NVARCHAR en bronze)
-        -- sin envolver la columna en una funcion: envolver AUGDT en TRY_CONVERT() en el WHERE
-        -- lo vuelve no-sargable (obliga a evaluar la funcion fila por fila, sin poder usar
-        -- ningun indice sobre AUGDT), igual que ya se corrigio en el MERGE de bronze.sap_bsad.
+        -- Text version 'YYYYMMDD' to be able to compare against AUGDT (NVARCHAR in bronze)
+        -- without wrapping the column in a function: wrapping AUGDT in TRY_CONVERT() in the
+        -- WHERE makes it non-sargable (forces the function to be evaluated row by row, with
+        -- no index usable on AUGDT), the same issue already fixed in bronze.sap_bsad's MERGE.
         DECLARE @mes_anterior_inicio_str NVARCHAR(8) = CONVERT(NVARCHAR(8), @mes_anterior_inicio, 112);
 
         MERGE silver.sap_bsad AS tgt
@@ -364,7 +364,7 @@ BEGIN
             SELECT
                 LTRIM(RTRIM(MANDT)) AS mandante,
                 LTRIM(RTRIM(BUKRS)) AS sociedad,
-                CAST(CAST(NULLIF(LTRIM(RTRIM(KUNNR)), '') AS BIGINT) AS VARCHAR(10)) AS cliente_id,  -- sin ceros a la izquierda
+                CAST(CAST(NULLIF(LTRIM(RTRIM(KUNNR)), '') AS BIGINT) AS VARCHAR(10)) AS cliente_id,  -- no leading zeros
                 GJAHR AS ejercicio,
                 NULLIF(LTRIM(RTRIM(MONAT)), '') AS mes,
                 LTRIM(RTRIM(BELNR)) AS documento_id,
@@ -381,7 +381,7 @@ BEGIN
                 NULLIF(LTRIM(RTRIM(BLART)), '') AS clase_documento,
                 NULLIF(LTRIM(RTRIM(MWSKZ)), '') AS codigo_impuesto,
                 NULLIF(LTRIM(RTRIM(SHKZG)), '') AS debe_haber,
-                DATEADD(DAY, ISNULL(ZBD1T, 0), TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(ZFBDT)), '00000000'), 112)) AS fecha_vencimiento, -- vencimiento real = ZFBDT + dias_plazo (bug corregido 2026-08-13, ver nota en el paso de bsid arriba)
+                DATEADD(DAY, ISNULL(ZBD1T, 0), TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(ZFBDT)), '00000000'), 112)) AS fecha_vencimiento, -- real due date = ZFBDT + dias_plazo (bug fixed 2026-08-13, see the note in the bsid step above)
                 ISNULL(DMBTR, 0) AS monto_moneda_local,
                 ISNULL(WRBTR, 0) AS monto_moneda_doc,
                 NULLIF(LTRIM(RTRIM(WAERS)), '') AS moneda,
@@ -406,16 +406,16 @@ BEGIN
         AND tgt.ejercicio = src.ejercicio
         AND tgt.documento_id = src.documento_id
         AND tgt.posicion = src.posicion
-        -- NO se filtra tgt.fecha_compensacion aqui (bug corregido 2026-08-13): si la
-        -- llave primaria coincide, es la misma linea sin importar que fecha_compensacion
-        -- tenga guardada. Con esa condicion en el ON, una linea reversada y vuelta a
-        -- compensar por SAP (fecha_compensacion vieja en destino, AUGDT nuevo en bronze
-        -- porque bronze no guarda historial) se trataba como "no coincide" y el MERGE
-        -- intentaba un INSERT duplicado en vez de actualizar la fila existente - violando
-        -- la PK. Caso real: documento 7404597470/pos.1, compensado originalmente
-        -- 2026-04-07 (doc. 8501526715), reversado y recompensado 2026-08-03 (doc.
-        -- 1402639643). El filtro de ventana ya vive en el WHERE del src (AUGDT >=
-        -- @mes_anterior_inicio_str) - no hace falta repetirlo en el ON.
+        -- tgt.fecha_compensacion is NOT filtered here (bug fixed 2026-08-13): if the
+        -- primary key matches, it's the same line regardless of what fecha_compensacion
+        -- it has stored. With that condition in the ON, a line that SAP reversed and
+        -- re-cleared (old fecha_compensacion in the target, new AUGDT in bronze because
+        -- bronze doesn't keep history) was treated as "no match" and the MERGE tried a
+        -- duplicate INSERT instead of updating the existing row - violating the PK. Real
+        -- case: document 7404597470/pos.1, originally cleared 2026-04-07 (doc.
+        -- 8501526715), reversed and re-cleared 2026-08-03 (doc. 1402639643). The window
+        -- filter already lives in the src's WHERE (AUGDT >= @mes_anterior_inicio_str) -
+        -- no need to repeat it in the ON.
 
         WHEN MATCHED THEN UPDATE SET
             tgt.fecha_compensacion = src.fecha_compensacion,
@@ -461,19 +461,19 @@ BEGIN
         SET @rows_count = @@ROWCOUNT;
 
         SET @end_time = GETDATE();
-        PRINT 'Filas: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
+        PRINT 'Rows: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
     END TRY
     BEGIN CATCH
-        PRINT 'ERROR en silver.sap_bsad: ' + ERROR_MESSAGE();
+        PRINT 'ERROR in silver.sap_bsad: ' + ERROR_MESSAGE();
         THROW;
     END CATCH;
 
     -- ==========================================
-    -- 7. LIMPIEZA: KNB1 (Datos de Sociedad del Cliente)
+    -- 7. CLEANING: KNB1 (Customer Company Code Data)
     -- ==========================================
     BEGIN TRY
         SET @start_time = GETDATE();
-        PRINT '>> Cargando y limpiando silver.sap_knb1...';
+        PRINT '>> Loading and cleaning silver.sap_knb1...';
 
         TRUNCATE TABLE silver.sap_knb1;
 
@@ -486,46 +486,46 @@ BEGIN
             cuenta_pagador_alterno, banco_propio, vias_pago, flag_compensacion_cliente_proveedor
         )
         SELECT
-            LTRIM(RTRIM(MANDT)),  -- mandante
-            LTRIM(RTRIM(BUKRS)),  -- sociedad
-            CAST(CAST(NULLIF(LTRIM(RTRIM(KUNNR)), '') AS BIGINT) AS VARCHAR(10)),  -- id cliente (sin ceros a la izquierda)
-            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(ERDAT)), '00000000'), 112), -- fecha de creacion
-            NULLIF(LTRIM(RTRIM(ERNAM)), ''),  -- usuario creador
-            NULLIF(LTRIM(RTRIM(AKONT)), ''),  -- cuenta de mayor
-            NULLIF(LTRIM(RTRIM(ZUAWA)), ''),  -- clave de ordenacion de partidas
-            NULLIF(LTRIM(RTRIM(FDGRV)), ''),  -- grupo de planificacion de tesoreria
-            NULLIF(LTRIM(RTRIM(ZTERM)), ''),  -- condicion de pago
-            NULLIF(LTRIM(RTRIM(VZSKZ)), ''),  -- indicador de calculo de intereses
-            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(ZINDT)), '00000000'), 112), -- fecha ultima liquidacion intereses
-            NULLIF(LTRIM(RTRIM(LOEVM)), ''),  -- flag de borrado
-            NULLIF(LTRIM(RTRIM(SPERR)), ''),  -- bloqueo de contabilizacion
-            NULLIF(LTRIM(RTRIM(BEGRU)), ''),  -- grupo de autorizacion
-            NULLIF(LTRIM(RTRIM(QLAND)), ''),  -- pais fiscal
-            NULLIF(LTRIM(RTRIM(XAUSZ)), ''),  -- flag de compensacion con acreedor
-            NULLIF(LTRIM(RTRIM(ALTKN)), ''),  -- cuenta anterior
-            NULLIF(LTRIM(RTRIM(KNRZE)), ''),  -- cuenta del pagador alterno
-            NULLIF(LTRIM(RTRIM(HBKID)), ''),  -- banco propio
-            NULLIF(LTRIM(RTRIM(ZWELS)), ''),  -- vias de pago permitidas
-            CASE WHEN LTRIM(RTRIM(XZVER)) = 'X' THEN 1 ELSE 0 END  -- flag compensacion cliente-proveedor
+            LTRIM(RTRIM(MANDT)),  -- client (SAP mandante)
+            LTRIM(RTRIM(BUKRS)),  -- company code
+            CAST(CAST(NULLIF(LTRIM(RTRIM(KUNNR)), '') AS BIGINT) AS VARCHAR(10)),  -- customer id (no leading zeros)
+            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(ERDAT)), '00000000'), 112), -- creation date
+            NULLIF(LTRIM(RTRIM(ERNAM)), ''),  -- creating user
+            NULLIF(LTRIM(RTRIM(AKONT)), ''),  -- reconciliation account
+            NULLIF(LTRIM(RTRIM(ZUAWA)), ''),  -- sort key for line items
+            NULLIF(LTRIM(RTRIM(FDGRV)), ''),  -- treasury planning group
+            NULLIF(LTRIM(RTRIM(ZTERM)), ''),  -- payment terms
+            NULLIF(LTRIM(RTRIM(VZSKZ)), ''),  -- interest calculation indicator
+            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(ZINDT)), '00000000'), 112), -- date of last interest settlement
+            NULLIF(LTRIM(RTRIM(LOEVM)), ''),  -- deletion flag
+            NULLIF(LTRIM(RTRIM(SPERR)), ''),  -- posting block
+            NULLIF(LTRIM(RTRIM(BEGRU)), ''),  -- authorization group
+            NULLIF(LTRIM(RTRIM(QLAND)), ''),  -- tax country
+            NULLIF(LTRIM(RTRIM(XAUSZ)), ''),  -- vendor clearing flag
+            NULLIF(LTRIM(RTRIM(ALTKN)), ''),  -- previous account
+            NULLIF(LTRIM(RTRIM(KNRZE)), ''),  -- alternate payer account
+            NULLIF(LTRIM(RTRIM(HBKID)), ''),  -- house bank
+            NULLIF(LTRIM(RTRIM(ZWELS)), ''),  -- allowed payment methods
+            CASE WHEN LTRIM(RTRIM(XZVER)) = 'X' THEN 1 ELSE 0 END  -- customer-vendor clearing flag
         FROM bronze.sap_knb1 WITH (NOLOCK)
         WHERE MANDT = '400'
-          AND LTRIM(RTRIM(LOEVM)) <> 'X';  -- excluye registros marcados para borrado en SAP
+          AND LTRIM(RTRIM(LOEVM)) <> 'X';  -- excludes records flagged for deletion in SAP
         SET @rows_count = @@ROWCOUNT;
 
         SET @end_time = GETDATE();
-        PRINT 'Filas: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
+        PRINT 'Rows: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
     END TRY
     BEGIN CATCH
-        PRINT 'ERROR en silver.sap_knb1: ' + ERROR_MESSAGE();
+        PRINT 'ERROR in silver.sap_knb1: ' + ERROR_MESSAGE();
         THROW;
     END CATCH;
 
     -- ==========================================
-    -- 8. LIMPIEZA: KNB5 (Datos de Reclamacion del Cliente)
+    -- 8. CLEANING: KNB5 (Customer Dunning Data)
     -- ==========================================
     BEGIN TRY
         SET @start_time = GETDATE();
-        PRINT '>> Cargando y limpiando silver.sap_knb5...';
+        PRINT '>> Loading and cleaning silver.sap_knb5...';
 
         TRUNCATE TABLE silver.sap_knb5;
 
@@ -534,22 +534,22 @@ BEGIN
             procedimiento_reclamacion, bloqueo_reclamacion, fecha_ultima_reclamacion
         )
         SELECT
-            LTRIM(RTRIM(MANDT)),  -- mandante
-            CAST(CAST(NULLIF(LTRIM(RTRIM(KUNNR)), '') AS BIGINT) AS VARCHAR(10)),  -- id cliente (sin ceros a la izquierda)
-            LTRIM(RTRIM(BUKRS)),  -- sociedad
-            LTRIM(RTRIM(MABER)),  -- area de reclamacion
-            NULLIF(LTRIM(RTRIM(MAHNA)), ''),  -- procedimiento de reclamacion
-            NULLIF(LTRIM(RTRIM(MAHNS)), ''),  -- bloqueo de reclamacion
-            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(MADAT)), '00000000'), 112) -- fecha de la ultima reclamacion
+            LTRIM(RTRIM(MANDT)),  -- client (SAP mandante)
+            CAST(CAST(NULLIF(LTRIM(RTRIM(KUNNR)), '') AS BIGINT) AS VARCHAR(10)),  -- customer id (no leading zeros)
+            LTRIM(RTRIM(BUKRS)),  -- company code
+            LTRIM(RTRIM(MABER)),  -- dunning area
+            NULLIF(LTRIM(RTRIM(MAHNA)), ''),  -- dunning procedure
+            NULLIF(LTRIM(RTRIM(MAHNS)), ''),  -- dunning block
+            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(MADAT)), '00000000'), 112) -- date of the last dunning notice
         FROM bronze.sap_knb5 WITH (NOLOCK)
         WHERE MANDT = '400';
         SET @rows_count = @@ROWCOUNT;
 
         SET @end_time = GETDATE();
-        PRINT 'Filas: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
+        PRINT 'Rows: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
     END TRY
     BEGIN CATCH
-        PRINT 'ERROR en silver.sap_knb5: ' + ERROR_MESSAGE();
+        PRINT 'ERROR in silver.sap_knb5: ' + ERROR_MESSAGE();
         THROW;
     END CATCH;
 

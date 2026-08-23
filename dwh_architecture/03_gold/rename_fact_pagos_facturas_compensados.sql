@@ -2,20 +2,20 @@ USE ANALISIS_DATOS;
 GO
 
 -- ==========================================================
--- MIGRACION UNICA: renombrar gold.fact_pagos -> gold.fact_pagos_compensados
--- y gold.fact_facturas -> gold.fact_facturas_compensadas EN EL SERVIDOR REAL,
--- preservando los datos ya cargados (backfill 2022-2026).
+-- ONE-TIME MIGRATION: rename gold.fact_pagos -> gold.fact_pagos_compensados
+-- and gold.fact_facturas -> gold.fact_facturas_compensadas ON THE REAL SERVER,
+-- preserving the data already loaded (2022-2026 backfill).
 --
--- NO uses ddl_gold.sql para este cambio: esa version ya quedo con
--- DROP TABLE + CREATE TABLE para los nombres nuevos, correcto para un
--- despliegue desde cero, pero destructivo si se corre sobre estas tablas
--- ya pobladas. sp_rename no toca los datos, solo el catalogo.
+-- DO NOT use ddl_gold.sql for this change: that version already has
+-- DROP TABLE + CREATE TABLE for the new names, correct for a from-scratch
+-- deployment, but destructive if run against these already-populated
+-- tables. sp_rename doesn't touch the data, only the catalog.
 --
--- Orden: 1) tablas, 2) PK (implementada como constraint/indice), 3) indices
--- no-clustered. Despues de correr esto, vuelve a correr sp_load_gold.sql
--- (los CREATE PROCEDURE completos) y vw_pago_factura_simple.sql para que
--- los procedimientos/vista queden apuntando a los nombres nuevos - ambos
--- son DROP+CREATE de objetos sin datos, no hay riesgo ahi.
+-- Order: 1) tables, 2) PK (implemented as a constraint/index), 3) non-
+-- clustered indexes. After running this, re-run sp_load_gold.sql (the
+-- full CREATE PROCEDURE statements) and vw_pago_factura_simple.sql so the
+-- procedures/view end up pointing at the new names -- both are DROP+CREATE
+-- of objects with no data, no risk there.
 -- ==========================================================
 
 EXEC sp_rename 'gold.fact_pagos', 'fact_pagos_compensados';
@@ -26,8 +26,8 @@ EXEC sp_rename 'gold.fact_facturas', 'fact_facturas_compensadas';
 EXEC sp_rename 'gold.PK_fact_facturas', 'PK_fact_facturas_compensadas', 'OBJECT';
 EXEC sp_rename 'gold.fact_facturas_compensadas.IX_fact_facturas_grupo', 'IX_fact_facturas_compensadas_grupo', 'INDEX';
 
--- Verificacion rapida: deben aparecer los nombres nuevos, con las mismas
--- filas que tenian antes del rename.
+-- Quick check: the new names should appear, with the same row counts
+-- they had before the rename.
 SELECT 'gold.fact_pagos_compensados' AS tabla, COUNT(*) AS filas FROM gold.fact_pagos_compensados
 UNION ALL
 SELECT 'gold.fact_facturas_compensadas', COUNT(*) FROM gold.fact_facturas_compensadas;

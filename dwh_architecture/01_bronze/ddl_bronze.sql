@@ -5,7 +5,7 @@ GO
 ===============================================================================
 PROJECT: Enterprise Data Warehouse (dwh-ciosa)
 LAYER: Bronze (Raw Data Staging)
-AUTHOR: Román Alejandro López
+AUTHOR: Roman Alejandro Lopez
 DESCRIPTION: DDL creation for the general customer master table using 
              the exact nvarchar and decimal structural metadata from SAP.
 ===============================================================================
@@ -223,7 +223,7 @@ CREATE TABLE bronze.sap_knvp (
     SPART      NVARCHAR(2) NOT NULL,
     PARVW      NVARCHAR(2) NOT NULL,
     PARZA      NVARCHAR(3) NOT NULL,
-    KUNN2      NVARCHAR(10), -- Mapeado exactamente como KUNN2 de tu extracción
+    KUNN2      NVARCHAR(10), -- Mapped exactly as KUNN2 from your extraction
     LIFNR      NVARCHAR(10),
     PERNR      NVARCHAR(8),
     PARNR      NVARCHAR(10),
@@ -245,19 +245,19 @@ CREATE TABLE bronze.sap_knkk (
     MANDT      NVARCHAR(3) NOT NULL,
     KUNNR      NVARCHAR(10) NOT NULL,
     KKBER      NVARCHAR(4) NOT NULL,
-    KLIMK      DECIMAL(15,2), -- Límite de crédito
+    KLIMK      DECIMAL(15,2), -- Credit limit
     KNKLI      NVARCHAR(10),
     SAUFT      DECIMAL(15,2),
-    SKFOR      DECIMAL(15,2), -- Obligaciones totales del cliente
-    SSOBL      DECIMAL(15,2), -- Saldo deudor total especial
+    SKFOR      DECIMAL(15,2), -- Customer's total obligations
+    SSOBL      DECIMAL(15,2), -- Special total debit balance
     UEDAT      NVARCHAR(8),
     XCHNG      NVARCHAR(1),
     ERNAM      NVARCHAR(12),
     ERDAT      NVARCHAR(8),
     CTLPC      NVARCHAR(3),
     DTREV      NVARCHAR(8),
-    CRBLB      NVARCHAR(1),   -- Bloqueo de crédito
-    SBGRP      NVARCHAR(3),   -- Grupo de responsables de crédito
+    CRBLB      NVARCHAR(1),   -- Credit block
+    SBGRP      NVARCHAR(3),   -- Credit officers group
     NXTRV      NVARCHAR(8),
     KRAUS      NVARCHAR(11),
     PAYDB      NVARCHAR(2),
@@ -405,8 +405,8 @@ CREATE TABLE bronze.sap_bsid (
     SHKZG           NVARCHAR(1),
     GSBER           NVARCHAR(4),
     MWSKZ           NVARCHAR(2),
-    DMBTR           DECIMAL(13,2), -- Monto en moneda local
-    WRBTR           DECIMAL(13,2), -- Monto en moneda del documento
+    DMBTR           DECIMAL(13,2), -- Amount in local currency
+    WRBTR           DECIMAL(13,2), -- Amount in document currency
     MWSTS           DECIMAL(13,2),
     WMWST           DECIMAL(13,2),
     BDIFF           DECIMAL(13,2),
@@ -420,8 +420,8 @@ CREATE TABLE bronze.sap_bsid (
     HKONT           NVARCHAR(10),
     FKONT           NVARCHAR(3),
     FILKD           NVARCHAR(10),
-    ZFBDT           NVARCHAR(8),   -- Fecha base para plazo de vencimiento
-    ZTERM           NVARCHAR(4),   -- Condiciones de pago
+    ZFBDT           NVARCHAR(8),   -- Base date for the due-date term
+    ZTERM           NVARCHAR(4),   -- Payment terms
     ZBD1T           DECIMAL(3,0),
     ZBD2T           DECIMAL(3,0),
     ZBD3T           DECIMAL(3,0),
@@ -572,7 +572,7 @@ GO
 IF OBJECT_ID('bronze.sap_bsad', 'U') IS NOT NULL DROP TABLE bronze.sap_bsad;
 GO
 
--- Duplicamos la estructura exacta ya que SAP BSAD y BSID comparten el mismo layout técnico
+-- We duplicate the exact structure since SAP BSAD and BSID share the same technical layout
 CREATE TABLE bronze.sap_bsad (
     MANDT           NVARCHAR(3) NOT NULL,
     BUKRS           NVARCHAR(4) NOT NULL,
@@ -873,53 +873,54 @@ PRINT 'Table bronze.sap_knb5 created successfully using exact SAP lengths.';
 GO
 
 -- ============================================================================
--- NOTA: bronze.sap_ausp (Valores de Caracteristicas / Classification System)
--- NO SE IMPLEMENTA COMO "asignacion de pagos".
--- En SAP real, AUSP pertenece al modulo CA-CL (Classification) y almacena
--- valores de caracteristicas asignadas a objetos (OBJEK, ATINN, ATWRT, etc.),
--- sin ninguna relacion con documentos de pago o compensacion.
--- El vinculo "que factura se pago con que documento" que se buscaba con AUSP
--- YA esta cubierto por los campos AUGBL (documento de compensacion) y AUGDT
--- (fecha de compensacion) presentes en bronze.sap_bsad (partidas compensadas).
--- Si en el futuro se requiere trazabilidad de pagos parciales/aplicaciones,
--- evaluar incorporar BSEG (ver nota de exclusion abajo) o REGUH/REGUP (propuesta de pago).
+-- NOTE: bronze.sap_ausp (Characteristic Values / Classification System)
+-- IS NOT IMPLEMENTED AS "payment assignment".
+-- In real SAP, AUSP belongs to the CA-CL (Classification) module and stores
+-- characteristic values assigned to objects (OBJEK, ATINN, ATWRT, etc.),
+-- with no relationship to payment or clearing documents.
+-- The "which invoice was paid with which document" link that AUSP was being
+-- sought for is ALREADY covered by the AUGBL (clearing document) and AUGDT
+-- (clearing date) fields present in bronze.sap_bsad (cleared items).
+-- If partial-payment/application traceability is needed in the future,
+-- consider adding BSEG (see the exclusion note below) or REGUH/REGUP (payment proposal).
 -- ============================================================================
 
 -- ============================================================================
--- NOTA: bronze.sap_bseg NO SE IMPLEMENTA.
--- BSEG es una tabla cluster en SAP ECC (cluster RFBLG); sus datos se guardan
--- comprimidos en formato binario y NO son accesibles via SQL directo contra
--- la replica de p01 (se verifico: solo existe RFBLG como blob binario y
--- tablas de trabajo de pantalla como VBSEGK/VBSEGD/VBSEGS/EBSEG, ninguna con
--- el detalle historico real). Extraerla requeriria un extractor a nivel ABAP
--- (RFC_READ_TABLE, extractor BW tipo 0FI_GL_4, o SLT en modo ABAP).
--- El alcance actual de Bronze es AR (cuentas por cobrar), ya cubierto a nivel
--- de detalle de linea por bronze.sap_bsid (partidas abiertas) y
--- bronze.sap_bsad (partidas compensadas), ambas tablas transparentes. Si en
--- el futuro se necesita detalle de mayor/proveedores fuera de AR, evaluar
--- conseguir acceso ABAP a BSEG en ese momento.
+-- NOTE: bronze.sap_bseg IS NOT IMPLEMENTED.
+-- BSEG is a cluster table in SAP ECC (RFBLG cluster); its data is stored
+-- compressed in binary format and is NOT accessible via direct SQL against
+-- the p01 replica (verified: only RFBLG exists as a binary blob, plus
+-- screen work tables like VBSEGK/VBSEGD/VBSEGS/EBSEG, none with the real
+-- historical detail). Extracting it would require an ABAP-level extractor
+-- (RFC_READ_TABLE, a BW extractor like 0FI_GL_4, or SLT in ABAP mode).
+-- Bronze's current scope is AR (accounts receivable), already covered at
+-- the line-item level by bronze.sap_bsid (open items) and
+-- bronze.sap_bsad (cleared items), both transparent tables. If GL/vendor
+-- detail outside AR is needed in the future, consider getting ABAP access
+-- to BSEG at that point.
 -- ============================================================================
 
 -- ============================================================================
--- NOTA: bronze.sap_bkpf / bronze.sap_vbrk / bronze.sap_vbrp NO SE IMPLEMENTAN.
--- Se disenaron, verificaron columna por columna contra P01 y se dejaron listas
--- (incluyendo un procedimiento de backfill historico por año), pero se
--- retiraron del alcance porque ninguna tabla de silver/gold las consume: el
--- alcance actual del proyecto es AR/Credit & Collections + maestro de cliente,
--- ya cubierto por kna1/knvp/knkk/knvv/knb1/knb5/bsid/bsad. bkpf es el libro
--- diario contable de TODA la compania (no solo AR) y vbrk/vbrp es detalle de
--- facturacion de ventas (modulo SD) - ambas fuera del alcance declarado.
--- Si en el futuro surge un caso de uso concreto que las necesite, retomar
--- desde el historial de conversacion/control de versiones: la verificacion
--- de estructura contra SAP ya esta hecha, solo falta reincorporarla.
+-- NOTE: bronze.sap_bkpf / bronze.sap_vbrk / bronze.sap_vbrp ARE NOT IMPLEMENTED.
+-- They were designed, verified column by column against P01, and left ready
+-- to go (including a yearly historical backfill procedure), but were
+-- dropped from scope because no silver/gold table consumes them: the
+-- project's current scope is AR/Credit & Collections + customer master,
+-- already covered by kna1/knvp/knkk/knvv/knb1/knb5/bsid/bsad. bkpf is the
+-- accounting journal for the ENTIRE company (not just AR) and vbrk/vbrp is
+-- sales billing detail (SD module) - both outside the declared scope.
+-- If a concrete use case that needs them comes up in the future, pick it
+-- back up from the conversation history/version control: the structure
+-- verification against SAP is already done, it just needs to be
+-- reintegrated.
 -- ============================================================================
 
 -- ============================================================================
--- 9. SCHEMA/TABLE: control.sap_load_control (Auditoria de Cargas Bronze)
--- PURPOSE: Registrar cada ejecucion de carga por tabla (full/incremental),
---          su resultado (SUCCESS/FAILED), filas procesadas, duracion y,
---          para tablas incrementales, el "highwater mark" (ultimo valor de
---          fecha cargado) para que la siguiente corrida solo traiga lo nuevo.
+-- 9. SCHEMA/TABLE: control.sap_load_control (Bronze Load Auditing)
+-- PURPOSE: Record every load run per table (full/incremental), its result
+--          (SUCCESS/FAILED), rows processed, duration, and, for incremental
+--          tables, the "highwater mark" (last date value loaded) so the
+--          next run only pulls what's new.
 -- ============================================================================
 IF OBJECT_ID('control.sap_load_control', 'U') IS NOT NULL
     DROP TABLE control.sap_load_control;
@@ -934,7 +935,7 @@ CREATE TABLE control.sap_load_control (
     start_time          DATETIME2 NOT NULL,
     end_time            DATETIME2 NULL,
     duration_seconds     INT NULL,
-    last_loaded_value    NVARCHAR(50) NULL,       -- highwater mark (ej. max BUDAT/FKDAT cargado)
+    last_loaded_value    NVARCHAR(50) NULL,       -- highwater mark (e.g. max BUDAT/FKDAT loaded)
     error_message       NVARCHAR(4000) NULL,
     load_date           DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
     CONSTRAINT PK_sap_load_control PRIMARY KEY CLUSTERED (load_id)
@@ -949,17 +950,17 @@ GO
 
 -- ============================================================================
 -- 10. PROCEDURE: control.sp_log_load
--- PURPOSE: Inserta un registro de auditoria por cada tabla cargada en Bronze.
+-- PURPOSE: Insert one audit record for each table loaded in Bronze.
 --
--- ADVERTENCIA (confirmado empiricamente): llamar a este procedimiento desde
--- DENTRO de otro procedimiento (ej. bronze.load_bronze) rompe la compilacion
--- en esta instancia de SQL Server 2012, con un error enganoso "Incorrect
--- syntax near ')'" cuyo numero de linea reportado no apunta al problema real.
--- Por eso bronze.load_bronze NO llama a este proc (ver header de
--- sp_load_bronze.sql). El proc en si compila y probablemente se puede
--- ejecutar de forma aislada (su propio batch, argumentos literales). Si se
--- quiere retomar el logging de auditoria, probar eso primero, en aislamiento
--- total, ANTES de volver a integrarlo dentro de un procedimiento de carga.
+-- WARNING (confirmed empirically): calling this procedure from INSIDE
+-- another procedure (e.g. bronze.load_bronze) breaks compilation on this
+-- SQL Server 2012 instance, with a misleading "Incorrect syntax near ')'"
+-- error whose reported line number doesn't point to the real problem.
+-- That's why bronze.load_bronze does NOT call this proc (see the header of
+-- sp_load_bronze.sql). The proc itself compiles and can presumably be run
+-- in isolation (its own batch, literal arguments). If audit logging needs
+-- to be picked back up, try that first, in complete isolation, BEFORE
+-- re-integrating it inside a load procedure.
 -- ============================================================================
 IF OBJECT_ID('control.sp_log_load', 'P') IS NOT NULL
     DROP PROCEDURE control.sp_log_load;
@@ -995,10 +996,10 @@ GO
 
 -- ============================================================================
 -- 11. FUNCTION: control.fn_get_last_loaded_value
--- PURPOSE: Devuelve el ultimo "highwater mark" registrado con SUCCESS para
---          una tabla incremental (ej. la maxima fecha ya cargada), usado
---          para filtrar solo registros nuevos en la siguiente corrida.
---          Devuelve '19000101' si la tabla nunca se ha cargado (carga full inicial).
+-- PURPOSE: Returns the last "highwater mark" logged with SUCCESS for an
+--          incremental table (e.g. the max date already loaded), used to
+--          filter only new records on the next run.
+--          Returns '19000101' if the table has never been loaded (initial full load).
 -- ============================================================================
 IF OBJECT_ID('control.fn_get_last_loaded_value', 'FN') IS NOT NULL
     DROP FUNCTION control.fn_get_last_loaded_value;
@@ -1025,14 +1026,15 @@ PRINT 'Function control.fn_get_last_loaded_value created successfully.';
 GO
 
 -- ============================================================================
--- 12. TABLE: bronze.sap_tvv1t (Texto de Rutas / Grupo de Clientes 1 - COMPLETE)
--- PURPOSE: Tabla de texto estandar de SAP (traduce KVGR1 a su nombre legible,
---          BEZEI). Se agrega para resolver el nombre real de la "ruta" que
---          usa el area de credito/cobranza en su clasificacion de clientes
---          activo/legal/inactivo (silver.sap_knvv.ruta = KVGR1 es solo el
---          codigo corto de 3 caracteres, no el nombre tipo "CC131-E04" que
---          se usa en las reglas de negocio).
--- Estructura verificada contra p01 real (no adivinada):
+-- 12. TABLE: bronze.sap_tvv1t (Route Text / Customer Group 1 - COMPLETE)
+-- PURPOSE: Standard SAP text table (translates KVGR1 into its readable
+--          name, BEZEI). Added to resolve the real name of the "route"
+--          used by the credit/collections department in its
+--          active/legal/inactive customer classification
+--          (silver.sap_knvv.ruta = KVGR1 is just the short 3-character
+--          code, not the name like "CC131-E04" used in the business
+--          rules).
+-- Structure verified against real p01 (not guessed):
 --   MANDT NVARCHAR(3), SPRAS NVARCHAR(1), KVGR1 NVARCHAR(3), BEZEI NVARCHAR(20)
 -- ============================================================================
 IF OBJECT_ID('bronze.sap_tvv1t', 'U') IS NOT NULL
@@ -1050,20 +1052,20 @@ PRINT 'Table bronze.sap_tvv1t created successfully using exact SAP lengths.';
 GO
 
 -- ============================================================================
--- 13. TABLE: bronze.sap_pa0001 (Infotipo 0001 - Asignacion Organizativa RRHH - COMPLETE)
--- PURPOSE: Infotipo estandar de RRHH de SAP. Se agrega unicamente para
---          resolver PERNR -> nombre real del empleado (columna ENAME) usado
---          en las funciones de interlocutor de silver.sap_knvp (VE=vendedor,
---          E1=ejecutivo de credito, GR=gerente de ventas, CC=cobrador), que
---          es exactamente lo que necesita la clasificacion de clientes
---          activo/legal/inactivo (ver ciosa.py). Se trae la estructura
---          completa por consistencia con el resto de bronze (espejo exacto
---          de SAP), aunque silver solo va a usar MANDT/PERNR/ENAME/BEGDA/ENDDA.
---          Es un infotipo con vigencia por fechas (BEGDA/ENDDA): un mismo
---          PERNR puede tener varias filas historicas, silver debe filtrar
---          el registro vigente.
--- Estructura verificada contra p01 real (no adivinada), 51 columnas.
--- Llave primaria: estructura estandar de infotipo SAP (PSKEY).
+-- 13. TABLE: bronze.sap_pa0001 (Infotype 0001 - HR Organizational Assignment - COMPLETE)
+-- PURPOSE: Standard SAP HR infotype. Added solely to resolve PERNR -> the
+--          employee's real name (ENAME column) used in silver.sap_knvp's
+--          partner functions (VE=salesperson, E1=credit executive,
+--          GR=sales manager, CC=collector), which is exactly what the
+--          active/legal/inactive customer classification needs (see
+--          ciosa.py). The full structure is brought in for consistency
+--          with the rest of bronze (exact SAP mirror), even though silver
+--          will only use MANDT/PERNR/ENAME/BEGDA/ENDDA.
+--          It's a date-effective infotype (BEGDA/ENDDA): the same PERNR
+--          can have several historical rows, silver must filter for the
+--          currently effective record.
+-- Structure verified against real p01 (not guessed), 51 columns.
+-- Primary key: standard SAP infotype structure (PSKEY).
 -- ============================================================================
 IF OBJECT_ID('bronze.sap_pa0001', 'U') IS NOT NULL
     DROP TABLE bronze.sap_pa0001;

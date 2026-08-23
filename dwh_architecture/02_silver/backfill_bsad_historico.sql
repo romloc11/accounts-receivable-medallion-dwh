@@ -3,48 +3,47 @@ GO
 
 /*
 ========================================================================================
-BACKFILL HISTORICO: silver.sap_bsad
+HISTORICAL BACKFILL: silver.sap_bsad
 ========================================================================================
-PROPOSITO:
-silver.sap_bsad solo tiene ~295K filas (ventana de 2 meses que mantiene el MERGE
-incremental de silver.load_silver), mientras que bronze.sap_bsad ya tiene el historico
-completo desde 2022-01-01 (~12.2M filas). Este script hace el backfill de todo lo
-anterior a la ventana que ya mantiene el incremental diario, para no duplicar ni pisar
-su trabajo.
+PURPOSE:
+silver.sap_bsad only has ~295K rows (the 2-month window silver.load_silver's incremental
+MERGE maintains), while bronze.sap_bsad already has the complete history since
+2022-01-01 (~12.2M rows). This script backfills everything before the window the daily
+incremental already maintains, so as not to duplicate or step on its work.
 
-LIMITE SUPERIOR:
-silver.load_silver mantiene AUGDT >= primer dia del mes anterior. Este backfill cubre
-todo lo ANTERIOR a ese limite. El limite se calcula dinamicamente (misma formula que
-sp_load_silver.sql) para que siga siendo correcto sin importar que dia se corra esto.
+UPPER BOUND:
+silver.load_silver maintains AUGDT >= first day of the previous month. This backfill
+covers everything BEFORE that bound. The bound is computed dynamically (same formula as
+sp_load_silver.sql) so it stays correct no matter what day this is run.
 
-PATRON DE CHUNKS (igual que el backfill original de bronze.sap_bsad):
-Un chunk por año. Cada chunk es DELETE + INSERT (idempotente - seguro volver a correr
-el mismo chunk si falla a la mitad o se cae la VPN). Si un año completo truena con:
+CHUNK PATTERN (same as bronze.sap_bsad's original backfill):
+One chunk per year. Each chunk is DELETE + INSERT (idempotent - safe to re-run the same
+chunk if it fails halfway or the VPN drops). If a full year breaks with:
     Msg 9002: The transaction log for database 'ANALISIS_DATOS' is full
-parte ESE año en dos mitades (semestres) y corre cada mitad por separado, con el mismo
-patron DELETE+INSERT pero acotando el rango de fechas. Si un semestre todavia truena,
-sigue partiendo a trimestres o meses. Ejemplo de como partir el chunk de 2022 en dos:
+split THAT year into two halves (half-years) and run each half separately, with the
+same DELETE+INSERT pattern but a narrower date range. If a half-year still breaks, keep
+splitting into quarters or months. Example of splitting the 2022 chunk in two:
 
-    -- 2022 primer semestre
+    -- 2022 first half
     ... WHERE fecha_compensacion >= '20220101' AND fecha_compensacion < '20220701'
     ... WHERE AUGDT >= '20220101' AND AUGDT < '20220701'
 
-    -- 2022 segundo semestre
+    -- 2022 second half
     ... WHERE fecha_compensacion >= '20220701' AND fecha_compensacion < '20230101'
     ... WHERE AUGDT >= '20220701' AND AUGDT < '20230101'
 
-No corras dos chunks al mismo tiempo en pestañas distintas de SSMS - uno a la vez, en
-orden, revisando el PRINT de filas insertadas antes de seguir con el siguiente.
+Don't run two chunks at the same time in different SSMS tabs - one at a time, in order,
+checking the rows-inserted PRINT output before moving on to the next.
 ========================================================================================
 */
 
--- Verifica el limite superior antes de arrancar (informativo, no hace nada por si solo)
+-- Checks the upper bound before starting (informational, doesn't do anything by itself)
 DECLARE @limite_check NVARCHAR(8) = CONVERT(NVARCHAR(8), DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()) - 1, 0), 112);
 SELECT @limite_check AS limite_superior_backfill_AUGDT;
 GO
 
 -- ========================================================================================
--- 2022 completo
+-- Full 2022
 -- ========================================================================================
 DELETE FROM silver.sap_bsad
 WHERE mandante = '400'
@@ -100,11 +99,11 @@ FROM bronze.sap_bsad WITH (NOLOCK)
 WHERE MANDT = '400'
   AND AUGDT >= '20220101' AND AUGDT < '20230101';
 
-PRINT 'Filas insertadas 2022: ' + CAST(@@ROWCOUNT AS VARCHAR);
+PRINT 'Rows inserted 2022: ' + CAST(@@ROWCOUNT AS VARCHAR);
 GO
 
 -- ========================================================================================
--- 2023 completo
+-- Full 2023
 -- ========================================================================================
 DELETE FROM silver.sap_bsad
 WHERE mandante = '400'
@@ -160,11 +159,11 @@ FROM bronze.sap_bsad WITH (NOLOCK)
 WHERE MANDT = '400'
   AND AUGDT >= '20230101' AND AUGDT < '20240101';
 
-PRINT 'Filas insertadas 2023: ' + CAST(@@ROWCOUNT AS VARCHAR);
+PRINT 'Rows inserted 2023: ' + CAST(@@ROWCOUNT AS VARCHAR);
 GO
 
 -- ========================================================================================
--- 2024 completo
+-- Full 2024
 -- ========================================================================================
 DELETE FROM silver.sap_bsad
 WHERE mandante = '400'
@@ -220,11 +219,11 @@ FROM bronze.sap_bsad WITH (NOLOCK)
 WHERE MANDT = '400'
   AND AUGDT >= '20240101' AND AUGDT < '20250101';
 
-PRINT 'Filas insertadas 2024: ' + CAST(@@ROWCOUNT AS VARCHAR);
+PRINT 'Rows inserted 2024: ' + CAST(@@ROWCOUNT AS VARCHAR);
 GO
 
 -- ========================================================================================
--- 2025 completo
+-- Full 2025
 -- ========================================================================================
 DELETE FROM silver.sap_bsad
 WHERE mandante = '400'
@@ -280,12 +279,12 @@ FROM bronze.sap_bsad WITH (NOLOCK)
 WHERE MANDT = '400'
   AND AUGDT >= '20250101' AND AUGDT < '20260101';
 
-PRINT 'Filas insertadas 2025: ' + CAST(@@ROWCOUNT AS VARCHAR);
+PRINT 'Rows inserted 2025: ' + CAST(@@ROWCOUNT AS VARCHAR);
 GO
 
 -- ========================================================================================
--- 2026 parcial: desde el 1-ene hasta el limite que ya cubre el incremental diario
--- (limite dinamico - NO toca la ventana de 2 meses que mantiene silver.load_silver)
+-- Partial 2026: from Jan 1st up to the bound the daily incremental already covers
+-- (dynamic bound - does NOT touch the 2-month window silver.load_silver maintains)
 -- ========================================================================================
 DECLARE @limite_date DATE = DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()) - 1, 0);
 DECLARE @limite_str  NVARCHAR(8) = CONVERT(NVARCHAR(8), @limite_date, 112);
@@ -344,12 +343,12 @@ FROM bronze.sap_bsad WITH (NOLOCK)
 WHERE MANDT = '400'
   AND AUGDT >= '20260101' AND AUGDT < @limite_str;
 
-PRINT 'Filas insertadas 2026 (parcial, hasta limite de silver.load_silver): ' + CAST(@@ROWCOUNT AS VARCHAR);
+PRINT 'Rows inserted 2026 (partial, up to silver.load_silver''s bound): ' + CAST(@@ROWCOUNT AS VARCHAR);
 GO
 
 -- ========================================================================================
--- Verificacion final: total en silver vs. lo que hay en bronze antes del limite del
--- incremental diario (deberian coincidir exactamente si todos los chunks corrieron bien)
+-- Final check: total in silver vs. what's in bronze before the daily incremental's
+-- bound (should match exactly if every chunk ran correctly)
 -- ========================================================================================
 DECLARE @limite_final NVARCHAR(8) = CONVERT(NVARCHAR(8), DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()) - 1, 0), 112);
 

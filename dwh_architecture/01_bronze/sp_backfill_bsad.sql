@@ -90,8 +90,8 @@ BEGIN
         SET @batch_start_time = SYSDATETIME();
 
         PRINT '==================================================';
-        PRINT '        Backfill historico BSAD por año           ';
-        PRINT '   Años: ' + CAST(@start_year AS NVARCHAR) + ' a ' + CAST(@end_year AS NVARCHAR);
+        PRINT '        BSAD historical backfill by year           ';
+        PRINT '   Years: ' + CAST(@start_year AS NVARCHAR) + ' to ' + CAST(@end_year AS NVARCHAR);
         PRINT '==================================================';
 
         WHILE @yr <= @end_year
@@ -105,20 +105,20 @@ BEGIN
 
             IF @already_loaded = 1
             BEGIN
-                PRINT '>> [' + CAST(@yr AS NVARCHAR) + '] bronze.sap_bsad ya tiene datos en ese año - se omite.';
+                PRINT '>> [' + CAST(@yr AS NVARCHAR) + '] bronze.sap_bsad already has data for that year - skipping.';
             END
             ELSE
             BEGIN
                 SET @start_time = SYSDATETIME();
-                PRINT '>> [' + CAST(@yr AS NVARCHAR) + '] Cargando bronze.sap_bsad (AUGDT ' + @range_start + ' a ' + @range_end + ')...';
+                PRINT '>> [' + CAST(@yr AS NVARCHAR) + '] Loading bronze.sap_bsad (AUGDT ' + @range_start + ' to ' + @range_end + ')...';
 
-                -- SELECT * posicional (no lista explicita de columnas): bronze.sap_bsad y
-                -- P01.p01.BSAD tienen el mismo orden de columnas verificado, y la lista
-                -- explicita de 179 columnas repetida dos veces (INSERT + SELECT) causaba un
-                -- error de sintaxis en SQL Server 2012 que no se pudo aislar mas alla de
-                -- "es la lista completa dentro de un INSERT...SELECT" - un SELECT simple con
-                -- las mismas 179 columnas funciona bien, así que el problema es especifico de
-                -- esa combinacion. Evitarla por completo es mas simple que seguir depurando.
+                -- Positional SELECT * (no explicit column list): bronze.sap_bsad and
+                -- P01.p01.BSAD have the same verified column order, and the explicit list
+                -- of 179 columns repeated twice (INSERT + SELECT) caused a syntax error on
+                -- SQL Server 2012 that couldn't be isolated beyond "it's the full list
+                -- inside an INSERT...SELECT" - a plain SELECT with the same 179 columns
+                -- works fine, so the problem is specific to that combination. Avoiding it
+                -- entirely is simpler than continuing to debug it.
                 INSERT INTO bronze.sap_bsad
                 SELECT *
                 FROM P01.p01.BSAD WITH (NOLOCK)
@@ -126,7 +126,7 @@ BEGIN
                 SET @rows_count = @@ROWCOUNT;
 
                 SET @end_time = SYSDATETIME();
-                PRINT '   -> ' + CAST(@rows_count AS NVARCHAR) + ' filas en ' + CAST(DATEDIFF(second,@start_time,@end_time) AS NVARCHAR) + ' seg.';
+                PRINT '   -> ' + CAST(@rows_count AS NVARCHAR) + ' rows in ' + CAST(DATEDIFF(second,@start_time,@end_time) AS NVARCHAR) + ' sec.';
 
                 EXEC control.sp_log_load @table_name = @current_table, @load_type = 'BACKFILL', @load_status = 'SUCCESS',
                      @rows_processed = @rows_count, @start_time = @start_time, @end_time = @end_time,
@@ -138,15 +138,15 @@ BEGIN
 
         SET @batch_end_time = SYSDATETIME();
         PRINT '==================================================';
-        PRINT 'Backfill BSAD completado. Duración total: ' + CAST(DATEDIFF(minute,@batch_start_time,@batch_end_time) AS NVARCHAR) + ' minutos';
+        PRINT 'BSAD backfill complete. Total duration: ' + CAST(DATEDIFF(minute,@batch_start_time,@batch_end_time) AS NVARCHAR) + ' minutes';
         PRINT '==================================================';
 
     END TRY
     BEGIN CATCH
 
         PRINT '==================================================';
-        PRINT 'ERROR EN BACKFILL DE BSAD';
-        PRINT 'Año en curso: ' + CAST(@yr AS NVARCHAR);
+        PRINT 'ERROR IN BSAD BACKFILL';
+        PRINT 'Current year: ' + CAST(@yr AS NVARCHAR);
         PRINT 'Message: ' + ERROR_MESSAGE();
         PRINT 'Line: '    + CAST(ERROR_LINE() AS VARCHAR(10));
         PRINT '==================================================';
@@ -155,9 +155,9 @@ BEGIN
              @rows_processed = NULL, @start_time = @start_time, @end_time = SYSDATETIME(),
              @error_message = ERROR_MESSAGE();
 
-        PRINT 'Para reanudar despues de corregir el problema, vuelve a ejecutar:';
+        PRINT 'To resume after fixing the issue, run again:';
         PRINT '  EXEC bronze.backfill_bsad @start_year = ' + CAST(@start_year AS NVARCHAR) + ', @end_year = ' + CAST(@end_year AS NVARCHAR) + ';';
-        PRINT '(los años ya presentes en la tabla se detectan y se omiten automáticamente)';
+        PRINT '(years already present in the table are detected and skipped automatically)';
 
         THROW;
 

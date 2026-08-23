@@ -10,7 +10,7 @@ LAYER: Silver (Clean Data Staging)
 
 
 -- ==========================================================
--- 1. MAESTRO DE CLIENTES (silver.sap_kna1)
+-- 1. CUSTOMER MASTER (silver.sap_kna1)
 -- ==========================================================
 IF OBJECT_ID('silver.sap_kna1', 'U') IS NOT NULL DROP TABLE silver.sap_kna1;
 CREATE TABLE silver.sap_kna1 (
@@ -18,10 +18,10 @@ CREATE TABLE silver.sap_kna1 (
     cliente_id              VARCHAR(10)  NOT NULL,
     rfc                     VARCHAR(16),   -- STCD1
     nombre                  VARCHAR(35),   -- NAME1
-    nombre2                 VARCHAR(35),   -- NAME2 (cuando el nombre es muy largo)
+    nombre2                 VARCHAR(35),   -- NAME2 (when the name is too long)
     pais                    VARCHAR(3),    -- LAND1
-    estado                  VARCHAR(3),    -- REGIO (clave del estado del cliente; renombrado de "region" para no confundirse con silver.sap_knvv.region, que es la region de ventas/BZIRK)
-    poblacion                VARCHAR(35),  -- ORT01 (ciudad)
+    estado                  VARCHAR(3),    -- REGIO (customer's state code; renamed from "region" to avoid confusion with silver.sap_knvv.region, which is the sales region/BZIRK)
+    poblacion                VARCHAR(35),  -- ORT01 (city)
     codigo_postal           VARCHAR(10),   -- PSTLZ
     calle                   VARCHAR(35),   -- STRAS
     bloqueo_pedido          VARCHAR(2),    -- AUFSD
@@ -47,7 +47,7 @@ CREATE TABLE silver.sap_kna1 (
 );
 
 -- ==========================================================
--- 2. INTERLOCUTORES DE CLIENTES (silver.sap_knvp)
+-- 2. CUSTOMER PARTNER FUNCTIONS (silver.sap_knvp)
 -- ==========================================================
 IF OBJECT_ID('silver.sap_knvp', 'U') IS NOT NULL DROP TABLE silver.sap_knvp;
 CREATE TABLE silver.sap_knvp (
@@ -57,11 +57,11 @@ CREATE TABLE silver.sap_knvp (
     canal_distribucion      VARCHAR(2)   NOT NULL,
     sector                  VARCHAR(2)   NOT NULL,
     funcion_interlocutor    VARCHAR(2)   NOT NULL,
-    descripcion_funcion     VARCHAR(40),  -- derivado de PARVW (catalogo de negocio, ver sp_load_silver.sql)
-    contador                VARCHAR(3)   NOT NULL,  -- PARZA, completa la PK (bronze usa el mismo campo)
+    descripcion_funcion     VARCHAR(40),  -- derived from PARVW (business catalog, see sp_load_silver.sql)
+    contador                VARCHAR(3)   NOT NULL,  -- PARZA, completes the PK (bronze uses the same field)
     cliente_asociado        VARCHAR(10),  -- KUNN2
     id_interlocutor         VARCHAR(8),   -- PERNR
-    nombre_interlocutor     VARCHAR(40),  -- ENAME resuelto desde bronze.sap_pa0001 (PERNR, registro vigente ENDDA='99991231'). Solo aplica cuando id_interlocutor es un empleado real (roles VE/E1/GR/CC); usado en la clasificacion activo/legal/inactivo (ver ciosa.py)
+    nombre_interlocutor     VARCHAR(40),  -- ENAME resolved from bronze.sap_pa0001 (PERNR, current record ENDDA='99991231'). Only applies when id_interlocutor is a real employee (VE/E1/GR/CC roles); used in the active/legal/inactive classification (see ciosa.py)
     id_paqueteria           VARCHAR(10),  -- LIFNR
     flag_default            BIT,          -- DEFPA
     fecha_carga             DATETIME DEFAULT GETDATE(),
@@ -69,7 +69,7 @@ CREATE TABLE silver.sap_knvp (
 );
 
 -- ==========================================================
--- 3. LÍMITES DE CRÉDITO (silver.sap_knkk)
+-- 3. CREDIT LIMITS (silver.sap_knkk)
 -- ==========================================================
 IF OBJECT_ID('silver.sap_knkk', 'U') IS NOT NULL DROP TABLE silver.sap_knkk;
 CREATE TABLE silver.sap_knkk (
@@ -98,26 +98,26 @@ CREATE TABLE silver.sap_knkk (
     monto_ultimo_pago              DECIMAL(15,2),-- CASHA
     moneda_ultimo_pago             VARCHAR(5),   -- CASHC
     clasificacion_riesgo           VARCHAR(5),   -- DBRTG
-    fecha_ultima_modificacion_texto DATE,        -- AETXT: fecha de la ultima modificacion del texto asociado al registro de credito. Se usa para dar seguimiento a pagares, entre otras cosas (confirmado con el area de credito)
-    grupo_credito                  VARCHAR(4),   -- GRUPP: codigo de grupo/estado especial de credito (valores reales observados: MORA, PPC, DEPU, ALTO, COM, ESPP, ESPI, FOT1-3, CV1-2, COVI, RESP, entre otros); significado exacto de cada codigo pendiente de catalogo de negocio
-    indicador_pago_db              VARCHAR(3),   -- DBPAY: indicador de pago (integracion Dun & Bradstreet), mezcla observada de porcentajes ('5%','7%'...) y calificaciones por letra ('A'-'D')
-    limite_credito_recomendado_db  DECIMAL(15,2),-- DBEKR: limite de credito recomendado (Dun & Bradstreet). Siempre en MXN en p01 (ver DBWAE en bronze.sap_knkk, columna con un unico valor constante, no se replico en silver por no aportar informacion)
+    fecha_ultima_modificacion_texto DATE,        -- AETXT: date of the last modification to the text attached to the credit record. Used, among other things, to track promissory notes (confirmed with the credit department)
+    grupo_credito                  VARCHAR(4),   -- GRUPP: special credit group/status code (real observed values: MORA, PPC, DEPU, ALTO, COM, ESPP, ESPI, FOT1-3, CV1-2, COVI, RESP, among others); exact meaning of each code pending a business catalog
+    indicador_pago_db              VARCHAR(3),   -- DBPAY: payment indicator (Dun & Bradstreet integration), observed mix of percentages ('5%','7%'...) and letter ratings ('A'-'D')
+    limite_credito_recomendado_db  DECIMAL(15,2),-- DBEKR: recommended credit limit (Dun & Bradstreet). Always in MXN on p01 (see DBWAE in bronze.sap_knkk, a column with a single constant value, not replicated in silver since it adds no information)
     fecha_carga                    DATETIME DEFAULT GETDATE(),
     CONSTRAINT PK_silver_sap_knkk PRIMARY KEY (mandante, cliente_id, area_control_credito)
 );
 
 -- ==========================================================
--- NOTA: columnas de bronze.sap_knkk deliberadamente NO incluidas en silver:
--- XCHNG, DBRAT, ABSBT -> 0% de filas con dato en p01 (confirmado por conteo).
--- DTREV, PAYDB, DBMON -> ~99.9%-100% de las filas traen unicamente el valor
---   por defecto tecnico ('00000000' o '00'), sin variacion real; el resto es
---   ruido disperso (un puñado de filas sueltas). No aportan informacion de
---   negocio. Si SAP llega a usarlos activamente en el futuro, revalidar con
---   el mismo tipo de conteo antes de incorporarlos.
+-- NOTE: bronze.sap_knkk columns deliberately NOT included in silver:
+-- XCHNG, DBRAT, ABSBT -> 0% of rows have data on p01 (confirmed by count).
+-- DTREV, PAYDB, DBMON -> ~99.9%-100% of rows carry only the technical
+--   default value ('00000000' or '00'), with no real variation; the rest is
+--   scattered noise (a handful of loose rows). They add no business
+--   information. If SAP starts actively using them in the future, revalidate
+--   with the same kind of count before adding them.
 -- ==========================================================
 
 -- ==========================================================
--- 4. DATOS AREA DE VENTAS (silver.sap_knvv)
+-- 4. SALES AREA DATA (silver.sap_knvv)
 -- ==========================================================
 IF OBJECT_ID('silver.sap_knvv', 'U') IS NOT NULL DROP TABLE silver.sap_knvv;
 CREATE TABLE silver.sap_knvv (
@@ -127,20 +127,20 @@ CREATE TABLE silver.sap_knvv (
     canal_distribucion     VARCHAR(2)   NOT NULL,
     sector                 VARCHAR(2)   NOT NULL,
 
-    -- Organización y Estructura Comercial
+    -- Commercial Organization and Structure
     oficina_ventas         VARCHAR(4),   -- VKBUR
     grupo_vendedores       VARCHAR(3),   -- VKGRP
     region                 VARCHAR(6),   -- BZIRK
-    ruta                   VARCHAR(3),   -- KVGR1 (codigo sap de la ruta)
-    ruta_nombre            VARCHAR(20),  -- BEZEI resuelto desde bronze.sap_tvv1t (MANDT+SPRAS='S'+KVGR1), usado en la clasificacion activo/legal/inactivo (ver ciosa.py)
+    ruta                   VARCHAR(3),   -- KVGR1 (SAP route code)
+    ruta_nombre            VARCHAR(20),  -- BEZEI resolved from bronze.sap_tvv1t (MANDT+SPRAS='S'+KVGR1), used in the active/legal/inactive classification (see ciosa.py)
     centro_suministrador   VARCHAR(4),   -- VWERK
 
-    -- Clasificación y Categorías
+    -- Classification and Categories
     grupo_clientes         VARCHAR(2),   -- KDGRP
     grupo_precios          VARCHAR(2),   -- KONDA
     lista_precios          VARCHAR(2),   -- PLTYP
 
-    -- Incoterms y Entregas
+    -- Incoterms and Deliveries
     incoterm               VARCHAR(3),   -- INCO1
     incoterm_descripcion   VARCHAR(28),  -- INCO2
     entregas_parciales_max DECIMAL(1,0), -- ANTLF
@@ -148,19 +148,19 @@ CREATE TABLE silver.sap_knvv (
     tiempo_entrega         VARCHAR(3),   -- KVGR2
     tipo_servicio          VARCHAR(3),   -- KVGR3
     tipo_servicio_2        VARCHAR(3),   -- KVGR4
-    condicion_expedicion   VARCHAR(2),   -- VSBED: normalizado ('1' -> '01') para unificar con el codigo de 2 digitos ya existente en el origen, ver sp_load_silver.sql
+    condicion_expedicion   VARCHAR(2),   -- VSBED: normalized ('1' -> '01') to line up with the 2-digit code already present in the source, see sp_load_silver.sql
 
-    -- Condiciones Financieras
+    -- Financial Terms
     condicion_pago         VARCHAR(4),   -- ZTERM
     moneda                 VARCHAR(5),   -- WAERS
 
-    -- Bloqueos y Marcas de Control
+    -- Blocks and Control Flags
     bloqueo_entrega        VARCHAR(2),   -- LIFSD
     bloqueo_factura        VARCHAR(2),   -- FAKSD
     bloqueo_pedido         VARCHAR(2),   -- AUFSD
-    bloqueo_contacto_deudor VARCHAR(2),  -- CASSD: "Bloqueo de contacto para deudores" (area de ventas), confirmado via SE11. Flag real (X/blanco, 4.3% de las filas), distinto de AUFSD
+    bloqueo_contacto_deudor VARCHAR(2),  -- CASSD: "Dunning contact block" (sales area), confirmed via SE11. Real flag (X/blank, 4.3% of rows), distinct from AUFSD
 
-    -- Fechas y Auditoría
+    -- Dates and Audit
     fecha_creacion         DATE,         -- ERDAT
     creado_por             VARCHAR(12),  -- ERNAM
     fecha_carga            DATETIME DEFAULT GETDATE(),
@@ -169,21 +169,21 @@ CREATE TABLE silver.sap_knvv (
 );
 
 -- ==========================================================
--- NOTA: columnas de bronze.sap_knvv deliberadamente NO incluidas en silver
--- (fuera de las ~50 de logistica de ejecucion/pricing/industria de bebidas
--- ya descartadas por alcance, ver nota de bkpf/vbrk/vbrp en ddl_bronze.sql):
--- LOEVM -> no se replica como columna, se usa como FILTRO de exclusion
---   (75 de 29,374 filas marcadas 'X', mismo criterio que kna1).
--- KLABC -> 0.03% de las filas con dato, sin uso real.
--- KKBER -> 0% de las filas con dato a este nivel (ya se tiene via silver.sap_knkk).
--- VERSG -> 98.4% de las filas con el mismo valor constante, sin variacion real.
--- KTGRD -> 97.3% de las filas con el mismo valor constante ('Z1'), sin variacion real.
--- AWAHR -> 99.7% de las filas en '100' (probabilidad de pedido, default SAP), sin variacion real.
--- KVGR5 -> 0% de las filas con dato.
+-- NOTE: bronze.sap_knvv columns deliberately NOT included in silver
+-- (beyond the ~50 execution-logistics/pricing/beverage-industry columns
+-- already dropped for scope, see the bkpf/vbrk/vbrp note in ddl_bronze.sql):
+-- LOEVM -> not replicated as a column, used as an exclusion FILTER
+--   (75 of 29,374 rows flagged 'X', same criterion as kna1).
+-- KLABC -> 0.03% of rows have data, no real use.
+-- KKBER -> 0% of rows have data at this level (already available via silver.sap_knkk).
+-- VERSG -> 98.4% of rows share the same constant value, no real variation.
+-- KTGRD -> 97.3% of rows share the same constant value ('Z1'), no real variation.
+-- AWAHR -> 99.7% of rows at '100' (order probability, SAP default), no real variation.
+-- KVGR5 -> 0% of rows have data.
 -- ==========================================================
 
 -- ==========================================================
--- 5. PARTIDAS ABIERTAS (silver.sap_bsid)
+-- 5. OPEN ITEMS (silver.sap_bsid)
 -- ==========================================================
 IF OBJECT_ID('silver.sap_bsid', 'U') IS NOT NULL DROP TABLE silver.sap_bsid;
 CREATE TABLE silver.sap_bsid (
@@ -195,14 +195,14 @@ CREATE TABLE silver.sap_bsid (
     documento_id             VARCHAR(10)  NOT NULL,
     asignacion               VARCHAR(18),   -- ZUONR
     referencia               VARCHAR(16),   -- XBLNR
-    documento_ventas         VARCHAR(10),   -- VBELN: referencia al documento de ventas (SD), 86,961 valores distintos de 88,022 filas, practicamente 1:1
+    documento_ventas         VARCHAR(10),   -- VBELN: reference to the sales document (SD), 86,961 distinct values out of 88,022 rows, virtually 1:1
     posicion                 INT          NOT NULL,
     fecha_contabilizacion    DATE,          -- BUDAT
     fecha_documento          DATE,          -- BLDAT
     fecha_registro_sistema   DATE,          -- CPUDT
     fecha_vencimiento        DATE,          -- ZFBDT
     clase_documento          VARCHAR(2),    -- BLART
-    codigo_impuesto          VARCHAR(2),    -- MWSKZ: codigo de IVA (catalogo real observado: B4, B5, B0, WJ)
+    codigo_impuesto          VARCHAR(2),    -- MWSKZ: VAT code (real observed catalog: B4, B5, B0, WJ)
     debe_haber               CHAR(1),       -- SHKZG
     monto_moneda_local       DECIMAL(15,2), -- DMBTR
     monto_moneda_doc         DECIMAL(15,2), -- WRBTR
@@ -210,7 +210,7 @@ CREATE TABLE silver.sap_bsid (
     condicion_pago           VARCHAR(4),    -- ZTERM
     dias_plazo               DECIMAL(15,2), -- ZBD1T
 
-    -- Reclamacion / Cobranza (dunning) a nivel de partida
+    -- Dunning at the line-item level
     area_reclamacion              VARCHAR(2), -- MABER
     nivel_reclamacion             CHAR(1),    -- MANST
     clave_reclamacion_legal       CHAR(1),    -- MSCHL
@@ -222,19 +222,19 @@ CREATE TABLE silver.sap_bsid (
 );
 
 -- ==========================================================
--- NOTA: columnas de bronze.sap_bsid deliberadamente NO incluidas en silver:
--- ZLSPR, RSTGR, BSTAT, UMSKS, UMSKZ, GSBER -> 0% de filas con dato en p01.
--- ZLSCH -> 0.05% de las filas (43 de 91,235), ruido disperso.
--- SKNTO, WSKTO -> 0% de las filas (nunca se registra el importe de descuento
---   por pronto pago tomado, aunque exista una base de descuento en SKFBT).
--- SKFBT -> descartado pese a 95.1% de cobertura: en 86,774 de 86,799 filas
---   (99.97%) es identico a DMBTR, es decir, no es una base de descuento real
---   distinta del monto total, solo una copia. La alta cantidad de valores
---   distintos que parecia sugerir datos reales en realidad la hereda de DMBTR.
+-- NOTE: bronze.sap_bsid columns deliberately NOT included in silver:
+-- ZLSPR, RSTGR, BSTAT, UMSKS, UMSKZ, GSBER -> 0% of rows have data on p01.
+-- ZLSCH -> 0.05% of rows (43 of 91,235), scattered noise.
+-- SKNTO, WSKTO -> 0% of rows (the early-payment discount amount taken is
+--   never recorded, even though a discount base exists in SKFBT).
+-- SKFBT -> dropped despite 95.1% coverage: in 86,774 of 86,799 rows
+--   (99.97%) it's identical to DMBTR, i.e. it's not a real discount base
+--   distinct from the total amount, just a copy. The high number of distinct
+--   values that seemed to suggest real data is actually inherited from DMBTR.
 -- ==========================================================
 
 -- ==========================================================
--- 6. PARTIDAS COMPENSADAS (silver.sap_bsad)
+-- 6. CLEARED ITEMS (silver.sap_bsad)
 -- ==========================================================
 IF OBJECT_ID('silver.sap_bsad', 'U') IS NOT NULL DROP TABLE silver.sap_bsad;
 CREATE TABLE silver.sap_bsad (
@@ -246,29 +246,29 @@ CREATE TABLE silver.sap_bsad (
     documento_id VARCHAR(10) NOT NULL,
     asignacion VARCHAR(18), -- ZUONR
     referencia VARCHAR(16), -- XBLNR
-    documento_ventas VARCHAR(10), -- VBELN: referencia al documento de ventas (SD), igual que en silver.sap_bsid
+    documento_ventas VARCHAR(10), -- VBELN: reference to the sales document (SD), same as in silver.sap_bsid
     posicion INT NOT NULL,
     fecha_contabilizacion DATE,
     fecha_documento DATE,
     fecha_registro_sistema DATE, -- CPUDT
     fecha_compensacion DATE,
     documento_compensacion VARCHAR(10),
-    ejercicio_compensacion INT, -- AUGGJ: ejercicio fiscal del documento_compensacion - AUGBL se reasigna cada año fiscal, asi que sin este campo un mismo numero de documento_compensacion puede corresponder a compensaciones distintas en años distintos. Agregado 2026-08-12 para poder caminar la cadena pago virgen -> hijo -> factura (ver gold.fact_pago_factura).
+    ejercicio_compensacion INT, -- AUGGJ: fiscal year of documento_compensacion - AUGBL gets reassigned every fiscal year, so without this field the same documento_compensacion number could correspond to different settlements in different years. Added 2026-08-12 to be able to walk the raw-payment -> child -> invoice chain (see gold.fact_pago_factura).
     clase_documento VARCHAR(2),
-    codigo_impuesto VARCHAR(2), -- MWSKZ: codigo de IVA, igual que en silver.sap_bsid
+    codigo_impuesto VARCHAR(2), -- MWSKZ: VAT code, same as in silver.sap_bsid
     debe_haber CHAR(1), -- SHKZG
-    fecha_vencimiento DATE, -- ZFBDT: se conserva desde bsid para poder medir pagos tardios (fecha_compensacion - fecha_vencimiento)
+    fecha_vencimiento DATE, -- ZFBDT: kept from bsid to be able to measure late payments (fecha_compensacion - fecha_vencimiento)
     monto_moneda_local DECIMAL(15,2),
     monto_moneda_doc DECIMAL(15,2),
     moneda VARCHAR(5),
     condicion_pago VARCHAR(4),
     dias_plazo DECIMAL(15,2), -- ZBD1T
-    sgtxt VARCHAR(50), -- SGTXT: texto de la posicion. 'Asignación Aut. Deposito' identifica el pago virgen (deposito bancario original antes de aplicarse a facturas) - ver gold.fact_pago_factura.
-    factura_referencia_documento VARCHAR(10), -- REBZG: documento de la factura a la que esta linea hace referencia directa (nativo de SAP) - agregado 2026-08-13, mucho mas preciso que documento_compensacion compartido para ligar pago/NC/ND/devolucion/ajuste a SU factura especifica cuando un mismo grupo de compensacion agrupa varias facturas y varias aplicaciones (ver gold.fact_aplicacion_pagos).
-    factura_referencia_ejercicio INT, -- REBZJ: ejercicio fiscal de factura_referencia_documento
-    factura_referencia_posicion INT, -- REBZZ: posicion de factura_referencia_documento
+    sgtxt VARCHAR(50), -- SGTXT: line item text. 'Asignación Aut. Deposito' identifies the raw payment (the original bank deposit before being applied to invoices) - see gold.fact_pago_factura.
+    factura_referencia_documento VARCHAR(10), -- REBZG: invoice document this line directly references (native SAP field) - added 2026-08-13, much more precise than the shared documento_compensacion for tying a payment/credit note/debit note/return/adjustment to ITS specific invoice when the same compensation group bundles several invoices and several applications (see gold.fact_aplicacion_pagos).
+    factura_referencia_ejercicio INT, -- REBZJ: fiscal year of factura_referencia_documento
+    factura_referencia_posicion INT, -- REBZZ: line item of factura_referencia_documento
 
-    -- Reclamacion / Cobranza (dunning) a nivel de partida
+    -- Dunning at the line-item level
     area_reclamacion              VARCHAR(2), -- MABER
     nivel_reclamacion             CHAR(1),    -- MANST
     clave_reclamacion_legal       CHAR(1),    -- MSCHL
@@ -280,7 +280,7 @@ CREATE TABLE silver.sap_bsad (
 );
 
 -- ==========================================================
--- 7. DATOS DE SOCIEDAD DEL CLIENTE (silver.sap_knb1)
+-- 7. CUSTOMER COMPANY CODE DATA (silver.sap_knb1)
 -- ==========================================================
 IF OBJECT_ID('silver.sap_knb1', 'U') IS NOT NULL DROP TABLE silver.sap_knb1;
 CREATE TABLE silver.sap_knb1 (
@@ -289,9 +289,9 @@ CREATE TABLE silver.sap_knb1 (
     cliente_id                            VARCHAR(10)  NOT NULL,
     fecha_creacion                        DATE,          -- ERDAT
     usuario_creacion                      VARCHAR(12),   -- ERNAM
-    cuenta_mayor                          VARCHAR(10),   -- AKONT (cuenta de enlace)
+    cuenta_mayor                          VARCHAR(10),   -- AKONT (reconciliation account)
     clave_orden_partidas                  VARCHAR(3),    -- ZUAWA
-    grupo_planificacion_tesoreria         VARCHAR(10),   -- FDGRV (ensanchado de VARCHAR(4) a VARCHAR(10): causaba "String or binary data would be truncated" al ejecutar silver.load_silver, bronze.sap_knb1.FDGRV es NVARCHAR(10))
+    grupo_planificacion_tesoreria         VARCHAR(10),   -- FDGRV (widened from VARCHAR(4) to VARCHAR(10): caused a "String or binary data would be truncated" error when running silver.load_silver, bronze.sap_knb1.FDGRV is NVARCHAR(10))
     condicion_pago                        VARCHAR(4),    -- ZTERM
     indicador_intereses                   VARCHAR(2),    -- VZSKZ
     fecha_ultima_liquidacion_intereses     DATE,          -- ZINDT
@@ -304,31 +304,32 @@ CREATE TABLE silver.sap_knb1 (
     cuenta_pagador_alterno                VARCHAR(10),   -- KNRZE
     banco_propio                          VARCHAR(5),    -- HBKID
     vias_pago                             VARCHAR(10),   -- ZWELS
-    flag_compensacion_cliente_proveedor   BIT,           -- XZVER: 88.6% de las filas en 'X', variacion real (vs 11.4% en blanco)
+    flag_compensacion_cliente_proveedor   BIT,           -- XZVER: 88.6% of rows are 'X', real variation (vs. 11.4% blank)
     fecha_carga                           DATETIME DEFAULT GETDATE(),
     CONSTRAINT PK_silver_sap_knb1 PRIMARY KEY (mandante, sociedad, cliente_id)
 );
 
 -- ==========================================================
--- NOTA: bronze.sap_knb1.QSSKZ NO EXISTE - la columna "indicador_retencion"
--- (mapeada aqui desde QSSKZ) estaba definida en versiones anteriores de este
--- archivo pero QSSKZ nunca fue una columna real de bronze.sap_knb1 (ver
--- ddl_bronze.sql, la tabla no la tiene). sp_load_silver.sql referenciaba esa
--- columna inexistente en el SELECT - nunca se detecto porque silver.load_silver
--- nunca se habia ejecutado con exito. Se elimino la columna de silver.
+-- NOTE: bronze.sap_knb1.QSSKZ DOES NOT EXIST - the "indicador_retencion"
+-- column (mapped here from QSSKZ) was defined in earlier versions of this
+-- file, but QSSKZ was never a real column of bronze.sap_knb1 (see
+-- ddl_bronze.sql, the table doesn't have it). sp_load_silver.sql referenced
+-- that nonexistent column in its SELECT - never caught because
+-- silver.load_silver had never run successfully. The column was removed
+-- from silver.
 --
--- NOTA: columnas de bronze.sap_knb1 deliberadamente NO incluidas en silver:
--- BUSAB, ZAHLS, VRBKZ, VLIBB, VRSNR, CESSION_KZ, KVERM -> 0% (o practicamente
---   0%, BUSAB con 1 de 24,244) de las filas con dato.
--- VRSPR -> 100% de las filas en 0 (constante), sin variacion real.
--- VERDT -> 100% de las filas en '00000000' (default), sin variacion real.
---   (Los tres campos de seguro de credito VRBKZ/VRSPR/VRSNR/VERDT en 0% o
---   constante son consistentes entre si: el modulo de seguro de credito no
---   esta en uso en este cliente SAP).
+-- NOTE: bronze.sap_knb1 columns deliberately NOT included in silver:
+-- BUSAB, ZAHLS, VRBKZ, VLIBB, VRSNR, CESSION_KZ, KVERM -> 0% (or practically
+--   0%, BUSAB with 1 of 24,244) of rows have data.
+-- VRSPR -> 100% of rows at 0 (constant), no real variation.
+-- VERDT -> 100% of rows at '00000000' (default), no real variation.
+--   (The three credit-insurance fields VRBKZ/VRSPR/VRSNR/VERDT at 0% or
+--   constant are consistent with each other: the credit insurance module
+--   isn't in use for this SAP client.)
 -- ==========================================================
 
 -- ==========================================================
--- 8. DATOS DE RECLAMACION DEL CLIENTE (silver.sap_knb5)
+-- 8. CUSTOMER DUNNING DATA (silver.sap_knb5)
 -- ==========================================================
 IF OBJECT_ID('silver.sap_knb5', 'U') IS NOT NULL DROP TABLE silver.sap_knb5;
 CREATE TABLE silver.sap_knb5 (
@@ -344,18 +345,18 @@ CREATE TABLE silver.sap_knb5 (
 );
 
 -- ==========================================================
--- NOTA: bronze.sap_knb5 NO tiene columnas MANST, MSCHL ni ZTERM - existen en
--- bsid/bsad (mismo bloque de "reclamacion/cobranza a nivel de partida") pero
--- KNB5 es una tabla distinta y mas pequeña (solo 11 columnas: MANDT, KUNNR,
--- BUKRS, MABER, MAHNA, MANSP, MADAT, MAHNS, KNRMA, GMVDT, BUSAB). Las
--- columnas "nivel_reclamacion"/"clave_reclamacion_legal"/"condicion_pago"
--- (mapeadas antes desde MANST/MSCHL/ZTERM) se eliminaron por el mismo motivo
--- que QSSKZ en silver.sap_knb1: referenciaban columnas que nunca existieron
--- en el bronze real, nunca detectado porque silver.load_silver nunca se
--- habia ejecutado con exito.
+-- NOTE: bronze.sap_knb5 does NOT have MANST, MSCHL, or ZTERM columns - they
+-- exist in bsid/bsad (same "line-item dunning" block) but KNB5 is a
+-- different, smaller table (only 11 columns: MANDT, KUNNR, BUKRS, MABER,
+-- MAHNA, MANSP, MADAT, MAHNS, KNRMA, GMVDT, BUSAB). The
+-- "nivel_reclamacion"/"clave_reclamacion_legal"/"condicion_pago" columns
+-- (previously mapped from MANST/MSCHL/ZTERM) were removed for the same
+-- reason as QSSKZ in silver.sap_knb1: they referenced columns that never
+-- existed in the real bronze table, never caught because
+-- silver.load_silver had never run successfully.
 --
--- NOTA: columnas reales de bronze.sap_knb5 deliberadamente NO incluidas:
--- KNRMA, GMVDT, BUSAB, MANSP -> 0% (o practicamente 0%, BUSAB 1 de 15,726)
---   de las filas con dato.
+-- NOTE: real bronze.sap_knb5 columns deliberately NOT included:
+-- KNRMA, GMVDT, BUSAB, MANSP -> 0% (or practically 0%, BUSAB 1 of 15,726)
+--   of rows have data.
 -- ==========================================================
 GO

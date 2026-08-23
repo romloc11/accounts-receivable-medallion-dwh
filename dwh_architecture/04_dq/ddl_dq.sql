@@ -4,29 +4,29 @@ GO
 /*
 ===============================================================================
 PROJECT: Enterprise Data Warehouse (dwh-ciosa)
-LAYER: DQ (Data Quality - excepciones de calidad de dato de NEGOCIO)
+LAYER: DQ (Data Quality - BUSINESS data-quality exceptions)
 
-Separado deliberadamente de 'gold': gold es para reportes/BI (dimensiones y
-hechos listos para consumo), dq es para que el equipo de datos sepa que
-corregir en SAP. Tambien separado de 'control' (esquema de auditoria de
-EJECUCION de cargas, ver ddl_bronze.sql seccion 9-11) - control es sobre
-"corrio bien la carga", dq es sobre "el dato de negocio es inconsistente".
-Son conceptos distintos y no se mezclan.
+Deliberately separated from 'gold': gold is for reporting/BI (dimensions and
+facts ready for consumption), dq is for the data team to know what to fix in
+SAP. Also separate from 'control' (load-EXECUTION auditing schema, see
+ddl_bronze.sql section 9-11) - control is about "did the load run
+correctly," dq is about "the business data is inconsistent." These are
+different concepts and shouldn't be mixed.
 
-Cada tabla dq.* se recalcula completa en cada corrida de su procedimiento de
-carga correspondiente (TRUNCATE+INSERT) - no acumula historico de casos ya
-corregidos, siempre refleja el estado actual.
+Each dq.* table is fully recalculated on every run of its corresponding load
+procedure (TRUNCATE+INSERT) - it doesn't accumulate a history of already-
+fixed cases, it always reflects the current state.
 ===============================================================================
 */
 
 -- ==========================================================
 -- 1. TABLE: dq.clientes_ambiguos
--- Clientes con 2+ canales ACTIVO simultaneos en gold.vw_cliente_canal_estatus
--- - contradice la regla de negocio de ciosa.py ("un cliente solo puede estar
--- activo en un canal"). NO bloquea la carga de gold.dim_cliente_comercial -
--- esa sigue usando su propio desempate (prioridad de estatus, luego canal
--- mas bajo) para elegir un representante de todas formas. Esta tabla es solo
--- para que el equipo de datos investigue/corrija en SAP.
+-- Customers with 2+ simultaneous ACTIVO channels in
+-- gold.vw_cliente_canal_estatus - contradicts ciosa.py's business rule
+-- ("a customer can only be active in one channel"). Does NOT block the
+-- gold.dim_cliente_comercial load - that still uses its own tiebreaker
+-- (status priority, then lowest channel) to pick a representative anyway.
+-- This table exists only so the data team can investigate/fix it in SAP.
 -- ==========================================================
 IF OBJECT_ID('dq.clientes_ambiguos', 'U') IS NOT NULL
     DROP TABLE dq.clientes_ambiguos;

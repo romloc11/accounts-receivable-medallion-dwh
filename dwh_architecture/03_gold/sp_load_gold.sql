@@ -31,24 +31,24 @@ empty - is now just the NULL case inside this procedure).
 */
 
 -- ==========================================================
--- gold.load_dim_fecha (Calendario, sin SCD)
--- REDISEÑADO 2026-08-20: gold.dim_fecha paso de estatica (2020-01-01 a
--- 2035-12-31, poblada una sola vez) a creciente - limite inferior fijo en
--- 2022-01-01 (arranque real de bronze.sap_bsad), limite superior = hoy + 1
--- año (colchon para fechas de vencimiento futuras tipo NET-90), extendido
--- automaticamente en cada corrida. Motivo: el rango estatico ofrecia años
--- sin ninguna transaccion real (ej. el filtro de Año del reporte de Power
--- BI mostraba 2020-2035 completos aunque solo hubiera datos reales desde
--- 2022) - ver dwh-ciosa-project-status en memoria para el detalle completo.
+-- gold.load_dim_fecha (Calendar, no SCD)
+-- REDESIGNED 2026-08-20: gold.dim_fecha went from static (2020-01-01 to
+-- 2035-12-31, populated once) to growing - fixed lower bound at 2022-01-01
+-- (bronze.sap_bsad's real start date), upper bound = today + 1 year (a
+-- cushion for future due dates like NET-90 terms), automatically extended
+-- on every run. Reason: the static range offered years with no real
+-- transactions at all (e.g. the Power BI report's Year filter showed the
+-- full 2020-2035 even though real data only existed since 2022) - see
+-- dwh-ciosa-project-status in memory for the full detail.
 --
--- Idempotente y seguro de correr todos los dias: si ya esta al corriente
--- (MAX(fecha) >= hoy+1 año), el WHILE no itera nada. Si la tabla esta vacia
--- (primera vez, base de datos nueva), arranca desde el limite inferior fijo
--- - esto reemplaza el bootstrap que antes hacia populate_dim_fecha.sql (ya
--- retirado). NUNCA borra filas existentes - solo agrega dias nuevos al
--- final, nunca usa TRUNCATE (gold.fact_saldo_cartera ya tiene una FK real
--- hacia esta tabla con datos - TRUNCATE fallaria, mismo motivo que ya
--- obligo a rediseñar gold.load_dim_cliente).
+-- Idempotent and safe to run every day: if it's already up to date
+-- (MAX(fecha) >= today+1 year), the WHILE doesn't iterate at all. If the
+-- table is empty (first time, new database), it starts from the fixed
+-- lower bound - this replaces the bootstrap that populate_dim_fecha.sql
+-- (now retired) used to do. NEVER deletes existing rows - only appends new
+-- days at the end, never uses TRUNCATE (gold.fact_saldo_cartera already
+-- has a real FK to this table with data - TRUNCATE would fail, the same
+-- reason that already forced gold.load_dim_cliente to be redesigned).
 -- ==========================================================
 IF OBJECT_ID('gold.load_dim_fecha', 'P') IS NOT NULL
     DROP PROCEDURE gold.load_dim_fecha;
@@ -63,9 +63,9 @@ BEGIN
 
     BEGIN TRY
         SET @start_time = GETDATE();
-        PRINT '>> Cargando gold.dim_fecha...';
+        PRINT '>> Loading gold.dim_fecha...';
 
-        SET DATEFIRST 7;  -- domingo = 1, explicito para no depender de la configuracion del servidor
+        SET DATEFIRST 7;  -- Sunday = 1, explicit so it doesn't depend on server configuration
 
         SELECT @fecha_max_actual = MAX(fecha) FROM gold.dim_fecha;
         SET @fecha_max_objetivo = DATEADD(YEAR, 1, CAST(GETDATE() AS DATE));
@@ -105,10 +105,10 @@ BEGIN
         END
 
         SET @end_time = GETDATE();
-        PRINT 'Dias nuevos agregados: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
+        PRINT 'New days added: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
     END TRY
     BEGIN CATCH
-        PRINT 'ERROR en gold.dim_fecha: ' + ERROR_MESSAGE();
+        PRINT 'ERROR in gold.dim_fecha: ' + ERROR_MESSAGE();
         THROW;
     END CATCH;
 END;
@@ -118,16 +118,16 @@ PRINT 'Procedure gold.load_dim_fecha created successfully.';
 GO
 
 -- ==========================================================
--- gold.load_dim_cliente (SCD Tipo 1)
--- 2026-08-17: rediseñado de TRUNCATE+INSERT a UPDATE+INSERT explicito (sin
--- DELETE) - TRUNCATE dejo de ser viable en cuanto gold.fact_aplicacion_pagos
--- agrego su FK hacia esta tabla (SQL Server no permite TRUNCATE sobre una
--- tabla referenciada por FK, sin importar si la tabla hija esta vacia o no).
--- No se borran clientes que ya no aparecen en kna1 (nunca se ha visto un
--- hard-delete real de un cliente en SAP, y borrar aqui arriesgaria romper
--- las FK de las facts si algun dia si pasa) - solo se actualizan los
--- existentes y se insertan los nuevos, mismo principio "explicito, no MERGE"
--- ya establecido para las SCD2 de este archivo.
+-- gold.load_dim_cliente (SCD Type 1)
+-- 2026-08-17: redesigned from TRUNCATE+INSERT to explicit UPDATE+INSERT (no
+-- DELETE) - TRUNCATE stopped being viable as soon as gold.fact_aplicacion_pagos
+-- added its FK to this table (SQL Server doesn't allow TRUNCATE on a table
+-- referenced by an FK, regardless of whether the child table is empty).
+-- Customers that no longer appear in kna1 are not deleted (a real hard
+-- delete of a customer has never been observed in SAP, and deleting here
+-- would risk breaking the facts' FKs if it ever does happen) - existing
+-- ones are only updated and new ones inserted, the same "explicit, not
+-- MERGE" principle already established for this file's SCD2 tables.
 -- ==========================================================
 IF OBJECT_ID('gold.load_dim_cliente', 'P') IS NOT NULL
     DROP PROCEDURE gold.load_dim_cliente;
@@ -141,7 +141,7 @@ BEGIN
 
     BEGIN TRY
         SET @start_time = GETDATE();
-        PRINT '>> Cargando gold.dim_cliente...';
+        PRINT '>> Loading gold.dim_cliente...';
 
         IF OBJECT_ID('tempdb..#fuente_cliente') IS NOT NULL
             DROP TABLE #fuente_cliente;
@@ -154,7 +154,7 @@ BEGIN
                 WHEN k.rfc IS NULL THEN 'DIRECCION_ALTERNA'
                 WHEN k.rfc IN ('XAXX010101000', 'XEXX010101000') THEN 'GENERICO'
                 ELSE 'PADRE'
-            END AS tipo_cliente,  -- confirmado 2026-08-07: KRAUS='FILIAL' manda, luego RFC nulo/generico
+            END AS tipo_cliente,  -- confirmed 2026-08-07: KRAUS='FILIAL' takes priority, then null/generic RFC
             k.nombre, k.nombre2, k.pais, k.estado, k.poblacion, k.codigo_postal, k.calle,
             k.bloqueo_pedido, k.regimen_fiscal, k.telefono, k.telefono_extra, k.whatsapp,
             k.fecha_creacion, k.grupo_cuentas, k.proveedor_vinculado, k.flag_bloqueado,
@@ -166,8 +166,9 @@ BEGIN
         LEFT JOIN silver.sap_knkk kk
             ON kk.cliente_id = k.cliente_id;
 
-        -- Paso 1: actualizar clientes ya existentes (sin importar si algo
-        -- cambio realmente - SCD1 siempre sobreescribe, no hay version que cuidar)
+        -- Step 1: update customers that already exist (regardless of
+        -- whether anything actually changed - SCD1 always overwrites,
+        -- there's no version to protect)
         UPDATE d
         SET d.rfc = f.rfc, d.tipo_cliente = f.tipo_cliente, d.nombre = f.nombre, d.nombre2 = f.nombre2,
             d.pais = f.pais, d.estado = f.estado, d.poblacion = f.poblacion, d.codigo_postal = f.codigo_postal,
@@ -184,7 +185,7 @@ BEGIN
         JOIN #fuente_cliente f ON f.cliente_id = d.cliente_id;
         SET @rows_updated = @@ROWCOUNT;
 
-        -- Paso 2: insertar clientes nuevos (no existian antes en dim_cliente)
+        -- Step 2: insert new customers (didn't previously exist in dim_cliente)
         INSERT INTO gold.dim_cliente (
             cliente_id, rfc, tipo_cliente, nombre, nombre2, pais, estado,
             poblacion, codigo_postal, calle, bloqueo_pedido, regimen_fiscal,
@@ -211,10 +212,10 @@ BEGIN
         DROP TABLE #fuente_cliente;
 
         SET @end_time = GETDATE();
-        PRINT 'Filas actualizadas: ' + CAST(@rows_updated AS NVARCHAR) + ' | Filas nuevas: ' + CAST(@rows_inserted AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
+        PRINT 'Rows updated: ' + CAST(@rows_updated AS NVARCHAR) + ' | New rows: ' + CAST(@rows_inserted AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
     END TRY
     BEGIN CATCH
-        PRINT 'ERROR en gold.dim_cliente: ' + ERROR_MESSAGE();
+        PRINT 'ERROR in gold.dim_cliente: ' + ERROR_MESSAGE();
         THROW;
     END CATCH;
 END;
@@ -224,11 +225,11 @@ PRINT 'Procedure gold.load_dim_cliente created successfully.';
 GO
 
 -- ==========================================================
--- gold.load_dim_cliente_comercial (SCD Tipo 2)
--- Primera SCD2 real del proyecto - construida en pasos explicitos (temp
--- table + UPDATE + INSERT) en vez de un solo MERGE, dado el historial de
--- errores de compilacion dificiles de rastrear de esta instancia de SQL
--- Server 2012 cuando se agrupa demasiado en un solo batch.
+-- gold.load_dim_cliente_comercial (SCD Type 2)
+-- The project's first real SCD2 - built in explicit steps (temp table +
+-- UPDATE + INSERT) instead of a single MERGE, given this SQL Server 2012
+-- instance's history of hard-to-trace compilation errors when too much
+-- gets grouped into a single batch.
 -- ==========================================================
 IF OBJECT_ID('gold.load_dim_cliente_comercial', 'P') IS NOT NULL
     DROP PROCEDURE gold.load_dim_cliente_comercial;
@@ -243,10 +244,10 @@ BEGIN
 
     BEGIN TRY
         SET @start_time = GETDATE();
-        PRINT '>> Cargando gold.dim_cliente_comercial...';
+        PRINT '>> Loading gold.dim_cliente_comercial...';
 
-        -- Paso 1: elegir el canal representante por cliente (prioridad de
-        -- estatus, luego canal_distribucion mas bajo como desempate final)
+        -- Step 1: pick the representative channel per customer (status
+        -- priority, then lowest canal_distribucion as the final tiebreak)
         IF OBJECT_ID('tempdb..#representante') IS NOT NULL
             DROP TABLE #representante;
 
@@ -279,7 +280,7 @@ BEGIN
 
         DELETE FROM #representante WHERE rn <> 1;
 
-        -- Paso 2: cerrar versiones vigentes cuyo hash de atributos cambio
+        -- Step 2: close active versions whose attribute hash changed
         UPDATE d
         SET d.es_vigente = 0,
             d.fecha_fin_vigencia = DATEADD(DAY, -1, @hoy)
@@ -288,9 +289,10 @@ BEGIN
         WHERE d.es_vigente = 1
           AND d.hash_atributos <> r.hash_atributos;
 
-        -- Paso 3: insertar version nueva para clientes nuevos o con hash distinto
-        -- (paso 2 ya cerro la version vigente anterior de los que cambiaron,
-        -- asi que "sin version vigente" cubre ambos casos: nuevo Y cambiado)
+        -- Step 3: insert a new version for customers that are new or have a
+        -- different hash (step 2 already closed the previous active
+        -- version for the ones that changed, so "no active version" covers
+        -- both cases: new AND changed)
         INSERT INTO gold.dim_cliente_comercial (
             cliente_id, organizacion_ventas, canal_distribucion, sector,
             region, ruta, ruta_nombre, condicion_pago,
@@ -313,10 +315,10 @@ BEGIN
         DROP TABLE #representante;
 
         SET @end_time = GETDATE();
-        PRINT 'Filas nuevas/versionadas: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
+        PRINT 'New/versioned rows: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
     END TRY
     BEGIN CATCH
-        PRINT 'ERROR en gold.dim_cliente_comercial: ' + ERROR_MESSAGE();
+        PRINT 'ERROR in gold.dim_cliente_comercial: ' + ERROR_MESSAGE();
         THROW;
     END CATCH;
 END;
@@ -326,13 +328,13 @@ PRINT 'Procedure gold.load_dim_cliente_comercial created successfully.';
 GO
 
 -- ==========================================================
--- gold.load_dim_cliente_credito (SCD Tipo 2)
--- Requiere que gold.dim_cliente_comercial ya este cargada (se apoya en su
--- version vigente para saber "cual canal" usar al buscar analista/cobrador).
--- No se llama automaticamente - el orden de ejecucion (comercial antes que
--- credito) es responsabilidad de quien ejecute los procedimientos, no de un
--- wrapper que llame uno desde el otro (mismo motivo que dq, ver nota en
--- sp_load_dq.sql).
+-- gold.load_dim_cliente_credito (SCD Type 2)
+-- Requires gold.dim_cliente_comercial to already be loaded (it relies on
+-- its active version to know "which channel" to use when looking up the
+-- analyst/collector). Not called automatically - execution order
+-- (comercial before credito) is the responsibility of whoever runs the
+-- procedures, not a wrapper that calls one from the other (same reasoning
+-- as dq, see the note in sp_load_dq.sql).
 -- ==========================================================
 IF OBJECT_ID('gold.load_dim_cliente_credito', 'P') IS NOT NULL
     DROP PROCEDURE gold.load_dim_cliente_credito;
@@ -347,13 +349,13 @@ BEGIN
 
     BEGIN TRY
         SET @start_time = GETDATE();
-        PRINT '>> Cargando gold.dim_cliente_credito...';
+        PRINT '>> Loading gold.dim_cliente_credito...';
 
-        -- Paso 1: analista de credito (E1) y cobrador (CC), resueltos en el
-        -- canal que gold.dim_cliente_comercial ya eligio como representante
-        -- (mismo desempate de 'contador' mas bajo usado en
-        -- gold.vw_cliente_canal_estatus, por si hay mas de una asignacion
-        -- del mismo rol en ese canal)
+        -- Step 1: credit analyst (E1) and collector (CC), resolved on the
+        -- channel gold.dim_cliente_comercial already chose as the
+        -- representative (same lowest-'contador' tiebreak used in
+        -- gold.vw_cliente_canal_estatus, in case there's more than one
+        -- assignment of the same role in that channel)
         IF OBJECT_ID('tempdb..#representante_credito') IS NOT NULL
             DROP TABLE #representante_credito;
 
@@ -407,7 +409,7 @@ BEGIN
             ON co.cliente_id = k.cliente_id AND co.organizacion_ventas = dc.organizacion_ventas
             AND co.canal_distribucion = dc.canal_distribucion AND co.sector = dc.sector AND co.rn = 1;
 
-        -- Paso 2: cerrar versiones vigentes cuyo hash de atributos cambio
+        -- Step 2: close active versions whose attribute hash changed
         UPDATE d
         SET d.es_vigente = 0,
             d.fecha_fin_vigencia = DATEADD(DAY, -1, @hoy)
@@ -416,7 +418,7 @@ BEGIN
         WHERE d.es_vigente = 1
           AND d.hash_atributos <> r.hash_atributos;
 
-        -- Paso 3: insertar version nueva para clientes nuevos o con hash distinto
+        -- Step 3: insert a new version for customers that are new or have a different hash
         INSERT INTO gold.dim_cliente_credito (
             cliente_id, limite_credito, bloqueo_credito, clasificacion_riesgo,
             etiqueta_credito, grupo_credito, analista_credito_id, analista_credito_nombre,
@@ -437,10 +439,10 @@ BEGIN
         DROP TABLE #representante_credito;
 
         SET @end_time = GETDATE();
-        PRINT 'Filas nuevas/versionadas: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
+        PRINT 'New/versioned rows: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
     END TRY
     BEGIN CATCH
-        PRINT 'ERROR en gold.dim_cliente_credito: ' + ERROR_MESSAGE();
+        PRINT 'ERROR in gold.dim_cliente_credito: ' + ERROR_MESSAGE();
         THROW;
     END CATCH;
 END;
@@ -451,13 +453,14 @@ GO
 
 -- ==========================================================
 -- gold.load_fact_saldo_cartera
--- Foto diaria del saldo abierto por cliente (silver.sap_bsid, agregado a
--- nivel cliente) + comportamiento historico de pago (DPP y % a tiempo/tarde,
--- desde gold.fact_aplicacion_pagos WHERE tipo_aplicacion='PAGO' - ver Paso 2
--- abajo). Corregido y validado 2026-08-17 (primera corrida exitosa: 4,571
--- clientes con saldo). NUNCA borra fotos de dias anteriores - solo agrega la
--- de hoy (con un DELETE de la fecha de hoy primero, para que sea seguro
--- volver a correrlo el mismo dia sin duplicar).
+-- Daily snapshot of each customer's open balance (silver.sap_bsid,
+-- aggregated at the customer level) + historical payment behavior (DPP and
+-- % on-time/late, from gold.fact_aplicacion_pagos WHERE
+-- tipo_aplicacion='PAGO' - see Step 2 below). Fixed and validated
+-- 2026-08-17 (first successful run: 4,571 customers with a balance). NEVER
+-- deletes previous days' snapshots - only appends today's (with a DELETE
+-- of today's date first, so it's safe to re-run it the same day without
+-- duplicating).
 -- ==========================================================
 IF OBJECT_ID('gold.load_fact_saldo_cartera', 'P') IS NOT NULL
     DROP PROCEDURE gold.load_fact_saldo_cartera;
@@ -472,27 +475,27 @@ BEGIN
 
     BEGIN TRY
         SET @start_time = GETDATE();
-        PRINT '>> Cargando gold.fact_saldo_cartera (snapshot ' + CONVERT(VARCHAR, @hoy, 23) + ')...';
+        PRINT '>> Loading gold.fact_saldo_cartera (snapshot ' + CONVERT(VARCHAR, @hoy, 23) + ')...';
 
-        -- Idempotente: si ya se corrio hoy, se reemplaza esa foto (no se duplica)
+        -- Idempotent: if it already ran today, that snapshot gets replaced (not duplicated)
         DELETE FROM gold.fact_saldo_cartera WHERE fecha_snapshot = @hoy;
 
-        -- Paso 1: agregar silver.sap_bsid a nivel cliente.
-        -- REDISEÑADO 2026-08-18 tras reconciliar contra un reporte externo de
-        -- cartera (ver ddl_gold.sql para el detalle completo de las 3 causas
-        -- encontradas):
-        --   1. monto_moneda_local NUNCA trae signo (igual que bsad) -
-        --      debe_haber='H' (pagos/notas de credito/devoluciones/ajustes
-        --      sentados como partida abierta sin aplicar) se firma como
-        --      NEGATIVO antes de agregar (#bsid_firmado) - sin esto se sumaba
-        --      como deuda en vez de restar ($143.2M mal sumados en TODO bsid,
-        --      sin filtrar).
-        --   2. clase_documento='SA' (asientos de mayor/GL) excluido por
-        --      completo - no son documentos de cliente reales.
-        --   3. Periodo de gracia de 16 dias: 1-16 dias vencido = "saldo sano"
-        --      (saldo_1_16, NO cuenta en saldo_vencido), solo 17+ dias es
-        --      vencido real. Buckets de antiguedad re-cortados a 17-31/
-        --      32-180/181+ para ser comparables con el reporte externo.
+        -- Step 1: aggregate silver.sap_bsid at the customer level.
+        -- REDESIGNED 2026-08-18 after reconciling against an external
+        -- portfolio report (see ddl_gold.sql for the full detail of the 3
+        -- causes found):
+        --   1. monto_moneda_local NEVER carries a sign (same as bsad) -
+        --      debe_haber='H' (payments/credit notes/returns/adjustments
+        --      sitting as an unapplied open item) is signed as NEGATIVE
+        --      before aggregating (#bsid_firmado) - without this it was
+        --      added as debt instead of subtracted ($143.2M wrongly added
+        --      across ALL of bsid, unfiltered).
+        --   2. clase_documento='SA' (GL journal entries) excluded entirely
+        --      - these aren't real customer documents.
+        --   3. 16-day grace period: 1-16 days overdue = "healthy balance"
+        --      (saldo_1_16, does NOT count in saldo_vencido), only 17+
+        --      days is truly overdue. Aging buckets re-cut to
+        --      17-31/32-180/181+ to be comparable with the external report.
         IF OBJECT_ID('tempdb..#bsid_firmado') IS NOT NULL
             DROP TABLE #bsid_firmado;
 
@@ -526,35 +529,38 @@ BEGIN
 
         DROP TABLE #bsid_firmado;
 
-        -- Paso 2: DPP / DPP ponderado / % a tiempo-tarde, ventanas de 3 y 12
-        -- meses hacia atras desde @hoy.
-        -- MIGRADO 2026-08-19 de gold.fact_aplicacion_pagos a gold.fact_pagos_compensados/
-        -- gold.fact_facturas_compensadas - la logica de matching de fact_aplicacion_pagos
-        -- (3 niveles: REBZG/GRUPO_INAMBIGUO/sin match) resulto tener bugs
-        -- reales de sobre-atribucion (un candidato podia "explicar" facturas
-        -- por mucho mas de lo que realmente vale - ej. un documento de $137
-        -- atribuido a $2.5M en facturas), asi que se reemplazo por el diseño
-        -- simple: solo relaciona grupos de compensacion con EXACTAMENTE 1
-        -- pago virgen candidato (misma logica que gold.vw_pago_factura_simple,
-        -- pero SIN su filtro de canal/tipo_cliente - aqui se preserva el
-        -- mismo alcance amplio que ya tiene el Paso 1 de saldo arriba, para no
-        -- introducir una asimetria de alcance entre saldo y DPP dentro de la
-        -- misma fila de fact_saldo_cartera. Si en el futuro se quiere un DPP
-        -- acotado a mayoreo/clientes reales, agregar esa version por separado,
-        -- no reemplazar esta).
-        -- fecha_pago = fecha_documento del deposito virgen (fecha real del
-        -- deposito, no la del documento que aplico). Sin filas "sin match":
-        -- a diferencia de fact_aplicacion_pagos, aqui solo existen pares ya
-        -- resueltos, por construccion (INNER JOIN en toda la cadena).
-        -- FIX 2026-08-20: agregado el filtro grupo_rfc_unico (copiado de
-        -- gold.vw_pago_factura_simple, agregado ahi el 2026-08-20, un dia
-        -- despues de escribirse este bloque - nunca se habia sincronizado).
-        -- Sin esto, un grupo de compensacion con 1 solo pago candidato pero
-        -- facturas de 2+ RFC reales distintos (lotes de liquidacion tipo
-        -- Mercado Libre/pasarelas de pago que mezclan varias empresas) le
-        -- atribuia ese pago a facturas que no necesariamente cubrio,
-        -- contaminando dpp_*/pct_pagos_*. Medido en la vista: ~0.12% del
-        -- monto historico de pagos cae en grupos asi.
+        -- Step 2: DPP / weighted DPP / % on-time-late, 3- and 12-month
+        -- rolling windows back from @hoy.
+        -- MIGRATED 2026-08-19 from gold.fact_aplicacion_pagos to
+        -- gold.fact_pagos_compensados/gold.fact_facturas_compensadas -
+        -- fact_aplicacion_pagos's matching logic (3 tiers:
+        -- REBZG/GRUPO_INAMBIGUO/no-match) turned out to have real
+        -- over-attribution bugs (a candidate could "explain" invoices
+        -- worth far more than it actually covers - e.g. a $137 document
+        -- attributed to $2.5M in invoices), so it was replaced by the
+        -- simple design: only relates compensation groups with EXACTLY 1
+        -- candidate raw payment (same logic as
+        -- gold.vw_pago_factura_simple, but WITHOUT its channel/tipo_cliente
+        -- filter - the same broad scope that Step 1's saldo already has
+        -- above is preserved here, so as not to introduce a scope
+        -- mismatch between saldo and DPP within the same
+        -- fact_saldo_cartera row. If a DPP scoped to wholesale/real
+        -- customers is wanted in the future, add that version separately,
+        -- don't replace this one).
+        -- fecha_pago = fecha_documento of the raw deposit (the deposit's
+        -- real date, not the applying document's). No "no match" rows:
+        -- unlike fact_aplicacion_pagos, only already-resolved pairs exist
+        -- here, by construction (INNER JOIN across the whole chain).
+        -- FIX 2026-08-20: added the grupo_rfc_unico filter (copied from
+        -- gold.vw_pago_factura_simple, added there on 2026-08-20, one day
+        -- after this block was written - they had never been kept in
+        -- sync). Without this, a compensation group with only 1 candidate
+        -- payment but invoices from 2+ distinct real RFCs (settlement
+        -- batches like Mercado Libre/payment gateways that mix several
+        -- companies) would attribute that payment to invoices it didn't
+        -- necessarily cover, contaminating dpp_*/pct_pagos_*. Measured in
+        -- the view: ~0.12% of the historical payment amount falls into
+        -- groups like that.
         IF OBJECT_ID('tempdb..#dpp_cliente') IS NOT NULL
             DROP TABLE #dpp_cliente;
 
@@ -608,7 +614,7 @@ BEGIN
         WHERE fecha_pago >= DATEADD(MONTH, -12, @hoy)
         GROUP BY cliente_id;
 
-        -- Paso 3: combinar saldo + DPP + dimensiones SCD2 (join temporal a @hoy) e insertar
+        -- Step 3: combine balance + DPP + SCD2 dimensions (temporal join to @hoy) and insert
         INSERT INTO gold.fact_saldo_cartera (
             cliente_id, fecha_snapshot,
             saldo_total, saldo_no_vencido, saldo_1_16, saldo_vencido, num_documentos_abiertos, dias_vencido_max,
@@ -641,10 +647,10 @@ BEGIN
         DROP TABLE #dpp_cliente;
 
         SET @end_time = GETDATE();
-        PRINT 'Filas (clientes con saldo): ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
+        PRINT 'Rows (customers with a balance): ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
     END TRY
     BEGIN CATCH
-        PRINT 'ERROR en gold.fact_saldo_cartera: ' + ERROR_MESSAGE();
+        PRINT 'ERROR in gold.fact_saldo_cartera: ' + ERROR_MESSAGE();
         THROW;
     END CATCH;
 END;
@@ -654,11 +660,11 @@ PRINT 'Procedure gold.load_fact_saldo_cartera created successfully.';
 GO
 
 -- ==========================================================
--- gold.load_fact_aplicacion_pagos fue ELIMINADO 2026-08-19 junto con la
--- tabla gold.fact_aplicacion_pagos - ver nota en ddl_gold.sql (bugs reales
--- de sobre-atribucion en el matching de 3 niveles). Reemplazado por
--- gold.load_fact_pagos_compensados / gold.load_fact_facturas_compensadas de abajo, mas
--- gold.vw_pago_factura_simple para la relacion.
+-- gold.load_fact_aplicacion_pagos was REMOVED 2026-08-19 along with the
+-- gold.fact_aplicacion_pagos table - see the note in ddl_gold.sql (real
+-- over-attribution bugs in the 3-tier matching). Replaced by
+-- gold.load_fact_pagos_compensados / gold.load_fact_facturas_compensadas
+-- below, plus gold.vw_pago_factura_simple for the relationship.
 -- ==========================================================
 
 -- ==========================================================
@@ -676,7 +682,7 @@ BEGIN
 
     BEGIN TRY
         SET @start_time = GETDATE();
-        PRINT '>> Cargando gold.fact_pagos_compensados (Merge Incremental)...';
+        PRINT '>> Loading gold.fact_pagos_compensados (Incremental Merge)...';
 
         DECLARE @mes_anterior_inicio DATE = DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()) - 1, 0);
 
@@ -689,8 +695,8 @@ BEGIN
             FROM silver.sap_bsad
             WHERE clase_documento = 'DZ'
               AND sgtxt = 'Asignación Aut. Deposito'
-              AND debe_haber <> 'S' -- excluye la linea espejo/contrapartida del documento "hijo" (fix 2026-08-19, ver ddl_gold.sql)
-              AND monto_moneda_local > 0 -- excluye residuos tecnicos en $0.00 (fix 2026-08-19, ver ddl_gold.sql)
+              AND debe_haber <> 'S' -- excludes the "child" document's mirror/offsetting line (fix 2026-08-19, see ddl_gold.sql)
+              AND monto_moneda_local > 0 -- excludes $0.00 technical residuals (fix 2026-08-19, see ddl_gold.sql)
               AND fecha_compensacion >= @mes_anterior_inicio
         ) AS src
         ON  tgt.sociedad = src.sociedad
@@ -716,10 +722,10 @@ BEGIN
 
         SET @rows_count = @@ROWCOUNT;
         SET @end_time = GETDATE();
-        PRINT 'Filas: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
+        PRINT 'Rows: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
     END TRY
     BEGIN CATCH
-        PRINT 'ERROR en gold.fact_pagos_compensados: ' + ERROR_MESSAGE();
+        PRINT 'ERROR in gold.fact_pagos_compensados: ' + ERROR_MESSAGE();
         THROW;
     END CATCH;
 END;
@@ -743,7 +749,7 @@ BEGIN
 
     BEGIN TRY
         SET @start_time = GETDATE();
-        PRINT '>> Cargando gold.fact_facturas_compensadas (Merge Incremental)...';
+        PRINT '>> Loading gold.fact_facturas_compensadas (Incremental Merge)...';
 
         DECLARE @mes_anterior_inicio DATE = DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()) - 1, 0);
 
@@ -781,10 +787,10 @@ BEGIN
 
         SET @rows_count = @@ROWCOUNT;
         SET @end_time = GETDATE();
-        PRINT 'Filas: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
+        PRINT 'Rows: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
     END TRY
     BEGIN CATCH
-        PRINT 'ERROR en gold.fact_facturas_compensadas: ' + ERROR_MESSAGE();
+        PRINT 'ERROR in gold.fact_facturas_compensadas: ' + ERROR_MESSAGE();
         THROW;
     END CATCH;
 END;
@@ -794,40 +800,40 @@ PRINT 'Procedure gold.load_fact_facturas_compensadas created successfully.';
 GO
 
 -- ==========================================================
--- gold.load_gold (orquestador)
--- Un solo EXEC para correr todo el refresh de gold, en el orden correcto.
--- No tiene logica propia, solo encadena los 6 procedimientos de arriba via
--- EXEC - cada uno sigue existiendo y se puede seguir corriendo suelto para
--- debug/pruebas aisladas.
+-- gold.load_gold (orchestrator)
+-- A single EXEC to run the whole gold refresh, in the correct order. Has
+-- no logic of its own, just chains the 6 procedures above via EXEC - each
+-- one still exists and can still be run standalone for isolated
+-- debugging/testing.
 --
--- ORDEN (fijo, no cambiar sin entender las dependencias):
---   1. gold.load_dim_fecha             - creciente, sin dependencias. Va
---      primero porque gold.fact_saldo_cartera (paso 7) tiene una FK real
---      hacia esta tabla - debe estar al corriente antes de insertar ahi.
---   2. gold.load_dim_cliente           - SCD1, sin dependencias.
---   3. gold.load_dim_cliente_comercial - SCD2, sin dependencias.
---   4. gold.load_dim_cliente_credito   - SCD2, requiere que (3) ya haya
---      corrido en este refresh (usa su version vigente para resolver
---      analista/cobrador en el mismo canal que (3) eligio).
---   5. gold.load_fact_pagos_compensados            - MERGE incremental, sin dependencias.
---   6. gold.load_fact_facturas_compensadas         - MERGE incremental, sin dependencias.
---   7. gold.load_fact_saldo_cartera    - requiere (1)-(6) ya corridos: el
---      saldo por cliente tiene FK a dim_cliente (si un cliente de bsid no
---      esta todavia en dim_cliente, el INSERT completo del snapshot falla),
---      y el DPP lee de fact_pagos_compensados/fact_facturas_compensadas - si no se refrescaron antes
---      en esta misma corrida, el DPP queda calculado con datos viejos, sin
---      error visible.
+-- ORDER (fixed, don't change without understanding the dependencies):
+--   1. gold.load_dim_fecha             - growing, no dependencies. Goes
+--      first because gold.fact_saldo_cartera (step 7) has a real FK to
+--      this table - it must be up to date before inserting there.
+--   2. gold.load_dim_cliente           - SCD1, no dependencies.
+--   3. gold.load_dim_cliente_comercial - SCD2, no dependencies.
+--   4. gold.load_dim_cliente_credito   - SCD2, requires (3) to have
+--      already run in this refresh (uses its active version to resolve
+--      analyst/collector on the same channel (3) chose).
+--   5. gold.load_fact_pagos_compensados            - incremental MERGE, no dependencies.
+--   6. gold.load_fact_facturas_compensadas         - incremental MERGE, no dependencies.
+--   7. gold.load_fact_saldo_cartera    - requires (1)-(6) to have already
+--      run: the per-customer balance has an FK to dim_cliente (if a bsid
+--      customer isn't in dim_cliente yet, the snapshot's full INSERT
+--      fails), and the DPP reads from
+--      fact_pagos_compensados/fact_facturas_compensadas - if they weren't
+--      refreshed earlier in this same run, the DPP ends up computed with
+--      stale data, with no visible error.
 --
--- NO PROBADO ANTES en esta instancia de SQL Server 2012: nunca se habia
--- llamado un procedimiento gold/dq desde DENTRO de otro. El unico patron
--- proc-llama-a-proc confirmado como roto en este servidor es
--- control.sp_log_load (ver dwh-ciosa-sqlserver-constraints en memoria), que
--- toma ~8 parametros con nombre - EXEC simple sin parametros como los de
--- abajo es un patron mucho mas simple, pero no esta probado. Si este
--- procedimiento falla en compilar o en correr con un error dificil de
--- rastrear, este patron es el primer sospechoso - probarlo aislado (un solo
--- EXEC a un solo procedimiento vacio de prueba) antes de seguir
--- investigando cualquier otra causa.
+-- NOT PREVIOUSLY TESTED on this SQL Server 2012 instance: a gold/dq
+-- procedure had never been called from INSIDE another one before. The
+-- only proc-calls-proc pattern confirmed broken on this server is
+-- control.sp_log_load (see dwh-ciosa-sqlserver-constraints in memory),
+-- which takes ~8 named parameters - a simple parameterless EXEC like the
+-- ones below is a much simpler pattern, but it's untested. If this
+-- procedure fails to compile or run with a hard-to-trace error, this
+-- pattern is the first suspect - test it in isolation (a single EXEC to a
+-- single empty test procedure) before investigating any other cause.
 -- ==========================================================
 IF OBJECT_ID('gold.load_gold', 'P') IS NOT NULL
     DROP PROCEDURE gold.load_gold;
@@ -842,7 +848,7 @@ BEGIN
     BEGIN TRY
         SET @start_time = GETDATE();
         PRINT '===================================================';
-        PRINT '>> Iniciando refresh completo de gold...';
+        PRINT '>> Starting full gold refresh...';
         PRINT '===================================================';
 
         EXEC gold.load_dim_fecha;
@@ -855,11 +861,11 @@ BEGIN
 
         SET @end_time = GETDATE();
         PRINT '===================================================';
-        PRINT '>> Refresh completo de gold terminado. Duration total: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
+        PRINT '>> Full gold refresh finished. Total duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
         PRINT '===================================================';
     END TRY
     BEGIN CATCH
-        PRINT 'ERROR en gold.load_gold: ' + ERROR_MESSAGE();
+        PRINT 'ERROR in gold.load_gold: ' + ERROR_MESSAGE();
         THROW;
     END CATCH;
 END;

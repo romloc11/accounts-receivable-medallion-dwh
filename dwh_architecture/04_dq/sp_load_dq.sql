@@ -31,7 +31,7 @@ BEGIN
 
     BEGIN TRY
         SET @start_time = GETDATE();
-        PRINT '>> Cargando dq.clientes_ambiguos...';
+        PRINT '>> Loading dq.clientes_ambiguos...';
 
         TRUNCATE TABLE dq.clientes_ambiguos;
 
@@ -45,10 +45,10 @@ BEGIN
         SET @rows_count = @@ROWCOUNT;
 
         SET @end_time = GETDATE();
-        PRINT 'Filas: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
+        PRINT 'Rows: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
     END TRY
     BEGIN CATCH
-        PRINT 'ERROR en dq.clientes_ambiguos: ' + ERROR_MESSAGE();
+        PRINT 'ERROR in dq.clientes_ambiguos: ' + ERROR_MESSAGE();
         THROW;
     END CATCH;
 END;
