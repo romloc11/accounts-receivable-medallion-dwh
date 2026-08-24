@@ -22,6 +22,9 @@ GOLD    ── dimensions (SCD1/SCD2) + facts + reporting views
 
 Each layer is loaded by its own stored procedure (`bronze.load_bronze`, `silver.load_silver`, `gold.load_gold`, `dq.load_clientes_ambiguos`), run in that order. `gold.load_gold` is a thin orchestrator that chains the individual gold load procedures — each of those still runs standalone for isolated testing.
 
+![Data Warehouse Architecture](docs/architecture/architecture_dwh.svg)
+
+*Editable source: [docs/architecture/architecture_dwh.drawio](docs/architecture/architecture_dwh.drawio).*
 
 ### Data sources & roadmap
 
