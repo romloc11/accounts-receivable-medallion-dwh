@@ -1,0 +1,126 @@
+<svg viewBox="0 0 1000 470" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <rect x="0" y="0" width="1000" height="470" fill="#ffffff"/>
+
+  <!-- Title -->
+  <text x="500" y="26" text-anchor="middle" font-size="19" font-weight="700" letter-spacing="0.5" fill="#1a1a1a">DATA WAREHOUSE ARCHITECTURE</text>
+
+  <!-- ===================== SOURCES ===================== -->
+  <text x="16" y="46" font-size="14" font-weight="700" fill="#1a1a1a">Sources</text>
+  <rect x="14" y="52" width="182" height="352" fill="none" stroke="#9e9e9e" stroke-dasharray="4,3"/>
+  <text x="24" y="68" font-size="9.5" fill="#616161">CIOSACOM systems</text>
+
+  <!-- SAP - Phase 1 -->
+  <rect x="26" y="76" width="158" height="60" rx="4" fill="#e8f5e9" stroke="#2e7d32" stroke-width="1.5"/>
+  <text x="105" y="94" text-anchor="middle" font-size="12" font-weight="700" fill="#1b5e20">SAP</text>
+  <text x="105" y="109" text-anchor="middle" font-size="8.5" fill="#33691e">Interface: SQL Server</text>
+  <text x="105" y="126" text-anchor="middle" font-size="8.5" font-weight="700" fill="#2e7d32">● Phase 1 — in production</text>
+
+  <!-- CRM - Phase 2 -->
+  <rect x="26" y="146" width="158" height="60" rx="4" fill="#f5f5f5" stroke="#9e9e9e" stroke-width="1.5" stroke-dasharray="5,3"/>
+  <text x="105" y="164" text-anchor="middle" font-size="12" font-weight="700" fill="#424242">CRM</text>
+  <text x="105" y="179" text-anchor="middle" font-size="8.5" fill="#757575">Interface: API</text>
+  <text x="105" y="196" text-anchor="middle" font-size="8.5" font-weight="700" fill="#757575">○ Phase 2 — to be added</text>
+
+  <!-- MariaDB (Ciosacom web) - Phase 2 -->
+  <rect x="26" y="216" width="158" height="68" rx="4" fill="#f5f5f5" stroke="#9e9e9e" stroke-width="1.5" stroke-dasharray="5,3"/>
+  <text x="105" y="234" text-anchor="middle" font-size="11.5" font-weight="700" fill="#424242">MariaDB</text>
+  <text x="105" y="247" text-anchor="middle" font-size="8.5" fill="#757575">(CIOSACOM website)</text>
+  <text x="105" y="260" text-anchor="middle" font-size="8.5" fill="#757575">Interface: MariaDB</text>
+  <text x="105" y="277" text-anchor="middle" font-size="8.5" font-weight="700" fill="#757575">○ Phase 2 — to be added</text>
+
+  <!-- Legend -->
+  <text x="24" y="366" font-size="8.5" fill="#2e7d32">● Phase 1: active production source</text>
+  <text x="24" y="380" font-size="8.5" fill="#757575">○ Phase 2: source/capability to add</text>
+
+  <!-- Arrows sources -> bronze -->
+  <path d="M184 106 L204 106 L204 220 L214 220" fill="none" stroke="#2e7d32" stroke-width="2" marker-end="url(#arrowSap)"/>
+  <path d="M184 176 L204 176 L204 220 L214 220" fill="none" stroke="#9e9e9e" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrowGray)"/>
+  <path d="M184 250 L204 250 L204 240 L214 240" fill="none" stroke="#9e9e9e" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrowGray)"/>
+
+  <!-- ===================== DATA WAREHOUSE ===================== -->
+  <text x="504" y="46" text-anchor="middle" font-size="14" font-weight="700" fill="#1a1a1a">Data Warehouse — Medallion</text>
+  <rect x="206" y="52" width="600" height="352" fill="none" stroke="#9e9e9e" stroke-dasharray="4,3"/>
+
+  <!-- Bronze column -->
+  <rect x="216" y="64" width="184" height="22" fill="#fad7ac" stroke="#b46504" stroke-width="1.5"/>
+  <text x="308" y="79" text-anchor="middle" font-size="12.5" font-weight="700" fill="#7a4200">Bronze Layer</text>
+  <rect x="216" y="86" width="184" height="296" fill="none" stroke="#b46504"/>
+  <rect x="252" y="98" width="112" height="40" rx="4" fill="#ffe6cc" stroke="#d79b00" stroke-width="1.5"/>
+  <text x="308" y="122" text-anchor="middle" font-size="9.5" fill="#7a4200">Raw Data</text>
+  <text x="228" y="158" font-size="9" fill="#4a4a4a"><tspan font-weight="700">Object Type:</tspan> 10 tables</text>
+  <text x="228" y="174" font-size="8.5" fill="#4a4a4a"><tspan font-weight="700">Load:</tspan> Full Load (9 tbl) +</text>
+  <text x="228" y="187" font-size="8.5" fill="#4a4a4a">Incremental MERGE (bsad)</text>
+  <text x="228" y="206" font-size="9" fill="#4a4a4a">No Transformation</text>
+  <text x="228" y="222" font-size="9" fill="#4a4a4a">(1:1 raw mirror)</text>
+  <text x="228" y="244" font-size="9" fill="#4a4a4a">No Data Model</text>
+
+  <!-- Silver column -->
+  <rect x="408" y="64" width="184" height="22" fill="#f5f5f5" stroke="#666666" stroke-width="1.5"/>
+  <text x="500" y="79" text-anchor="middle" font-size="12.5" font-weight="700" fill="#333333">Silver Layer</text>
+  <rect x="408" y="86" width="184" height="296" fill="none" stroke="#666666"/>
+  <rect x="444" y="98" width="112" height="40" rx="4" fill="#f5f5f5" stroke="#666666" stroke-width="1.5"/>
+  <text x="500" y="122" text-anchor="middle" font-size="9.5" fill="#333333">Cleaned Data</text>
+  <text x="420" y="158" font-size="9" fill="#4a4a4a"><tspan font-weight="700">Object Type:</tspan> 8 tables</text>
+  <text x="420" y="174" font-size="8.5" fill="#4a4a4a"><tspan font-weight="700">Load:</tspan> Full Load (7 tbl) +</text>
+  <text x="420" y="187" font-size="8.5" fill="#4a4a4a">Incremental MERGE (bsad)</text>
+  <text x="420" y="206" font-size="9" fill="#4a4a4a"><tspan font-weight="700">Transform:</tspan> cleansing,</text>
+  <text x="420" y="219" font-size="9" fill="#4a4a4a">standardization, scope filters</text>
+  <text x="420" y="238" font-size="9" fill="#4a4a4a">No Data Model</text>
+
+  <!-- Gold column -->
+  <rect x="600" y="64" width="184" height="22" fill="#fff2cc" stroke="#d6b656" stroke-width="1.5"/>
+  <text x="692" y="79" text-anchor="middle" font-size="12.5" font-weight="700" fill="#7a6400">Gold Layer</text>
+  <rect x="600" y="86" width="184" height="296" fill="none" stroke="#d6b656"/>
+  <rect x="636" y="98" width="112" height="40" rx="4" fill="#fff2cc" stroke="#d6b656" stroke-width="1.5"/>
+  <text x="692" y="122" text-anchor="middle" font-size="9.5" fill="#7a6400">Business-Ready</text>
+  <text x="612" y="158" font-size="9" fill="#4a4a4a"><tspan font-weight="700">Object Type:</tspan> Tables + 2 Views</text>
+  <text x="612" y="174" font-size="8.5" fill="#4a4a4a"><tspan font-weight="700">Load:</tspan> SCD1/SCD2 dims +</text>
+  <text x="612" y="187" font-size="8.5" fill="#4a4a4a">Incremental/snapshot facts</text>
+  <text x="612" y="206" font-size="9" fill="#4a4a4a"><tspan font-weight="700">Transform:</tspan> integration,</text>
+  <text x="612" y="219" font-size="9" fill="#4a4a4a">aggregation, business rules</text>
+  <text x="612" y="238" font-size="9" fill="#4a4a4a"><tspan font-weight="700">Model:</tspan> Star schema</text>
+  <text x="612" y="251" font-size="9" fill="#4a4a4a">4 dims, 3 shared-dim facts</text>
+
+  <!-- Arrows bronze -> silver -> gold -->
+  <path d="M400 118 L408 118" fill="none" stroke="#b46504" stroke-width="3" marker-end="url(#arrowBronze)"/>
+  <path d="M592 118 L600 118" fill="none" stroke="#666666" stroke-width="3" marker-end="url(#arrowSilver)"/>
+
+  <!-- ===================== CONSUME ===================== -->
+  <text x="898" y="46" text-anchor="middle" font-size="14" font-weight="700" fill="#1a1a1a">Consume</text>
+  <rect x="814" y="52" width="172" height="352" fill="none" stroke="#9e9e9e" stroke-dasharray="4,3"/>
+
+  <rect x="826" y="66" width="148" height="52" rx="4" fill="#cce5ff" stroke="#006eaf" stroke-width="1.5"/>
+  <text x="900" y="88" text-anchor="middle" font-size="10" font-weight="700" fill="#003a5d">BI and Reporting</text>
+  <text x="900" y="102" text-anchor="middle" font-size="8" fill="#003a5d">Power BI</text>
+
+  <rect x="826" y="130" width="148" height="52" rx="4" fill="#cce5ff" stroke="#006eaf" stroke-width="1.5"/>
+  <text x="900" y="152" text-anchor="middle" font-size="10" font-weight="700" fill="#003a5d">SQL Queries</text>
+  <text x="900" y="166" text-anchor="middle" font-size="8" fill="#003a5d">Ad-hoc analysis</text>
+
+  <rect x="826" y="194" width="148" height="52" rx="4" fill="#fff2cc" stroke="#d6b656" stroke-width="1.5"/>
+  <text x="900" y="216" text-anchor="middle" font-size="10" font-weight="700" fill="#7a6400">DQ Monitoring</text>
+  <text x="900" y="230" text-anchor="middle" font-size="8" fill="#7a6400">clientes_ambiguos</text>
+
+  <rect x="826" y="258" width="148" height="52" rx="4" fill="#f5f5f5" stroke="#9e9e9e" stroke-width="1.5" stroke-dasharray="5,3"/>
+  <text x="900" y="280" text-anchor="middle" font-size="10" font-weight="700" fill="#424242">Machine Learning</text>
+  <text x="900" y="294" text-anchor="middle" font-size="8" font-weight="700" fill="#757575">○ Phase 2 — planned</text>
+
+  <!-- Arrow gold -> consume -->
+  <path d="M784 118 L800 118 L800 92 L826 92" fill="none" stroke="#1ba1e2" stroke-width="3" marker-end="url(#arrowBlue)"/>
+  <path d="M784 118 L800 118 L800 156 L826 156" fill="none" stroke="#1ba1e2" stroke-width="3" marker-end="url(#arrowBlue)"/>
+  <path d="M784 118 L800 118 L800 220 L826 220" fill="none" stroke="#1ba1e2" stroke-width="3" marker-end="url(#arrowBlue)"/>
+  <path d="M784 118 L800 118 L800 284 L826 284" fill="none" stroke="#9e9e9e" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrowGray)"/>
+
+  <!-- Roadmap note -->
+  <rect x="14" y="416" width="972" height="40" fill="#fffde7" stroke="#d6b656"/>
+  <text x="500" y="432" text-anchor="middle" font-size="9.5" fill="#5a4a00">Phase 1 (active): SAP → Bronze → Silver → Gold → Power BI / SQL / DQ Monitoring.</text>
+  <text x="500" y="447" text-anchor="middle" font-size="9.5" fill="#5a4a00">Phase 2 (planned): add CRM (API) and the CIOSACOM website (MariaDB) as sources, and Machine Learning as a new consumption layer.</text>
+
+  <defs>
+    <marker id="arrowSap" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#2e7d32"/></marker>
+    <marker id="arrowGray" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#9e9e9e"/></marker>
+    <marker id="arrowBronze" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#b46504"/></marker>
+    <marker id="arrowSilver" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#666666"/></marker>
+    <marker id="arrowBlue" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#1ba1e2"/></marker>
+  </defs>
+</svg>

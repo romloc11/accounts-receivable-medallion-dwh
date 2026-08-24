@@ -22,9 +22,24 @@ GOLD    ── dimensions (SCD1/SCD2) + facts + reporting views
 
 Each layer is loaded by its own stored procedure (`bronze.load_bronze`, `silver.load_silver`, `gold.load_gold`, `dq.load_clientes_ambiguos`), run in that order. `gold.load_gold` is a thin orchestrator that chains the individual gold load procedures — each of those still runs standalone for isolated testing.
 
+![CIOSACOM Data Warehouse Architecture](docs/architecture/architecture_dwh.svg)
+
+*Editable source: [docs/architecture/architecture_dwh.drawio](docs/architecture/architecture_dwh.drawio) (open with [diagrams.net](https://app.diagrams.net/) / the draw.io desktop app).*
+
+### Data sources & roadmap
+
+This warehouse is being rolled out in phases:
+
+- **Phase 1 (current, in production)** — SAP ECC (FI/SD modules), pulled via a SQL Server linked server. This is the only source feeding Bronze/Silver/Gold today.
+- **Phase 2 (planned)** — two additional CIOSACOM systems will be centralized into the same Medallion pipeline: the **CIOSACOM website's MariaDB database** and the **CRM**. Neither is connected yet; onboarding either will follow the same Bronze (raw mirror) → Silver (cleansing/standardization) → Gold (star schema) pattern already proven for SAP.
+
 ## Repository structure
 
 ```
+docs/
+└── architecture/
+    ├── architecture_dwh.svg      rendered architecture diagram (used in this README)
+    └── architecture_dwh.drawio   editable source (diagrams.net / draw.io)
 dwh_architecture/
 ├── init_database.sql        schema creation (bronze/silver/gold/control/dq)
 ├── 01_bronze/
