@@ -117,6 +117,13 @@ WITH pagos_por_grupo AS (
     GROUP BY documento_compensacion, ejercicio_compensacion
 ),
 grupo_rfc_unico AS (
+    -- INNER JOIN intencional, no LEFT JOIN: este negocio nunca elimina
+    -- clientes de SAP, solo los inactiva (via flags como bloqueo_pedido/
+    -- estatus_comercial) - el registro fisico en kna1/knkk siempre persiste,
+    -- asi que todo cliente_id de sap_bsad tiene garantizado un match en
+    -- dim_cliente. Confirmado con datos reales 2026-08-26 (0 huerfanos) y
+    -- con la regla de negocio del usuario. No cambiar a LEFT JOIN sin
+    -- evidencia de que esta politica cambio.
     SELECT b.documento_compensacion, b.ejercicio_compensacion
     FROM silver.sap_bsad b
     INNER JOIN gold.dim_cliente k ON k.cliente_id = b.cliente_id
@@ -129,7 +136,7 @@ facturas_por_grupo AS (
     GROUP BY documento_compensacion, ejercicio_compensacion
 )
 SELECT
-    p.cliente_id,
+    p.cliente_id, -- the PAYER, not the invoice's own owner (f.cliente_id, not exposed) - confirmed 2026-08-26 this is intentional: the report groups by who paid, not by who originally owed the invoice. If that ever needs to change, f.cliente_id is available on the fact_facturas_compensadas join (f) already in this view.
     k.nombre,
     dc.canal_distribucion,
     dc.estatus_comercial,
@@ -143,6 +150,12 @@ SELECT
     f.fecha_vencimiento,
     f.monto_moneda_local  AS monto_factura,
     DATEDIFF(DAY, f.fecha_vencimiento, p.fecha_documento) AS dias_pago, -- negative = paid before due, positive = paid late
+    -- No NULL-guard on fecha_vencimiento intentional: every invoice in this
+    -- business is required to carry a due date, confirmed with real data
+    -- 2026-08-26 (0 rows with fecha_vencimiento IS NULL). If it were ever
+    -- NULL, both WHEN comparisons evaluate to UNKNOWN and the CASE falls
+    -- through to PAGO_ANTICIPADO by SQL default - don't assume that's still
+    -- safe if this business rule ever changes.
     CASE
         WHEN f.fecha_vencimiento < DATEFROMPARTS(YEAR(p.fecha_documento), MONTH(p.fecha_documento), 1) THEN 'CARTERA_VENCIDA'
         WHEN f.fecha_vencimiento <= EOMONTH(p.fecha_documento) THEN 'CARTERA_DEL_MES'

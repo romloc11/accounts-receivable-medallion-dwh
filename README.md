@@ -56,8 +56,9 @@ dwh_architecture/
 │   ├── vw_pago_factura_simple.sql    payment-to-invoice reconciliation view
 │   └── backfill_fact_pagos_facturas_compensados.sql  one-time historical backfill
 └── 04_dq/
-    ├── ddl_dq.sql          data-quality flag tables
-    └── sp_load_dq.sql      data-quality monitor load
+    ├── ddl_dq.sql                          data-quality flag tables
+    ├── sp_load_dq.sql                      data-quality monitor load
+    └── validate_clasificacion_cobranza.sql  ad-hoc query re-validating vw_pago_factura_simple's month-cohort classification on demand
 ```
 
 ## Data model
