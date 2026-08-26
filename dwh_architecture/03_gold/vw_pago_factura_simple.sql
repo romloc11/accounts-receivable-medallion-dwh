@@ -65,6 +65,45 @@
 -- still exists, it just stopped being used for the classification) - the
 -- same historical-reliability caveat applies if they're used to
 -- filter/group backward in time.
+--
+-- clasificacion_cobranza validated 2026-08-26: the month-boundary
+-- coarseness (comparing fecha_vencimiento's month against fecha_pago's
+-- month, not the exact day gap) was checked against dias_pago directly
+-- over 2026 data. Two possible distortions were measured and found
+-- immaterial when judged against the same 1-16 day grace-period
+-- threshold gold.fact_saldo_cartera already uses for "not really
+-- overdue" (saldo_1_16):
+--   - PAGO_ANTICIPADO inflated by payments 1-3 days early that just
+--     happen to cross a month boundary: 3.25% of the bucket's amount
+--     ($7.8M of $239.9M).
+--   - CARTERA_DEL_MES hiding invoices paid 17+ days late within the
+--     same month: 1.9% of the bucket's amount ($11.5M of $616.4M).
+-- Both effects are real (the classification IS month-cohort, not
+-- day-precise) but too small to justify a redesign. dias_pago is
+-- already exposed as a raw column for anyone who needs day-level
+-- precision instead of the month-cohort label. Don't re-run this
+-- investigation from scratch - re-verify with a fresh date range only
+-- if the underlying payment mix changes materially.
+--
+-- monto_pago_asignado added 2026-08-26 - FAN-OUT WARNING: a single
+-- compensation group commonly settles 2+ invoices at once (51.6% of
+-- payment groups measured on 2026 data), and this view's grain is
+-- 1 row per (pago, factura) pair. That means monto_pago_virgen REPEATS
+-- in full on every one of those rows - summing it directly inflates
+-- the real cash figure by however many invoices share the group (measured:
+-- $853.9M real vs. $97,645.0M if summed naively across all 2026 fan-out
+-- groups, a ~95x inflation - the same class of over-attribution bug that
+-- got the original fact_aplicacion_pagos deleted 2026-08-19). Power BI's
+-- own "Monto Total Recibido" measure already works around this via
+-- SUMX(DISTINCT Cobranza[Documento Pago], MIN(...)) - but any direct SQL
+-- consumer of monto_pago_virgen falls straight into the trap.
+-- monto_pago_asignado is the safe alternative: the payment amount split
+-- proportionally across the invoices it settled (weighted by each
+-- invoice's own amount within the group), so SUM(monto_pago_asignado)
+-- always equals real cash received, with no DISTINCT trick required.
+-- monto_pago_virgen is kept as-is (the raw, per-row-repeated deposit
+-- amount) for anyone who genuinely needs to see the original payment
+-- document's value on each row - just never SUM() it directly.
 -- ==========================================================
 IF OBJECT_ID('gold.vw_pago_factura_simple', 'V') IS NOT NULL DROP VIEW gold.vw_pago_factura_simple;
 GO
@@ -83,6 +122,11 @@ grupo_rfc_unico AS (
     INNER JOIN gold.dim_cliente k ON k.cliente_id = b.cliente_id
     GROUP BY b.documento_compensacion, b.ejercicio_compensacion
     HAVING COUNT(DISTINCT k.rfc) = 1
+),
+facturas_por_grupo AS (
+    SELECT documento_compensacion, ejercicio_compensacion, SUM(monto_moneda_local) AS suma_facturas_grupo
+    FROM gold.fact_facturas_compensadas
+    GROUP BY documento_compensacion, ejercicio_compensacion
 )
 SELECT
     p.cliente_id,
@@ -91,7 +135,9 @@ SELECT
     dc.estatus_comercial,
     p.documento_id        AS documento_pago,
     p.fecha_documento     AS fecha_pago,
-    p.monto_moneda_local  AS monto_pago_virgen,
+    p.monto_moneda_local  AS monto_pago_virgen, -- repeats per row when the group has 2+ facturas - do not SUM() directly, see header warning
+    p.monto_moneda_local * f.monto_moneda_local
+        / NULLIF(fpg.suma_facturas_grupo, 0)      AS monto_pago_asignado, -- safe to SUM(): payment split proportionally across the invoices it settled
     f.documento_id        AS documento_factura,
     f.fecha_documento     AS fecha_factura,
     f.fecha_vencimiento,
@@ -113,6 +159,9 @@ INNER JOIN grupo_rfc_unico gr
 INNER JOIN gold.fact_facturas_compensadas f
     ON f.documento_compensacion = p.documento_compensacion
    AND f.ejercicio_compensacion = p.ejercicio_compensacion
+INNER JOIN facturas_por_grupo fpg
+    ON fpg.documento_compensacion = p.documento_compensacion
+   AND fpg.ejercicio_compensacion = p.ejercicio_compensacion
 INNER JOIN gold.dim_cliente_comercial dc
     ON dc.cliente_id = p.cliente_id
    AND p.fecha_documento BETWEEN dc.fecha_inicio_vigencia AND ISNULL(dc.fecha_fin_vigencia, '99991231')

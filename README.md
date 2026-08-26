@@ -90,6 +90,7 @@ See [DESIGN.md](DESIGN.md) for the full reasoning behind every table/view — wh
 - **SCD Type 2 history is only reliable from when each dimension's load procedure started running regularly.** A customer's first-ever captured version is backdated so older facts can still join to it, but that's a join-compatibility mechanism, not a claim that the attribute was actually true that far back — classifications that depend on projecting a *current* SCD2 attribute onto old transactions should be treated with that in mind.
 - **`fact_saldo_cartera` cannot be backfilled.** Its source (`silver.sap_bsid`) is a full daily mirror with no history retained, so the snapshot fact only accumulates forward from the day its load started running.
 - **Payment-to-invoice matching is deliberately incomplete.** `vw_pago_factura_simple` only resolves settlement groups with exactly one payment candidate and a single real company involved; ambiguous groups are left unmatched rather than guessed.
+- **`clasificacion_cobranza` classifies by calendar month, not exact days.** An invoice due the 1st of a month, paid the last day of the prior month, counts as early by one day but lands in the same bucket as a payment made weeks ahead. Quantified against real data and found immaterial (each direction of the effect is under 4% of its bucket's amount) — see [DESIGN.md](DESIGN.md) for the validation.
 
 ## Status
 
