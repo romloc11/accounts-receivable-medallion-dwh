@@ -140,6 +140,7 @@ SELECT
     k.nombre,
     dc.canal_distribucion,
     dc.estatus_comercial,
+    dc.id_surrogate        AS cliente_comercial_sk, -- added 2026-08-26: lets Power BI relate to gold.dim_cliente_comercial by key (star schema) instead of embedding canal_distribucion/estatus_comercial as plain text columns
     p.documento_id        AS documento_pago,
     p.fecha_documento     AS fecha_pago,
     p.monto_moneda_local  AS monto_pago_virgen, -- repeats per row when the group has 2+ facturas - do not SUM() directly, see header warning
