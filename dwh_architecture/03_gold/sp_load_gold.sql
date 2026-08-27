@@ -529,99 +529,17 @@ BEGIN
 
         DROP TABLE #bsid_firmado;
 
-        -- Step 2: DPP / weighted DPP / % on-time-late, 3- and 12-month
-        -- rolling windows back from @hoy.
-        -- MIGRATED 2026-08-19 from gold.fact_aplicacion_pagos to
-        -- gold.fact_pagos_compensados/gold.fact_facturas_compensadas -
-        -- fact_aplicacion_pagos's matching logic (3 tiers:
-        -- REBZG/GRUPO_INAMBIGUO/no-match) turned out to have real
-        -- over-attribution bugs (a candidate could "explain" invoices
-        -- worth far more than it actually covers - e.g. a $137 document
-        -- attributed to $2.5M in invoices), so it was replaced by the
-        -- simple design: only relates compensation groups with EXACTLY 1
-        -- candidate raw payment (same logic as
-        -- gold.vw_pago_factura_simple, but WITHOUT its channel/tipo_cliente
-        -- filter - the same broad scope that Step 1's saldo already has
-        -- above is preserved here, so as not to introduce a scope
-        -- mismatch between saldo and DPP within the same
-        -- fact_saldo_cartera row. If a DPP scoped to wholesale/real
-        -- customers is wanted in the future, add that version separately,
-        -- don't replace this one).
-        -- fecha_pago = fecha_documento of the raw deposit (the deposit's
-        -- real date, not the applying document's). No "no match" rows:
-        -- unlike fact_aplicacion_pagos, only already-resolved pairs exist
-        -- here, by construction (INNER JOIN across the whole chain).
-        -- FIX 2026-08-20: added the grupo_rfc_unico filter (copied from
-        -- gold.vw_pago_factura_simple, added there on 2026-08-20, one day
-        -- after this block was written - they had never been kept in
-        -- sync). Without this, a compensation group with only 1 candidate
-        -- payment but invoices from 2+ distinct real RFCs (settlement
-        -- batches like Mercado Libre/payment gateways that mix several
-        -- companies) would attribute that payment to invoices it didn't
-        -- necessarily cover, contaminating dpp_*/pct_pagos_*. Measured in
-        -- the view: ~0.12% of the historical payment amount falls into
-        -- groups like that.
-        IF OBJECT_ID('tempdb..#dpp_cliente') IS NOT NULL
-            DROP TABLE #dpp_cliente;
+        -- Step 2 (DPP / % on-time-late) REMOVED 2026-08-27 - now a Power BI
+        -- DAX time-intelligence measure over gold.vw_pago_factura_simple,
+        -- not a SQL object. See this table's own header comment in
+        -- ddl_gold.sql for the full reasoning.
 
-        ;WITH pagos_por_grupo AS (
-            SELECT documento_compensacion, ejercicio_compensacion, COUNT(*) AS num_pagos_candidatos
-            FROM gold.fact_pagos_compensados
-            GROUP BY documento_compensacion, ejercicio_compensacion
-        ),
-        grupo_rfc_unico AS (
-            SELECT b.documento_compensacion, b.ejercicio_compensacion
-            FROM silver.sap_bsad b
-            INNER JOIN gold.dim_cliente k ON k.cliente_id = b.cliente_id
-            GROUP BY b.documento_compensacion, b.ejercicio_compensacion
-            HAVING COUNT(DISTINCT k.rfc) = 1
-        ),
-        pago_factura AS (
-            SELECT
-                p.cliente_id,
-                p.fecha_documento AS fecha_pago,
-                f.monto_moneda_local AS monto_factura,
-                DATEDIFF(DAY, f.fecha_vencimiento, p.fecha_documento) AS dias_pago
-            FROM gold.fact_pagos_compensados p
-            INNER JOIN pagos_por_grupo g
-                ON g.documento_compensacion = p.documento_compensacion
-               AND g.ejercicio_compensacion = p.ejercicio_compensacion
-               AND g.num_pagos_candidatos = 1
-            INNER JOIN grupo_rfc_unico gr
-                ON gr.documento_compensacion = p.documento_compensacion
-               AND gr.ejercicio_compensacion = p.ejercicio_compensacion
-            INNER JOIN gold.fact_facturas_compensadas f
-                ON f.documento_compensacion = p.documento_compensacion
-               AND f.ejercicio_compensacion = p.ejercicio_compensacion
-        )
-        SELECT
-            cliente_id,
-            AVG(CASE WHEN fecha_pago >= DATEADD(MONTH, -3, @hoy) THEN dias_pago END) AS dpp_3m,
-            SUM(CASE WHEN fecha_pago >= DATEADD(MONTH, -3, @hoy) THEN dias_pago * monto_factura END)
-                / NULLIF(SUM(CASE WHEN fecha_pago >= DATEADD(MONTH, -3, @hoy) THEN monto_factura END), 0) AS dpp_ponderado_3m,
-            AVG(dias_pago) AS dpp_12m,
-            SUM(dias_pago * monto_factura) / NULLIF(SUM(monto_factura), 0) AS dpp_ponderado_12m,
-            SUM(CASE WHEN fecha_pago >= DATEADD(MONTH, -3, @hoy) AND dias_pago <= 0 THEN monto_factura ELSE 0 END)
-                / NULLIF(SUM(CASE WHEN fecha_pago >= DATEADD(MONTH, -3, @hoy) THEN monto_factura END), 0) * 100 AS pct_pagos_a_tiempo_3m,
-            SUM(CASE WHEN fecha_pago >= DATEADD(MONTH, -3, @hoy) AND dias_pago > 0 THEN monto_factura ELSE 0 END)
-                / NULLIF(SUM(CASE WHEN fecha_pago >= DATEADD(MONTH, -3, @hoy) THEN monto_factura END), 0) * 100 AS pct_pagos_tarde_3m,
-            SUM(CASE WHEN dias_pago <= 0 THEN monto_factura ELSE 0 END)
-                / NULLIF(SUM(monto_factura), 0) * 100 AS pct_pagos_a_tiempo_12m,
-            SUM(CASE WHEN dias_pago > 0 THEN monto_factura ELSE 0 END)
-                / NULLIF(SUM(monto_factura), 0) * 100 AS pct_pagos_tarde_12m
-        INTO #dpp_cliente
-        FROM pago_factura
-        WHERE fecha_pago >= DATEADD(MONTH, -12, @hoy)
-        GROUP BY cliente_id;
-
-        -- Step 3: combine balance + DPP + SCD2 dimensions (temporal join to @hoy) and insert
+        -- Step 2 (was Step 3): combine balance + SCD2 dimensions (temporal join to @hoy) and insert
         INSERT INTO gold.fact_saldo_cartera (
             cliente_id, fecha_snapshot,
             saldo_total, saldo_no_vencido, saldo_1_16, saldo_vencido, num_documentos_abiertos, dias_vencido_max,
             saldo_17_31, saldo_32_180, saldo_181_mas,
             documentos_con_reclamacion, nivel_reclamacion_max,
-            dpp_3m, dpp_ponderado_3m, dpp_12m, dpp_ponderado_12m,
-            pct_pagos_a_tiempo_3m, pct_pagos_tarde_3m, pct_pagos_a_tiempo_12m, pct_pagos_tarde_12m,
             id_cliente_comercial, id_cliente_credito
         )
         SELECT
@@ -629,12 +547,8 @@ BEGIN
             s.saldo_total, s.saldo_no_vencido, s.saldo_1_16, s.saldo_vencido, s.num_documentos_abiertos, s.dias_vencido_max,
             s.saldo_17_31, s.saldo_32_180, s.saldo_181_mas,
             s.documentos_con_reclamacion, s.nivel_reclamacion_max,
-            d.dpp_3m, d.dpp_ponderado_3m, d.dpp_12m, d.dpp_ponderado_12m,
-            d.pct_pagos_a_tiempo_3m, d.pct_pagos_tarde_3m, d.pct_pagos_a_tiempo_12m, d.pct_pagos_tarde_12m,
             dc.id_surrogate, dcr.id_surrogate
         FROM #saldo_cliente s
-        LEFT JOIN #dpp_cliente d
-            ON d.cliente_id = s.cliente_id
         LEFT JOIN gold.dim_cliente_comercial dc
             ON dc.cliente_id = s.cliente_id
             AND @hoy BETWEEN dc.fecha_inicio_vigencia AND ISNULL(dc.fecha_fin_vigencia, '99991231')
@@ -644,7 +558,6 @@ BEGIN
         SET @rows_count = @@ROWCOUNT;
 
         DROP TABLE #saldo_cliente;
-        DROP TABLE #dpp_cliente;
 
         SET @end_time = GETDATE();
         PRINT 'Rows (customers with a balance): ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
@@ -800,24 +713,82 @@ PRINT 'Procedure gold.load_fact_facturas_compensadas created successfully.';
 GO
 
 -- ==========================================================
+-- gold.load_dim_empleado (SCD Type 1)
+-- Same explicit UPDATE+INSERT pattern as gold.load_dim_cliente (no
+-- TRUNCATE, no MERGE - see ddl_gold.sql for why). Employees who no longer
+-- have a current (ENDDA='99991231') row in silver.sap_pa0001 (left the
+-- company) are not deleted here, same reasoning as dim_cliente not deleting
+-- customers gone from kna1 - a historical vendedor_id/cobrador_id already
+-- captured on an SCD2 dimension should keep resolving to the name that was
+-- true at the time, not silently go orphaned.
+-- ==========================================================
+IF OBJECT_ID('gold.load_dim_empleado', 'P') IS NOT NULL
+    DROP PROCEDURE gold.load_dim_empleado;
+GO
+
+CREATE PROCEDURE gold.load_dim_empleado
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @start_time DATETIME, @end_time DATETIME, @rows_updated INT, @rows_inserted INT;
+
+    BEGIN TRY
+        SET @start_time = GETDATE();
+        PRINT '>> Loading gold.dim_empleado...';
+
+        -- Step 1: update employees that already exist (SCD1 always
+        -- overwrites, there's no version to protect)
+        UPDATE d
+        SET d.nombre = f.nombre, d.fecha_actualizacion = GETDATE()
+        FROM gold.dim_empleado d
+        JOIN silver.sap_pa0001 f ON f.id_empleado = d.id_empleado;
+        SET @rows_updated = @@ROWCOUNT;
+
+        -- Step 2: insert new employees (didn't previously exist in dim_empleado)
+        INSERT INTO gold.dim_empleado (id_empleado, nombre)
+        SELECT f.id_empleado, f.nombre
+        FROM silver.sap_pa0001 f
+        WHERE NOT EXISTS (
+            SELECT 1 FROM gold.dim_empleado d WHERE d.id_empleado = f.id_empleado
+        );
+        SET @rows_inserted = @@ROWCOUNT;
+
+        SET @end_time = GETDATE();
+        PRINT 'Rows updated: ' + CAST(@rows_updated AS NVARCHAR) + ' | New rows: ' + CAST(@rows_inserted AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
+    END TRY
+    BEGIN CATCH
+        PRINT 'ERROR in gold.dim_empleado: ' + ERROR_MESSAGE();
+        THROW;
+    END CATCH;
+END;
+GO
+
+PRINT 'Procedure gold.load_dim_empleado created successfully.';
+GO
+
+-- ==========================================================
 -- gold.load_gold (orchestrator)
 -- A single EXEC to run the whole gold refresh, in the correct order. Has
--- no logic of its own, just chains the 6 procedures above via EXEC - each
+-- no logic of its own, just chains the procedures above via EXEC - each
 -- one still exists and can still be run standalone for isolated
 -- debugging/testing.
 --
 -- ORDER (fixed, don't change without understanding the dependencies):
 --   1. gold.load_dim_fecha             - growing, no dependencies. Goes
---      first because gold.fact_saldo_cartera (step 7) has a real FK to
+--      first because gold.fact_saldo_cartera (step 8) has a real FK to
 --      this table - it must be up to date before inserting there.
---   2. gold.load_dim_cliente           - SCD1, no dependencies.
---   3. gold.load_dim_cliente_comercial - SCD2, no dependencies.
---   4. gold.load_dim_cliente_credito   - SCD2, requires (3) to have
+--   2. gold.load_dim_empleado          - SCD1, no dependencies. No FK from
+--      any other gold object (see ddl_gold.sql), so its position here is
+--      not load-bearing - kept next to dim_cliente since both are simple
+--      SCD1 identity dimensions with no dependents.
+--   3. gold.load_dim_cliente           - SCD1, no dependencies.
+--   4. gold.load_dim_cliente_comercial - SCD2, no dependencies.
+--   5. gold.load_dim_cliente_credito   - SCD2, requires (4) to have
 --      already run in this refresh (uses its active version to resolve
---      analyst/collector on the same channel (3) chose).
---   5. gold.load_fact_pagos_compensados            - incremental MERGE, no dependencies.
---   6. gold.load_fact_facturas_compensadas         - incremental MERGE, no dependencies.
---   7. gold.load_fact_saldo_cartera    - requires (1)-(6) to have already
+--      analyst/collector on the same channel (4) chose).
+--   6. gold.load_fact_pagos_compensados            - incremental MERGE, no dependencies.
+--   7. gold.load_fact_facturas_compensadas         - incremental MERGE, no dependencies.
+--   8. gold.load_fact_saldo_cartera    - requires (1)-(7) to have already
 --      run: the per-customer balance has an FK to dim_cliente (if a bsid
 --      customer isn't in dim_cliente yet, the snapshot's full INSERT
 --      fails), and the DPP reads from
@@ -852,6 +823,7 @@ BEGIN
         PRINT '===================================================';
 
         EXEC gold.load_dim_fecha;
+        EXEC gold.load_dim_empleado;
         EXEC gold.load_dim_cliente;
         EXEC gold.load_dim_cliente_comercial;
         EXEC gold.load_dim_cliente_credito;

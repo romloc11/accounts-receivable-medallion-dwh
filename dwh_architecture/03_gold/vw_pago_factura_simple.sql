@@ -183,8 +183,8 @@ INNER JOIN gold.dim_cliente k
     ON k.cliente_id = p.cliente_id
 INNER JOIN gold.dim_cliente kf
     ON kf.cliente_id = f.cliente_id
-WHERE dc.canal_distribucion IN ('10', '40', '60')
+WHERE dc.canal_distribucion IN ('10', '40', '60')  -- '20' (menudeo) agregado y luego REVERTIDO 2026-08-27, mismo día: este DWH es explícitamente para mayoreo - canal 20 SÍ son clientes reales (por eso NO se tocó FUERA_DE_ALCANCE en vw_cliente_canal_estatus), simplemente están fuera de la misión de este reporte. Revertir esto también evitó tener que investigar CP (Cobranza POS) - ver dwh-ciosa-project-status.md en memoria para el hallazgo completo de por qué canal 20 casi no tiene DZ.
   AND dc.estatus_comercial <> 'FUERA_DE_ALCANCE'
-  AND k.tipo_cliente <> 'DIRECCION_ALTERNA'
+  AND k.tipo_cliente <> 'DIRECCION_ALTERNA'  -- confirmado 2026-08-27 por un usuario clave del negocio: clientes sin RFC no son clientes reales, no deben entrar en análisis de cartera
   AND kf.tipo_cliente <> 'DIRECCION_ALTERNA';
 GO

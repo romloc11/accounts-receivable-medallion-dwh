@@ -204,8 +204,18 @@ SELECT
         -- No channel-50 account has a ruta_nombre. Likely a related/
         -- shareholder account, correctly falls into FUERA_DE_ALCANCE under
         -- the rule below (it's not in 10/20/40/60).
+        -- Prefix '9' added 2026-08-27 - confirmed by the user (business
+        -- process owner) while validating gold.vw_cartera_abierta: cliente_id
+        -- starting with 9 are not real customers either, same tier as
+        -- 5/6/7 (not "real customer out of scope for one report" - the
+        -- distinction this project already got wrong once, for channel
+        -- 10/20/40/60, and reverted 2026-08-17 - see the note that used to
+        -- be right here). Example seen during validation: 90000371 "KIPKAR
+        -- SAPI DE CV", channel 10, was landing as INACTIVO (a real-looking
+        -- customer status) before this fix.
         WHEN v.canal_distribucion NOT IN ('10', '20', '40', '60')
-             OR v.cliente_id LIKE '5%' OR v.cliente_id LIKE '6%' OR v.cliente_id LIKE '7%'
+             OR v.cliente_id LIKE '5%' OR v.cliente_id LIKE '6%'
+             OR v.cliente_id LIKE '7%' OR v.cliente_id LIKE '9%'
             THEN 'FUERA_DE_ALCANCE'
         WHEN v.ruta_nombre IN ('CC131-E04', 'CC131-G01', 'C131-E200', 'C131-R014')
              OR ve.vendedor_nombre IN ('COBRADOR EXTRAJUDICIAL INTERNO', 'CLIENTES JURIDICO', 'CUENTAS CRITICAS JURIDICO', 'COBRADOR EXTRAJUDICIAL ABOGADO', 'COBRADOR RUTA DOS CIENTOS')
@@ -355,28 +365,35 @@ GO
 --   documentos_con_reclamacion/nivel_reclamacion_max (MANST, worst level
 --   among its open documents).
 --
--- DPP (average days to pay) and weighted DPP: NOT computed from bsid (open
--- items - we don't know how long they'll take to be paid) but from ALREADY
--- settled documents, as historical payment-behavior context laid over the
--- current balance snapshot. Two rolling windows (3 and 12 months back from
--- fecha_snapshot), each simple and amount-weighted (larger invoices carry
--- more weight in the average).
--- 2026-08-19: DPP and % on-time/late are computed from
--- gold.fact_pagos_compensados/gold.fact_facturas_compensadas (see
--- gold.load_fact_saldo_cartera Step 2) - migrated from
--- gold.fact_aplicacion_pagos, whose 3-tier matching logic (REBZG/
--- GRUPO_INAMBIGUO/no-match) turned out to have real over-attribution bugs
--- (a match candidate could "explain" invoices worth far more than it
--- actually covers - confirmed with real cases, e.g. a $137 document
--- attributed to $2.5M in invoices within a massive compensation group).
--- fact_pagos_compensados/fact_facturas_compensadas use a deliberately
--- simpler design: they only relate compensation groups with EXACTLY 1
--- candidate raw payment, with no match tiers or partial-application
--- splitting. It only covers real payments (not credit notes/returns/
--- adjustments/reversals, out of scope for this design) - that's why these
--- percentages deliberately will NOT add up to 100% of a customer's total
--- balance, they specifically cover the portion with an unambiguously
--- identified payment.
+-- DELIBERATELY LEFT BROAD SCOPE (2026-08-27): unlike gold.vw_cartera_abierta
+-- (which got 3 scope filters the same day - canal 10/20/40/60,
+-- tipo_cliente<>DIRECCION_ALTERNA, estatus_comercial<>FUERA_DE_ALCANCE),
+-- this fact keeps NO scope filter on purpose - it's the only object in the
+-- DWH that answers "how much does the WHOLE company owe, any channel/type",
+-- and since it's a periodic snapshot that CANNOT be backfilled, narrowing
+-- it in place would create a permanent discontinuity between already-
+-- accumulated broad-scope history and any future narrow-scope snapshots.
+-- If a wholesale/real-customer-only cartera number is needed, use
+-- gold.vw_cartera_abierta - it reconciles against neither this fact's
+-- saldo_total NOR PowerBI is expected to, by design (see that view's own
+-- header for the full reasoning).
+--
+-- DPP / % on-time-late REMOVED 2026-08-27 - decided NOT to rebuild as a SQL
+-- object at all. fecha_pago/dias_pago already live on gold.vw_pago_factura_simple
+-- with full history since 2022, so the user chose to compute the DPP TREND
+-- as a Power BI DAX time-intelligence measure directly over that view
+-- (AVERAGEX(DATESINPERIOD(...))) instead of a new SQL view/table - same
+-- pattern already used for credit utilization (DAX, not SQL, per DESIGN.md's
+-- 5th table-vs-view question: "will this only ever be consumed from Power
+-- BI?"). A gold.vw_comportamiento_pago_cliente view was drafted first
+-- (recomputes live, "today" only, no real trend) and retired same-day once
+-- this was raised - a live view can't show "what DPP looked like 3 months
+-- ago" without re-running it with historical data, only DAX time
+-- intelligence (or a future periodic-snapshot fact, if DAX ever proves too
+-- slow) actually solves that. Living inside this fact was a carry-over from
+-- when it migrated 2026-08-19 from the now-deleted gold.fact_aplicacion_pagos
+-- (whose 3-tier matching had real over-attribution bugs - a $137 document
+-- once "explained" $2.5M in invoices), not an architectural requirement.
 -- ==========================================================
 IF OBJECT_ID('gold.fact_saldo_cartera', 'U') IS NOT NULL
     DROP TABLE gold.fact_saldo_cartera;
@@ -419,19 +436,7 @@ CREATE TABLE gold.fact_saldo_cartera (
     documentos_con_reclamacion   INT NOT NULL,
     nivel_reclamacion_max        CHAR(1) NULL,
 
-    -- historical payment behavior (from gold.fact_pagos_compensados/
-    -- gold.fact_facturas_compensadas via gold.load_fact_saldo_cartera Step
-    -- 2 - see the note above the CREATE TABLE. History: this migrated
-    -- 2026-08-19 from gold.fact_aplicacion_pagos due to the
-    -- over-attribution bugs already documented above).
-    dpp_3m                       DECIMAL(9,2) NULL,
-    dpp_ponderado_3m             DECIMAL(9,2) NULL,
-    dpp_12m                      DECIMAL(9,2) NULL,
-    dpp_ponderado_12m            DECIMAL(9,2) NULL,
-    pct_pagos_a_tiempo_3m        DECIMAL(5,2) NULL,  -- % of the amount paid (PAGO) in the last 3m with dias_anticipacion_vencimiento <= 0
-    pct_pagos_tarde_3m           DECIMAL(5,2) NULL,
-    pct_pagos_a_tiempo_12m       DECIMAL(5,2) NULL,
-    pct_pagos_tarde_12m          DECIMAL(5,2) NULL,
+    -- DPP / % pagos a tiempo-tarde REMOVED 2026-08-27 - ahora medida DAX en Power BI sobre gold.vw_pago_factura_simple, ver nota arriba
 
     -- SCD2 surrogate keys, resolved via a temporal join to fecha_snapshot
     id_cliente_comercial         INT NULL,
@@ -568,4 +573,54 @@ CREATE INDEX IX_fact_facturas_compensadas_grupo ON gold.fact_facturas_compensada
 GO
 
 PRINT 'Table gold.fact_facturas_compensadas created successfully.';
+GO
+
+-- ==========================================================
+-- 8. DIMENSION: gold.dim_empleado (SCD Type 1 - conformed employee dimension)
+-- Added 2026-08-27, from the pending "Proposals in design" list in
+-- DESIGN.md. Source: silver.sap_pa0001 (current record only).
+-- PURPOSE: today, vendedor/gerente/analista_credito/cobrador each carry
+-- their own *_id/*_nombre column pair, duplicated as plain text across
+-- gold.dim_cliente_comercial (vendedor_id/nombre, gerente_id/nombre) and
+-- gold.dim_cliente_credito (analista_credito_id/nombre, cobrador_id/nombre)
+-- - the same employee can show up with the same name typed 4 separate
+-- times. dim_empleado is a Kimball "role-playing dimension": ONE table,
+-- joined multiple times (once per role, via Power BI relationships or a
+-- query alias) instead of the name being repeated as text. It does NOT
+-- replace the *_id columns already on dim_cliente_comercial/dim_cliente_credito
+-- - those stay as-is; this only adds a place to join "by person" reporting
+-- to (headcount-level attributes, one row per employee, not per assignment).
+-- SCD1, no version history (employee identity - just id/name - changes
+-- rarely enough that SCD2 isn't worth the complexity, same reasoning as
+-- gold.dim_cliente). Key is id_empleado directly (PERNR, no surrogate key -
+-- same business-key style as dim_cliente), so it matches
+-- dim_cliente_comercial.vendedor_id/gerente_id and
+-- dim_cliente_credito.analista_credito_id/cobrador_id with NO transformation
+-- (none of those are zero-stripped either, see silver.sap_knvp.id_interlocutor).
+-- NO FK constraints added from dim_cliente_comercial/dim_cliente_credito to
+-- this table (deliberate, not an oversight): SAP end-dates an infotype 0001
+-- row when someone leaves the company, so a *_id captured historically on
+-- an SCD2 row could point to a PERNR that no longer has a current
+-- (ENDDA='99991231') record in silver.sap_pa0001, and therefore never makes
+-- it into this table - enforcing an FK here could break existing loads over
+-- an ex-employee with no warning. Join by id_empleado at query time
+-- (Power BI relationship or view) instead, same as any other unenforced
+-- role-playing dimension.
+-- Load pattern: explicit UPDATE+INSERT (gold.load_dim_empleado), never
+-- TRUNCATE - same lesson as gold.dim_cliente (a TRUNCATE-based load becomes
+-- unusable the moment any table gains an incoming FK to this one).
+-- ==========================================================
+IF OBJECT_ID('gold.dim_empleado', 'U') IS NOT NULL
+    DROP TABLE gold.dim_empleado;
+GO
+
+CREATE TABLE gold.dim_empleado (
+    id_empleado             VARCHAR(8) NOT NULL,   -- PERNR, raw format
+    nombre                  VARCHAR(40),
+    fecha_actualizacion     DATETIME DEFAULT GETDATE(),
+    CONSTRAINT PK_dim_empleado PRIMARY KEY CLUSTERED (id_empleado)
+);
+GO
+
+PRINT 'Table gold.dim_empleado created successfully.';
 GO

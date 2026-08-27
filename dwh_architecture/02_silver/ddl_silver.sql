@@ -359,4 +359,44 @@ CREATE TABLE silver.sap_knb5 (
 -- KNRMA, GMVDT, BUSAB, MANSP -> 0% (or practically 0%, BUSAB 1 of 15,726)
 --   of rows have data.
 -- ==========================================================
+
+-- ==========================================================
+-- 9. EMPLOYEE MASTER (silver.sap_pa0001)
+-- Added 2026-08-27 as the source for gold.dim_empleado (conformed
+-- vendedor/gerente/analista_credito/cobrador dimension). Curated to the
+-- only 5 bronze.sap_pa0001 columns any consumer in this project has ever
+-- used (MANDT/PERNR/ENAME/BEGDA/ENDDA - see the "51-column full mirror"
+-- note on bronze.sap_pa0001 in ddl_bronze.sql) - unlike bronze's
+-- exact-mirror philosophy, silver curates to what's actually used, same as
+-- every other table in this file.
+-- FILTERED TO ENDDA = '99991231', same filter silver.sap_knvp already
+-- applies ad-hoc when resolving nombre_interlocutor. CONFIRMED 2026-08-27
+-- with real data: this filter is currently a NO-OP - 100% of
+-- bronze.sap_pa0001 rows (MANDT='400') have ENDDA='99991231', and 0 PERNR
+-- values have 2+ rows. This SAP extract simply doesn't delimit old
+-- infotype 0001 records when they're superseded (no real historical
+-- versioning captured here, despite BEGDA/ENDDA looking like a temporal
+-- range) - there's no field anywhere on this table that flags "is this the
+-- current record" (checked, doesn't exist). The filter is kept anyway as a
+-- forward-looking safety net: if this data source ever starts properly
+-- end-dating old records, the filter starts doing real work with zero code
+-- changes - and it's free today since it excludes nothing. If a future
+-- session finds 2+ rows for the same PERNR (this WOULD break the PK below
+-- and fail the load), don't reach for ENDDA - re-check with the same query
+-- used to confirm this note, then pick the latest by BEGDA
+-- (ROW_NUMBER() OVER (PARTITION BY MANDT, PERNR ORDER BY BEGDA DESC) = 1),
+-- same tiebreak pattern gold.vw_cliente_canal_estatus already uses for
+-- vendedor/ejecutivo/gerente.
+-- id_empleado (PERNR) is NOT zero-stripped, unlike cliente_id - kept in its
+-- raw SAP format to match silver.sap_knvp.id_interlocutor (also raw PERNR,
+-- see sp_load_silver.sql) so the two can join with no transformation.
+-- ==========================================================
+IF OBJECT_ID('silver.sap_pa0001', 'U') IS NOT NULL DROP TABLE silver.sap_pa0001;
+CREATE TABLE silver.sap_pa0001 (
+    mandante                VARCHAR(3)   NOT NULL,
+    id_empleado             VARCHAR(8)   NOT NULL,  -- PERNR, raw format (not zero-stripped)
+    nombre                  VARCHAR(40),             -- ENAME
+    fecha_carga             DATETIME DEFAULT GETDATE(),
+    CONSTRAINT PK_silver_sap_pa0001 PRIMARY KEY (mandante, id_empleado)
+);
 GO

@@ -553,5 +553,37 @@ BEGIN
         THROW;
     END CATCH;
 
+    -- ==========================================
+    -- 9. CLEANING: PA0001 (Employee Master)
+    -- ENDDA = '99991231' filter: confirmed 2026-08-27 to be a no-op on this
+    -- extract (100% of rows already have it, 0 duplicate PERNR) - kept as a
+    -- forward-looking safety net, not because it's actively filtering
+    -- anything today. See the full note in ddl_silver.sql before touching
+    -- this if a future load ever fails on the PK.
+    -- ==========================================
+    BEGIN TRY
+        SET @start_time = GETDATE();
+        PRINT '>> Loading and cleaning silver.sap_pa0001...';
+
+        TRUNCATE TABLE silver.sap_pa0001;
+
+        INSERT INTO silver.sap_pa0001 (mandante, id_empleado, nombre)
+        SELECT
+            LTRIM(RTRIM(MANDT)),        -- client (SAP mandante)
+            LTRIM(RTRIM(PERNR)),        -- employee id (raw PERNR, not zero-stripped - matches silver.sap_knvp.id_interlocutor)
+            NULLIF(LTRIM(RTRIM(ENAME)), '')  -- employee name
+        FROM bronze.sap_pa0001 WITH (NOLOCK)
+        WHERE MANDT = '400'
+          AND LTRIM(RTRIM(ENDDA)) = '99991231';
+        SET @rows_count = @@ROWCOUNT;
+
+        SET @end_time = GETDATE();
+        PRINT 'Rows: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
+    END TRY
+    BEGIN CATCH
+        PRINT 'ERROR in silver.sap_pa0001: ' + ERROR_MESSAGE();
+        THROW;
+    END CATCH;
+
 END;
 GO
