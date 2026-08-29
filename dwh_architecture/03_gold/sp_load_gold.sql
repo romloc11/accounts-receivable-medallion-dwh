@@ -150,8 +150,26 @@ BEGIN
             k.cliente_id,
             k.rfc,
             CASE
+                -- MARKETPLACE added 2026-08-27 - TOP priority (checked before FILIAL/SIN_RFC/GENERICO)
+                -- because these named accounts span every RFC bucket: Amazon has a real RFC (would
+                -- otherwise fall to PADRE), most Mercado Libre/Claro Shop variants have RFC='XAXX010101000'
+                -- (would otherwise fall to GENERICO), and the payment-gateway clearing accounts
+                -- (Mercado Libre/Mercado Pago/Kushky/Conekta "INGRESOS TRANSITORIA") have RFC NULL
+                -- (would otherwise fall to SIN_RFC). Identified by name, not RFC - confirmed against
+                -- real data 2026-08-27 (see dwh-ciosa-project-status.md in memory for the full account
+                -- list, 30 rows checked one by one before writing this). 'OPENPAY INGRESOS TRANSITORIA'
+                -- uses an EXACT match, not LIKE 'OPENPAY%' - a real customer, 'OPENPAY SAPI DE CV'
+                -- (RFC OPE130906HN4, unrelated to the payment gateway), would have been caught by a
+                -- broader pattern - confirmed by the user this must NOT be MARKETPLACE.
+                WHEN k.nombre = 'OPENPAY INGRESOS TRANSITORIA'
+                     OR k.nombre LIKE 'MERCADO LIBRE%' OR k.nombre LIKE 'MERCADO PAGO%'
+                     OR k.nombre LIKE '%AMAZON%' OR k.nombre LIKE 'CLAROSHOP%'
+                     OR k.nombre LIKE 'KUSHKY%' OR k.nombre LIKE 'CONEKTA%'
+                    THEN 'MARKETPLACE'
                 WHEN kk.etiqueta_credito = 'FILIAL' THEN 'FILIAL'
-                WHEN k.rfc IS NULL THEN 'DIRECCION_ALTERNA'
+                -- Renamed from 'DIRECCION_ALTERNA' to 'SIN_RFC' 2026-08-27, user's own naming
+                -- preference - same condition (RFC IS NULL), no logic change.
+                WHEN k.rfc IS NULL THEN 'SIN_RFC'
                 WHEN k.rfc IN ('XAXX010101000', 'XEXX010101000') THEN 'GENERICO'
                 ELSE 'PADRE'
             END AS tipo_cliente,  -- confirmed 2026-08-07: KRAUS='FILIAL' takes priority, then null/generic RFC

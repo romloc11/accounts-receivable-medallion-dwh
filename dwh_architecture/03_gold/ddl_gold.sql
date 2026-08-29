@@ -65,7 +65,8 @@ GO
 -- Key: cliente_id directly (no surrogate key - not needed for SCD1, and
 -- keeps consistency with the rest of the project, which uses business
 -- keys). mandante is NOT included (always '400', zero variation).
--- tipo_cliente = PADRE / FILIAL / DIRECCION_ALTERNA / GENERICO, full logic
+-- tipo_cliente = PADRE / FILIAL / SIN_RFC / GENERICO / MARKETPLACE (renamed
+-- from DIRECCION_ALTERNA, MARKETPLACE added, both 2026-08-27), full logic
 -- in gold.load_dim_cliente (sp_load_gold.sql).
 -- ==========================================================
 IF OBJECT_ID('gold.dim_cliente', 'U') IS NOT NULL

@@ -38,12 +38,16 @@ GO
 --     gold.vw_cliente_canal_estatus already flags as not real customers
 --     (wrong channel, or cliente_id prefix 5/6/7/9 - see that view's own
 --     header for the full catalog, prefix 9 added same day as this).
---   - tipo_cliente <> 'DIRECCION_ALTERNA' - customers with no RFC.
---     Confirmed 2026-08-27 by a business-process owner: these are not real
---     customers and should never be counted in cartera analysis (echoes
---     the same exclusion gold.vw_pago_factura_simple already had since
---     2026-08-19, now confirmed rather than just inferred from a 10-account
---     sample).
+--   - tipo_cliente <> 'SIN_RFC' (renamed from DIRECCION_ALTERNA 2026-08-27)
+--     - customers with no RFC. Confirmed 2026-08-27 by a business-process
+--     owner: these are not real customers and should never be counted in
+--     cartera analysis (echoes the same exclusion gold.vw_pago_factura_simple
+--     already had since 2026-08-19, now confirmed rather than just inferred
+--     from a 10-account sample). Named marketplace/payment-gateway accounts
+--     (Kushky, Conekta, Openpay's clearing account, Mercado Libre, Mercado
+--     Pago, Amazon, Claro Shop) are tipo_cliente='MARKETPLACE' instead, so
+--     they're no longer caught by this exclusion - their open invoices (if
+--     any) now show up here like any other in-scope customer.
 --
 -- DELIBERATE ARCHITECTURAL CHOICE - this view NO LONGER reconciles against
 -- gold.fact_saldo_cartera.saldo_total, and that's intentional, not a
@@ -147,7 +151,7 @@ LEFT JOIN gold.dim_cliente_credito dcr
     ON dcr.cliente_id = b.cliente_id
    AND h.fecha_hoy BETWEEN dcr.fecha_inicio_vigencia AND ISNULL(dcr.fecha_fin_vigencia, '99991231')
 WHERE b.clase_documento <> 'SA'
-  AND k.tipo_cliente <> 'DIRECCION_ALTERNA'
+  AND k.tipo_cliente <> 'SIN_RFC'
   AND dc.canal_distribucion IN ('10', '40', '60')
   AND dc.estatus_comercial <> 'FUERA_DE_ALCANCE';
 GO

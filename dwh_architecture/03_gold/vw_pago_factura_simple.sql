@@ -10,11 +10,19 @@
 -- out (the same "don't guess" principle already used throughout the
 -- project) instead of forcing an arbitrary match.
 --
--- DIRECCION_ALTERNA is excluded entirely (confirmed 2026-08-19: 9 of 10
--- accounts of that type within the in-scope channels are technical
--- reconciliation accounts: Kushky/Conekta-Oxxo/Openpay/Mercado Libre/Mercado
--- Pago "INGRESOS TRANSITORIA", SALDO A FAVOR CUENTAS, DEPOSITOS NO
--- IDENTIFICADOS, etc. - none of them represents a real customer).
+-- SIN_RFC (renamed from DIRECCION_ALTERNA 2026-08-27) is excluded entirely
+-- (confirmed 2026-08-19: 9 of 10 accounts of that type within the in-scope
+-- channels were technical reconciliation accounts, and confirmed again
+-- 2026-08-27 by a business-process owner as a general rule: customers with
+-- no RFC are not real customers for cartera purposes). MARKETPLACE added
+-- 2026-08-27 as its own tipo_cliente, carved out BEFORE this exclusion -
+-- named payment-gateway/marketplace clearing accounts (Kushky, Conekta,
+-- Openpay's "INGRESOS TRANSITORIA" account specifically, Mercado Libre,
+-- Mercado Pago, Amazon, Claro Shop) used to be caught by this exclusion
+-- (most have RFC NULL) but are now deliberately let through, tagged
+-- MARKETPLACE in clasificacion_cobranza instead of excluded - see
+-- gold.dim_cliente's tipo_cliente CASE (sp_load_gold.sql) for the exact
+-- name-pattern identification.
 --
 -- GENERICO (RFC XAXX010101000/XEXX010101000) IS included - business
 -- decision 2026-08-20: the business process owner was shown the full list
@@ -158,6 +166,16 @@ SELECT
     -- through to PAGO_ANTICIPADO by SQL default - don't assume that's still
     -- safe if this business rule ever changes.
     CASE
+        -- MARKETPLACE/Contado added 2026-08-27, checked by the PAYER's
+        -- tipo_cliente (k, not kf) - same "group by who paid" convention
+        -- already established 2026-08-26 for cliente_id itself. These
+        -- customers never really have a "vencimiento"-driven payment
+        -- pattern (marketplace settlement batches, or generic cash-type
+        -- accounts), so they're pulled out before the date-based CASE runs
+        -- at all, instead of trying to force them into VENCIDA/DEL_MES/
+        -- ANTICIPADO.
+        WHEN k.tipo_cliente = 'MARKETPLACE' THEN 'MARKETPLACE'
+        WHEN k.tipo_cliente = 'GENERICO' THEN 'CONTADO'
         WHEN f.fecha_vencimiento < DATEFROMPARTS(YEAR(p.fecha_documento), MONTH(p.fecha_documento), 1) THEN 'CARTERA_VENCIDA'
         WHEN f.fecha_vencimiento <= EOMONTH(p.fecha_documento) THEN 'CARTERA_DEL_MES'
         ELSE 'PAGO_ANTICIPADO'
@@ -185,6 +203,6 @@ INNER JOIN gold.dim_cliente kf
     ON kf.cliente_id = f.cliente_id
 WHERE dc.canal_distribucion IN ('10', '40', '60')  -- '20' (menudeo) agregado y luego REVERTIDO 2026-08-27, mismo día: este DWH es explícitamente para mayoreo - canal 20 SÍ son clientes reales (por eso NO se tocó FUERA_DE_ALCANCE en vw_cliente_canal_estatus), simplemente están fuera de la misión de este reporte. Revertir esto también evitó tener que investigar CP (Cobranza POS) - ver dwh-ciosa-project-status.md en memoria para el hallazgo completo de por qué canal 20 casi no tiene DZ.
   AND dc.estatus_comercial <> 'FUERA_DE_ALCANCE'
-  AND k.tipo_cliente <> 'DIRECCION_ALTERNA'  -- confirmado 2026-08-27 por un usuario clave del negocio: clientes sin RFC no son clientes reales, no deben entrar en análisis de cartera
-  AND kf.tipo_cliente <> 'DIRECCION_ALTERNA';
+  AND k.tipo_cliente <> 'SIN_RFC'  -- confirmado 2026-08-27 por un usuario clave del negocio: clientes sin RFC no son clientes reales, no deben entrar en análisis de cartera. Renombrado de DIRECCION_ALTERNA a SIN_RFC el mismo día (misma condición, solo cambia el nombre) - y las cuentas de marketplace/pasarela de pago que antes caían aquí (RFC nulo) ahora son tipo_cliente='MARKETPLACE' en vez de 'SIN_RFC', así que dejan de excluirse por esta condición.
+  AND kf.tipo_cliente <> 'SIN_RFC';
 GO
