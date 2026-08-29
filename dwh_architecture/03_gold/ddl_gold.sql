@@ -472,8 +472,15 @@ GO
 -- ==========================================================
 -- 6. FACT: gold.fact_pagos_compensados
 -- Grain: 1 row = 1 "raw" deposit (silver.sap_bsad, clase_documento='DZ'
--- AND sgtxt='Asignación Aut. Deposito' AND debe_haber<>'S' AND
--- monto_moneda_local>0) - a customer payment not yet allocated to invoices.
+-- AND (sgtxt='Asignación Aut. Deposito' OR sgtxt LIKE 'BB%') AND
+-- debe_haber<>'S' AND monto_moneda_local>0) - a customer payment not yet
+-- allocated to invoices. The sgtxt condition went through 3 iterations
+-- on 2026-08-29 (exact match -> IS NOT NULL -> this conservative pair) -
+-- see gold.load_fact_pagos_compensados in sp_load_gold.sql and
+-- dwh-ciosa-project-status.md in memory for the full investigation;
+-- deliberately excludes CHEQUE DEVUELTO (bounced checks) and several
+-- other unreviewed text patterns until someone confirms their business
+-- legitimacy as real cobranza.
 -- Filtered mirror, with no matching logic (unlike fact_aplicacion_pagos) -
 -- the payment<->invoice relationship lives in gold.vw_pago_factura_simple
 -- (a query, not a table), which only relates compensation groups with

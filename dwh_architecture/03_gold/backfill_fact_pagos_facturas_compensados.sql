@@ -60,7 +60,7 @@ SELECT
     documento_compensacion, ejercicio_compensacion
 FROM silver.sap_bsad
 WHERE clase_documento = 'DZ'
-  AND sgtxt = 'Asignación Aut. Deposito'
+  AND (sgtxt = 'Asignación Aut. Deposito' OR sgtxt LIKE 'BB%') -- updated 2026-08-29, see sp_load_gold.sql / dwh-ciosa-project-status.md in memory
   AND debe_haber <> 'S'
   AND monto_moneda_local > 0
   AND fecha_compensacion >= '20220101' AND fecha_compensacion < '20230101';
@@ -103,7 +103,7 @@ SELECT
     documento_compensacion, ejercicio_compensacion
 FROM silver.sap_bsad
 WHERE clase_documento = 'DZ'
-  AND sgtxt = 'Asignación Aut. Deposito'
+  AND (sgtxt = 'Asignación Aut. Deposito' OR sgtxt LIKE 'BB%') -- updated 2026-08-29, see sp_load_gold.sql / dwh-ciosa-project-status.md in memory
   AND debe_haber <> 'S'
   AND monto_moneda_local > 0
   AND fecha_compensacion >= '20230101' AND fecha_compensacion < '20240101';
@@ -146,7 +146,7 @@ SELECT
     documento_compensacion, ejercicio_compensacion
 FROM silver.sap_bsad
 WHERE clase_documento = 'DZ'
-  AND sgtxt = 'Asignación Aut. Deposito'
+  AND (sgtxt = 'Asignación Aut. Deposito' OR sgtxt LIKE 'BB%') -- updated 2026-08-29, see sp_load_gold.sql / dwh-ciosa-project-status.md in memory
   AND debe_haber <> 'S'
   AND monto_moneda_local > 0
   AND fecha_compensacion >= '20240101' AND fecha_compensacion < '20250101';
@@ -189,7 +189,7 @@ SELECT
     documento_compensacion, ejercicio_compensacion
 FROM silver.sap_bsad
 WHERE clase_documento = 'DZ'
-  AND sgtxt = 'Asignación Aut. Deposito'
+  AND (sgtxt = 'Asignación Aut. Deposito' OR sgtxt LIKE 'BB%') -- updated 2026-08-29, see sp_load_gold.sql / dwh-ciosa-project-status.md in memory
   AND debe_haber <> 'S'
   AND monto_moneda_local > 0
   AND fecha_compensacion >= '20250101' AND fecha_compensacion < '20260101';
@@ -236,7 +236,7 @@ SELECT
     documento_compensacion, ejercicio_compensacion
 FROM silver.sap_bsad
 WHERE clase_documento = 'DZ'
-  AND sgtxt = 'Asignación Aut. Deposito'
+  AND (sgtxt = 'Asignación Aut. Deposito' OR sgtxt LIKE 'BB%') -- updated 2026-08-29, see sp_load_gold.sql / dwh-ciosa-project-status.md in memory
   AND debe_haber <> 'S'
   AND monto_moneda_local > 0
   AND fecha_compensacion >= '20260101' AND fecha_compensacion < @limite_date;
@@ -269,7 +269,7 @@ GO
 DECLARE @limite_final DATE = DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()) - 1, 0);
 
 SELECT
-    (SELECT COUNT(*) FROM silver.sap_bsad WHERE clase_documento = 'DZ' AND sgtxt = 'Asignación Aut. Deposito' AND debe_haber <> 'S' AND monto_moneda_local > 0 AND fecha_compensacion < @limite_final) AS pagos_silver_antes_del_limite,
+    (SELECT COUNT(*) FROM silver.sap_bsad WHERE clase_documento = 'DZ' AND (sgtxt = 'Asignación Aut. Deposito' OR sgtxt LIKE 'BB%') AND debe_haber <> 'S' AND monto_moneda_local > 0 AND fecha_compensacion < @limite_final) AS pagos_silver_antes_del_limite,
     (SELECT COUNT(*) FROM gold.fact_pagos_compensados WHERE fecha_compensacion < @limite_final) AS pagos_gold_antes_del_limite,
     (SELECT COUNT(*) FROM silver.sap_bsad WHERE clase_documento IN ('F1','F2','F3','F4','F5','F6') AND fecha_compensacion < @limite_final) AS facturas_silver_antes_del_limite,
     (SELECT COUNT(*) FROM gold.fact_facturas_compensadas WHERE fecha_compensacion < @limite_final) AS facturas_gold_antes_del_limite;

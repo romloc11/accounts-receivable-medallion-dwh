@@ -625,16 +625,25 @@ BEGIN
                 documento_compensacion, ejercicio_compensacion
             FROM silver.sap_bsad
             WHERE clase_documento = 'DZ'
-              -- sgtxt IS NOT NULL (not sgtxt = 'Asignación Aut. Deposito') - fix 2026-08-29,
-              -- see dwh-ciosa-project-status.md in memory for the full investigation. The exact-text
-              -- match was too strict: real July data showed 99.3% of DZ rows carry SOME line-item
-              -- text (not always that literal phrase), and the rows that genuinely have no text at
-              -- all are exactly the self-referencing/mirror/reallocation placeholder lines that
-              -- shouldn't be counted as separate cash anyway (confirmed against real SAP documents,
-              -- including a large multi-invoice payment that would have been double-counted by an
-              -- earlier, more complex fix attempt that tried to specifically detect and re-admit
-              -- those reallocation lines - IS NOT NULL alone already excludes them correctly).
-              AND sgtxt IS NOT NULL
+              -- sgtxt = 'Asignación Aut. Deposito' OR sgtxt LIKE 'BB%' (not a bare sgtxt IS NOT NULL) -
+              -- fix 2026-08-29, refined same day, see dwh-ciosa-project-status.md in memory for the
+              -- full investigation. Went through 2 iterations the same day:
+              --   1. sgtxt = 'Asignación Aut. Deposito' (original) was too strict - excluded real
+              --      payments whose SAP text varies (e.g. a large payment reallocated across several
+              --      invoices, each losing that exact phrase).
+              --   2. sgtxt IS NOT NULL (tried next) turned out too loose in the other direction -
+              --      it let through 'CHEQUE DEVUELTO' (a BOUNCED check - not real collected cash)
+              --      and a long tail of other one-off reference texts (SPEI, DEPOSITO DE TERCERO,
+              --      PAGO FACTURAS, etc.) whose business legitimacy as "real cobranza" hasn't been
+              --      confirmed with someone who owns these rules.
+              -- CURRENT (deliberately conservative): only 'Asignación Aut. Deposito' (the confirmed-
+              -- safe original pattern) and 'BB%' (bank reference codes, confirmed safe by the user) -
+              -- covers 98.6% of July's non-null-sgtxt population ($166.5M of $168.85M) at essentially
+              -- no cost, while excluding CHEQUE DEVUELTO and every unreviewed pattern until someone
+              -- with more business-rule knowledge confirms which of them are genuinely collected cash.
+              -- Known to UNDER-count vs. sgtxt IS NOT NULL by design - do not "fix" this by widening
+              -- the pattern again without that confirmation.
+              AND (sgtxt = 'Asignación Aut. Deposito' OR sgtxt LIKE 'BB%')
               AND debe_haber <> 'S' -- excludes the "child" document's mirror/offsetting line (fix 2026-08-19, see ddl_gold.sql)
               AND monto_moneda_local > 0 -- excludes $0.00 technical residuals (fix 2026-08-19, see ddl_gold.sql)
               AND fecha_compensacion >= @mes_anterior_inicio

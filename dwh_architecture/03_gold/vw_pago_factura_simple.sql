@@ -146,11 +146,22 @@ grupo_rfc_unico AS (
     -- dim_cliente. Confirmado con datos reales 2026-08-26 (0 huerfanos) y
     -- con la regla de negocio del usuario. No cambiar a LEFT JOIN sin
     -- evidencia de que esta politica cambio.
+    --
+    -- ISNULL(k.rfc, 'SIN_RFC_'+k.cliente_id) agregado 2026-08-29: COUNT(DISTINCT k.rfc)
+    -- ignora los NULL, asi que un grupo compuesto solo por un cliente MARKETPLACE
+    -- (RFC NULL por diseno - Kushky, etc.) daba COUNT(DISTINCT rfc)=0, no 1, y la
+    -- condicion HAVING =1 fallaba - excluyendo pagos reales de marketplace que se
+    -- compensan solos, sin ninguna ambiguedad real. Confirmado con datos reales:
+    -- $1,338,328.31 recuperados en julio (9 pagos), $0 perdido de lo que ya estaba
+    -- bien (validado antes de implementar). El fallback por cliente_id preserva el
+    -- proposito original de la regla: sigue excluyendo grupos que mezclan 2+
+    -- identidades reales distintas, solo deja de tratar "un mismo cliente sin RFC"
+    -- como si fueran 0 identidades. Ver dwh-ciosa-project-status.md en memoria.
     SELECT b.documento_compensacion, b.ejercicio_compensacion
     FROM silver.sap_bsad b
     INNER JOIN gold.dim_cliente k ON k.cliente_id = b.cliente_id
     GROUP BY b.documento_compensacion, b.ejercicio_compensacion
-    HAVING COUNT(DISTINCT k.rfc) = 1
+    HAVING COUNT(DISTINCT ISNULL(k.rfc, 'SIN_RFC_' + k.cliente_id)) = 1
 ),
 facturas_por_grupo AS (
     SELECT documento_compensacion, ejercicio_compensacion, SUM(monto_moneda_local) AS suma_facturas_grupo
