@@ -135,6 +135,41 @@
 -- p.monto*f.monto/suma_facturas_grupo simplifies to p.monto - each payment
 -- counts in full, nothing double-counted or dropped.
 --
+-- LOTE_CONCILIACION added 2026-08-29 (same day, later session): the AMBIGUITY
+-- GATE note above still left 4 real July groups excluded even after allowing
+-- single-invoice groups through - all 4 are genuine many-to-many batches
+-- (2-3 payment candidates against 5-13 invoices each, spanning several
+-- months). Found from a second real SAP screenshot (customer 10002440,
+-- group 8501588763: 2 deposits totaling $25,099.70 against 5 invoices
+-- totaling $25,446.69, balanced by an AB adjustment line). Checked whether
+-- any deposit amount subset-sums to a specific invoice or invoice subset -
+-- no clean match in any of the 4 groups, so per-invoice attribution here
+-- would be exactly the kind of guess that got the original
+-- fact_aplicacion_pagos deleted 2026-08-19 (a $137 document once appeared to
+-- "explain" $2.5M of invoices in a similarly large group).
+--
+-- The real, validated signal: all 4 groups carry a document with
+-- clase_documento='AB' (SAP's manual adjustment/reclassification type) as
+-- their own self-referencing document - confirmed against ALL of July's
+-- data, 100% correlation (the 23 groups resolved by the single-invoice rule
+-- above have ZERO AB documents; these 4 have exactly one each). AB presence
+-- is SAP's own signal that this compensation was manually reconciled as a
+-- batch, not automatically matched - structurally different from every
+-- other pattern this project has resolved so far.
+--
+-- Resolution: these groups are now INCLUDED (previously excluded entirely),
+-- one row per payment (not fanned out per invoice - the invoice join is
+-- suppressed specifically for these groups, see the JOIN condition below),
+-- tagged 'LOTE_CONCILIACION' in clasificacion_cobranza with NO factura
+-- columns populated (documento_factura/fecha_factura/fecha_vencimiento/
+-- monto_factura/dias_pago all NULL - same treatment as SIN_FACTURA_
+-- IDENTIFICADA, since there genuinely isn't one specific invoice to report
+-- per payment). monto_pago_asignado falls back to the full payment amount
+-- (same CASE branch already used for the no-invoice-at-all case) - the cash
+-- now counts in any measure that sums monto_pago_asignado, without
+-- pretending to know which invoice(s) each specific deposit covered.
+-- Validated before implementing: recovers $166,221.23 across the 4 groups.
+--
 -- INNER JOIN -> LEFT JOIN on gold.fact_facturas_compensadas, 2026-08-29:
 -- a payment with no matching invoice in its compensation group ("pago a
 -- cuenta", confirmed with real July data: 1,411 of 1,426 such cases have
@@ -229,6 +264,13 @@ SELECT
         -- all - see dwh-ciosa-project-status.md in memory).
         WHEN k.tipo_cliente = 'MARKETPLACE' THEN 'MARKETPLACE'
         WHEN k.tipo_cliente = 'GENERICO' THEN 'CONTADO'
+        -- LOTE_CONCILIACION added 2026-08-29 - see the "LOTE_CONCILIACION
+        -- added" note above. Checked before SIN_FACTURA_IDENTIFICADA:
+        -- f.documento_id is also NULL for these rows (the invoice JOIN below
+        -- is deliberately suppressed for this exact condition), but the
+        -- reason is different - there ARE invoices in the group, just too
+        -- many to attribute safely, not zero.
+        WHEN g.num_pagos_candidatos > 1 AND ISNULL(fpg.num_facturas_candidatas, 0) > 1 THEN 'LOTE_CONCILIACION'
         -- Added 2026-08-29 alongside the INNER->LEFT JOIN change on
         -- gold.fact_facturas_compensadas: a real payment with no invoice
         -- in its compensation group ("pago a cuenta") is documented here
@@ -245,12 +287,19 @@ INNER JOIN pagos_por_grupo g
 INNER JOIN grupo_rfc_unico gr
     ON gr.documento_compensacion = p.documento_compensacion
    AND gr.ejercicio_compensacion = p.ejercicio_compensacion
-LEFT JOIN gold.fact_facturas_compensadas f
-    ON f.documento_compensacion = p.documento_compensacion
-   AND f.ejercicio_compensacion = p.ejercicio_compensacion
 LEFT JOIN facturas_por_grupo fpg
     ON fpg.documento_compensacion = p.documento_compensacion
    AND fpg.ejercicio_compensacion = p.ejercicio_compensacion
+LEFT JOIN gold.fact_facturas_compensadas f
+    ON f.documento_compensacion = p.documento_compensacion
+   AND f.ejercicio_compensacion = p.ejercicio_compensacion
+   -- Suppressed for LOTE_CONCILIACION groups (see note above): forces
+   -- f.* to NULL for these rows, which also means the LEFT JOIN produces
+   -- exactly 1 row per payment here instead of fanning out per invoice.
+   -- fpg (joined above, so it's already in scope here) still reflects the
+   -- real invoice count for the clasificacion_cobranza CASE even though
+   -- this join doesn't surface the invoice rows themselves.
+   AND NOT (g.num_pagos_candidatos > 1 AND ISNULL(fpg.num_facturas_candidatas, 0) > 1)
 INNER JOIN gold.dim_cliente_comercial dc
     ON dc.cliente_id = p.cliente_id
    AND p.fecha_documento BETWEEN dc.fecha_inicio_vigencia AND ISNULL(dc.fecha_fin_vigencia, '99991231')
@@ -261,6 +310,5 @@ LEFT JOIN gold.dim_cliente kf
 WHERE dc.canal_distribucion IN ('10', '40', '60')  -- '20' (menudeo) agregado y luego REVERTIDO 2026-08-27, mismo día: este DWH es explícitamente para mayoreo - canal 20 SÍ son clientes reales (por eso NO se tocó FUERA_DE_ALCANCE en vw_cliente_canal_estatus), simplemente están fuera de la misión de este reporte. Revertir esto también evitó tener que investigar CP (Cobranza POS) - ver dwh-ciosa-project-status.md en memoria para el hallazgo completo de por qué canal 20 casi no tiene DZ.
   AND dc.estatus_comercial <> 'FUERA_DE_ALCANCE'
   AND k.tipo_cliente <> 'SIN_RFC'  -- confirmado 2026-08-27 por un usuario clave del negocio: clientes sin RFC no son clientes reales, no deben entrar en análisis de cartera. Renombrado de DIRECCION_ALTERNA a SIN_RFC el mismo día (misma condición, solo cambia el nombre) - y las cuentas de marketplace/pasarela de pago que antes caían aquí (RFC nulo) ahora son tipo_cliente='MARKETPLACE' en vez de 'SIN_RFC', así que dejan de excluirse por esta condición.
-  AND (kf.tipo_cliente IS NULL OR kf.tipo_cliente <> 'SIN_RFC')  -- kf.tipo_cliente es NULL cuando no hay factura (LEFT JOIN, 2026-08-29) - no debe excluir el pago por eso
-  AND NOT (g.num_pagos_candidatos > 1 AND ISNULL(fpg.num_facturas_candidatas, 0) > 1);  -- ambigüedad real solo cuando AMBOS lados tienen 2+ candidatos - ver nota "AMBIGUITY GATE REDEFINED" arriba
+  AND (kf.tipo_cliente IS NULL OR kf.tipo_cliente <> 'SIN_RFC');  -- kf.tipo_cliente es NULL cuando no hay factura (LEFT JOIN, 2026-08-29) - no debe excluir el pago por eso. Nota: ya NO hay exclusion por ambiguedad aqui - los grupos many-to-many (2+ pagos Y 2+ facturas) ahora se incluyen, etiquetados LOTE_CONCILIACION (ver nota arriba) en vez de excluirse por completo.
 GO
