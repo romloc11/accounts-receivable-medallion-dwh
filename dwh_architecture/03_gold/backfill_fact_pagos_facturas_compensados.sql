@@ -51,19 +51,30 @@ WHERE fecha_compensacion >= '20220101' AND fecha_compensacion < '20230101';
 
 INSERT INTO gold.fact_pagos_compensados (
     sociedad, cliente_id, ejercicio, documento_id, posicion,
-    fecha_documento, fecha_compensacion, monto_moneda_local,
+    fecha_documento, fecha_contabilizacion, fecha_compensacion, monto_moneda_local,
     documento_compensacion, ejercicio_compensacion
 )
 SELECT
     sociedad, cliente_id, ejercicio, documento_id, posicion,
-    fecha_documento, fecha_compensacion, monto_moneda_local,
+    fecha_documento, fecha_contabilizacion, fecha_compensacion, monto_moneda_local,
     documento_compensacion, ejercicio_compensacion
-FROM silver.sap_bsad
-WHERE clase_documento = 'DZ'
-  AND (sgtxt = 'Asignación Aut. Deposito' OR sgtxt LIKE 'BB%') -- updated 2026-08-29, see sp_load_gold.sql / dwh-ciosa-project-status.md in memory
-  AND debe_haber <> 'S'
-  AND monto_moneda_local > 0
-  AND fecha_compensacion >= '20220101' AND fecha_compensacion < '20230101';
+FROM silver.sap_bsad b
+WHERE b.clase_documento = 'DZ'
+  AND (b.sgtxt = 'Asignación Aut. Deposito' OR b.sgtxt LIKE 'BB%') -- updated 2026-08-29, see sp_load_gold.sql / dwh-ciosa-project-status.md in memory
+  AND b.debe_haber <> 'S'
+  AND b.monto_moneda_local > 0
+  AND NOT ( -- self-canceling internal pair excluded, fix 2026-08-29, see sp_load_gold.sql
+      b.documento_compensacion = b.documento_id
+      AND EXISTS (
+          SELECT 1 FROM silver.sap_bsad b2
+          WHERE b2.sociedad = b.sociedad AND b2.cliente_id = b.cliente_id
+            AND b2.ejercicio = b.ejercicio AND b2.documento_id = b.documento_id
+            AND b2.posicion <> b.posicion
+            AND b2.clase_documento = 'DZ' AND b2.debe_haber = 'S'
+            AND b2.monto_moneda_local = b.monto_moneda_local
+      )
+  )
+  AND b.fecha_compensacion >= '20220101' AND fecha_compensacion < '20230101';
 
 PRINT 'fact_pagos_compensados - rows inserted 2022: ' + CAST(@@ROWCOUNT AS VARCHAR);
 
@@ -94,19 +105,30 @@ WHERE fecha_compensacion >= '20230101' AND fecha_compensacion < '20240101';
 
 INSERT INTO gold.fact_pagos_compensados (
     sociedad, cliente_id, ejercicio, documento_id, posicion,
-    fecha_documento, fecha_compensacion, monto_moneda_local,
+    fecha_documento, fecha_contabilizacion, fecha_compensacion, monto_moneda_local,
     documento_compensacion, ejercicio_compensacion
 )
 SELECT
     sociedad, cliente_id, ejercicio, documento_id, posicion,
-    fecha_documento, fecha_compensacion, monto_moneda_local,
+    fecha_documento, fecha_contabilizacion, fecha_compensacion, monto_moneda_local,
     documento_compensacion, ejercicio_compensacion
-FROM silver.sap_bsad
-WHERE clase_documento = 'DZ'
-  AND (sgtxt = 'Asignación Aut. Deposito' OR sgtxt LIKE 'BB%') -- updated 2026-08-29, see sp_load_gold.sql / dwh-ciosa-project-status.md in memory
-  AND debe_haber <> 'S'
-  AND monto_moneda_local > 0
-  AND fecha_compensacion >= '20230101' AND fecha_compensacion < '20240101';
+FROM silver.sap_bsad b
+WHERE b.clase_documento = 'DZ'
+  AND (b.sgtxt = 'Asignación Aut. Deposito' OR b.sgtxt LIKE 'BB%') -- updated 2026-08-29, see sp_load_gold.sql / dwh-ciosa-project-status.md in memory
+  AND b.debe_haber <> 'S'
+  AND b.monto_moneda_local > 0
+  AND NOT ( -- self-canceling internal pair excluded, fix 2026-08-29, see sp_load_gold.sql
+      b.documento_compensacion = b.documento_id
+      AND EXISTS (
+          SELECT 1 FROM silver.sap_bsad b2
+          WHERE b2.sociedad = b.sociedad AND b2.cliente_id = b.cliente_id
+            AND b2.ejercicio = b.ejercicio AND b2.documento_id = b.documento_id
+            AND b2.posicion <> b.posicion
+            AND b2.clase_documento = 'DZ' AND b2.debe_haber = 'S'
+            AND b2.monto_moneda_local = b.monto_moneda_local
+      )
+  )
+  AND b.fecha_compensacion >= '20230101' AND fecha_compensacion < '20240101';
 
 PRINT 'fact_pagos_compensados - rows inserted 2023: ' + CAST(@@ROWCOUNT AS VARCHAR);
 
@@ -137,19 +159,30 @@ WHERE fecha_compensacion >= '20240101' AND fecha_compensacion < '20250101';
 
 INSERT INTO gold.fact_pagos_compensados (
     sociedad, cliente_id, ejercicio, documento_id, posicion,
-    fecha_documento, fecha_compensacion, monto_moneda_local,
+    fecha_documento, fecha_contabilizacion, fecha_compensacion, monto_moneda_local,
     documento_compensacion, ejercicio_compensacion
 )
 SELECT
     sociedad, cliente_id, ejercicio, documento_id, posicion,
-    fecha_documento, fecha_compensacion, monto_moneda_local,
+    fecha_documento, fecha_contabilizacion, fecha_compensacion, monto_moneda_local,
     documento_compensacion, ejercicio_compensacion
-FROM silver.sap_bsad
-WHERE clase_documento = 'DZ'
-  AND (sgtxt = 'Asignación Aut. Deposito' OR sgtxt LIKE 'BB%') -- updated 2026-08-29, see sp_load_gold.sql / dwh-ciosa-project-status.md in memory
-  AND debe_haber <> 'S'
-  AND monto_moneda_local > 0
-  AND fecha_compensacion >= '20240101' AND fecha_compensacion < '20250101';
+FROM silver.sap_bsad b
+WHERE b.clase_documento = 'DZ'
+  AND (b.sgtxt = 'Asignación Aut. Deposito' OR b.sgtxt LIKE 'BB%') -- updated 2026-08-29, see sp_load_gold.sql / dwh-ciosa-project-status.md in memory
+  AND b.debe_haber <> 'S'
+  AND b.monto_moneda_local > 0
+  AND NOT ( -- self-canceling internal pair excluded, fix 2026-08-29, see sp_load_gold.sql
+      b.documento_compensacion = b.documento_id
+      AND EXISTS (
+          SELECT 1 FROM silver.sap_bsad b2
+          WHERE b2.sociedad = b.sociedad AND b2.cliente_id = b.cliente_id
+            AND b2.ejercicio = b.ejercicio AND b2.documento_id = b.documento_id
+            AND b2.posicion <> b.posicion
+            AND b2.clase_documento = 'DZ' AND b2.debe_haber = 'S'
+            AND b2.monto_moneda_local = b.monto_moneda_local
+      )
+  )
+  AND b.fecha_compensacion >= '20240101' AND fecha_compensacion < '20250101';
 
 PRINT 'fact_pagos_compensados - rows inserted 2024: ' + CAST(@@ROWCOUNT AS VARCHAR);
 
@@ -180,19 +213,30 @@ WHERE fecha_compensacion >= '20250101' AND fecha_compensacion < '20260101';
 
 INSERT INTO gold.fact_pagos_compensados (
     sociedad, cliente_id, ejercicio, documento_id, posicion,
-    fecha_documento, fecha_compensacion, monto_moneda_local,
+    fecha_documento, fecha_contabilizacion, fecha_compensacion, monto_moneda_local,
     documento_compensacion, ejercicio_compensacion
 )
 SELECT
     sociedad, cliente_id, ejercicio, documento_id, posicion,
-    fecha_documento, fecha_compensacion, monto_moneda_local,
+    fecha_documento, fecha_contabilizacion, fecha_compensacion, monto_moneda_local,
     documento_compensacion, ejercicio_compensacion
-FROM silver.sap_bsad
-WHERE clase_documento = 'DZ'
-  AND (sgtxt = 'Asignación Aut. Deposito' OR sgtxt LIKE 'BB%') -- updated 2026-08-29, see sp_load_gold.sql / dwh-ciosa-project-status.md in memory
-  AND debe_haber <> 'S'
-  AND monto_moneda_local > 0
-  AND fecha_compensacion >= '20250101' AND fecha_compensacion < '20260101';
+FROM silver.sap_bsad b
+WHERE b.clase_documento = 'DZ'
+  AND (b.sgtxt = 'Asignación Aut. Deposito' OR b.sgtxt LIKE 'BB%') -- updated 2026-08-29, see sp_load_gold.sql / dwh-ciosa-project-status.md in memory
+  AND b.debe_haber <> 'S'
+  AND b.monto_moneda_local > 0
+  AND NOT ( -- self-canceling internal pair excluded, fix 2026-08-29, see sp_load_gold.sql
+      b.documento_compensacion = b.documento_id
+      AND EXISTS (
+          SELECT 1 FROM silver.sap_bsad b2
+          WHERE b2.sociedad = b.sociedad AND b2.cliente_id = b.cliente_id
+            AND b2.ejercicio = b.ejercicio AND b2.documento_id = b.documento_id
+            AND b2.posicion <> b.posicion
+            AND b2.clase_documento = 'DZ' AND b2.debe_haber = 'S'
+            AND b2.monto_moneda_local = b.monto_moneda_local
+      )
+  )
+  AND b.fecha_compensacion >= '20250101' AND fecha_compensacion < '20260101';
 
 PRINT 'fact_pagos_compensados - rows inserted 2025: ' + CAST(@@ROWCOUNT AS VARCHAR);
 
@@ -227,19 +271,30 @@ WHERE fecha_compensacion >= '20260101' AND fecha_compensacion < @limite_date;
 
 INSERT INTO gold.fact_pagos_compensados (
     sociedad, cliente_id, ejercicio, documento_id, posicion,
-    fecha_documento, fecha_compensacion, monto_moneda_local,
+    fecha_documento, fecha_contabilizacion, fecha_compensacion, monto_moneda_local,
     documento_compensacion, ejercicio_compensacion
 )
 SELECT
     sociedad, cliente_id, ejercicio, documento_id, posicion,
-    fecha_documento, fecha_compensacion, monto_moneda_local,
+    fecha_documento, fecha_contabilizacion, fecha_compensacion, monto_moneda_local,
     documento_compensacion, ejercicio_compensacion
-FROM silver.sap_bsad
-WHERE clase_documento = 'DZ'
-  AND (sgtxt = 'Asignación Aut. Deposito' OR sgtxt LIKE 'BB%') -- updated 2026-08-29, see sp_load_gold.sql / dwh-ciosa-project-status.md in memory
-  AND debe_haber <> 'S'
-  AND monto_moneda_local > 0
-  AND fecha_compensacion >= '20260101' AND fecha_compensacion < @limite_date;
+FROM silver.sap_bsad b
+WHERE b.clase_documento = 'DZ'
+  AND (b.sgtxt = 'Asignación Aut. Deposito' OR b.sgtxt LIKE 'BB%') -- updated 2026-08-29, see sp_load_gold.sql / dwh-ciosa-project-status.md in memory
+  AND b.debe_haber <> 'S'
+  AND b.monto_moneda_local > 0
+  AND NOT ( -- self-canceling internal pair excluded, fix 2026-08-29, see sp_load_gold.sql
+      b.documento_compensacion = b.documento_id
+      AND EXISTS (
+          SELECT 1 FROM silver.sap_bsad b2
+          WHERE b2.sociedad = b.sociedad AND b2.cliente_id = b.cliente_id
+            AND b2.ejercicio = b.ejercicio AND b2.documento_id = b.documento_id
+            AND b2.posicion <> b.posicion
+            AND b2.clase_documento = 'DZ' AND b2.debe_haber = 'S'
+            AND b2.monto_moneda_local = b.monto_moneda_local
+      )
+  )
+  AND b.fecha_compensacion >= '20260101' AND fecha_compensacion < @limite_date;
 
 PRINT 'fact_pagos_compensados - rows inserted 2026 (partial, up to the incremental''s bound): ' + CAST(@@ROWCOUNT AS VARCHAR);
 

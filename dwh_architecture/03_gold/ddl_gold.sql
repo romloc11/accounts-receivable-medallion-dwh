@@ -473,7 +473,9 @@ GO
 -- 6. FACT: gold.fact_pagos_compensados
 -- Grain: 1 row = 1 "raw" deposit (silver.sap_bsad, clase_documento='DZ'
 -- AND (sgtxt='Asignación Aut. Deposito' OR sgtxt LIKE 'BB%') AND
--- debe_haber<>'S' AND monto_moneda_local>0) - a customer payment not yet
+-- debe_haber<>'S' AND monto_moneda_local>0, AND not a self-canceling
+-- internal pair - see gold.load_fact_pagos_compensados in sp_load_gold.sql,
+-- fix 2026-08-29) - a customer payment not yet
 -- allocated to invoices. The sgtxt condition went through 3 iterations
 -- on 2026-08-29 (exact match -> IS NOT NULL -> this conservative pair) -
 -- see gold.load_fact_pagos_compensados in sp_load_gold.sql and
@@ -525,6 +527,7 @@ CREATE TABLE gold.fact_pagos_compensados (
     documento_id               VARCHAR(10)   NOT NULL,
     posicion                   INT           NOT NULL,
     fecha_documento             DATE, -- real deposit date ("payment date")
+    fecha_contabilizacion       DATE, -- posting/GL date - added 2026-08-29, backfilled via ALTER TABLE on the live server (not re-run of this CREATE TABLE, which would have dropped real data) - this is the field that actually matches SAP's own monthly payment report period, NOT fecha_documento/fecha_compensacion (both tried and ruled out - see dwh-ciosa-project-status.md in memory)
     fecha_compensacion          DATE,
     monto_moneda_local          DECIMAL(15,2),
     documento_compensacion      VARCHAR(10), -- compensation group shared with the invoices it covers

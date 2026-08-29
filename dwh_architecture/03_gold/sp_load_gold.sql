@@ -617,14 +617,20 @@ BEGIN
 
         DECLARE @mes_anterior_inicio DATE = DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()) - 1, 0);
 
+        -- fecha_contabilizacion added 2026-08-29: neither fecha_documento nor fecha_compensacion
+        -- matches how SAP's own monthly payment reports bucket a payment into a period - both
+        -- were tried and ruled out with real data during a reconciliation investigation (see
+        -- dwh-ciosa-project-status.md in memory). fecha_contabilizacion (posting/GL date) is the
+        -- field that actually matches. Use it, not fecha_documento/fecha_compensacion, for any
+        -- future report that needs to match a SAP-side "pagos del periodo" export.
         MERGE gold.fact_pagos_compensados AS tgt
         USING (
             SELECT
-                sociedad, cliente_id, ejercicio, documento_id, posicion,
-                fecha_documento, fecha_compensacion, monto_moneda_local,
-                documento_compensacion, ejercicio_compensacion
-            FROM silver.sap_bsad
-            WHERE clase_documento = 'DZ'
+                b.sociedad, b.cliente_id, b.ejercicio, b.documento_id, b.posicion,
+                b.fecha_documento, b.fecha_contabilizacion, b.fecha_compensacion, b.monto_moneda_local,
+                b.documento_compensacion, b.ejercicio_compensacion
+            FROM silver.sap_bsad b
+            WHERE b.clase_documento = 'DZ'
               -- sgtxt = 'Asignación Aut. Deposito' OR sgtxt LIKE 'BB%' (not a bare sgtxt IS NOT NULL) -
               -- fix 2026-08-29, refined same day, see dwh-ciosa-project-status.md in memory for the
               -- full investigation. Went through 2 iterations the same day:
@@ -643,10 +649,32 @@ BEGIN
               -- with more business-rule knowledge confirms which of them are genuinely collected cash.
               -- Known to UNDER-count vs. sgtxt IS NOT NULL by design - do not "fix" this by widening
               -- the pattern again without that confirmation.
-              AND (sgtxt = 'Asignación Aut. Deposito' OR sgtxt LIKE 'BB%')
-              AND debe_haber <> 'S' -- excludes the "child" document's mirror/offsetting line (fix 2026-08-19, see ddl_gold.sql)
-              AND monto_moneda_local > 0 -- excludes $0.00 technical residuals (fix 2026-08-19, see ddl_gold.sql)
-              AND fecha_compensacion >= @mes_anterior_inicio
+              AND (b.sgtxt = 'Asignación Aut. Deposito' OR b.sgtxt LIKE 'BB%')
+              AND b.debe_haber <> 'S' -- excludes the "child" document's mirror/offsetting line (fix 2026-08-19, see ddl_gold.sql)
+              AND b.monto_moneda_local > 0 -- excludes $0.00 technical residuals (fix 2026-08-19, see ddl_gold.sql)
+              AND b.fecha_compensacion >= @mes_anterior_inicio
+              -- Self-canceling internal pair excluded (fix 2026-08-29): a document can carry TWO of
+              -- its own lines in the SAME self-referencing compensation group (documento_compensacion
+              -- = documento_id) - one 'S' (already excluded above) and one 'H' with the exact same
+              -- amount, netting to zero. That 'H' line is an internal reclassification receiving its
+              -- own reversal, not a second real deposit - but without this exclusion it was counted
+              -- as a 2nd "candidate" alongside the real deposit (a different document) in the same
+              -- compensation group, making gold.vw_pago_factura_simple's num_pagos_candidatos=1 "don't
+              -- guess" rule wrongly treat the whole group as ambiguous. Confirmed against real July
+              -- data before implementing: resolves 102 of 133 previously-ambiguous groups ($192,320.13
+              -- recovered); the other 27 groups (genuinely 2+ different real deposits, different
+              -- amounts) correctly remain excluded - see dwh-ciosa-project-status.md in memory.
+              AND NOT (
+                  b.documento_compensacion = b.documento_id
+                  AND EXISTS (
+                      SELECT 1 FROM silver.sap_bsad b2
+                      WHERE b2.sociedad = b.sociedad AND b2.cliente_id = b.cliente_id
+                        AND b2.ejercicio = b.ejercicio AND b2.documento_id = b.documento_id
+                        AND b2.posicion <> b.posicion
+                        AND b2.clase_documento = 'DZ' AND b2.debe_haber = 'S'
+                        AND b2.monto_moneda_local = b.monto_moneda_local
+                  )
+              )
         ) AS src
         ON  tgt.sociedad = src.sociedad
         AND tgt.cliente_id = src.cliente_id
@@ -655,6 +683,7 @@ BEGIN
         AND tgt.posicion = src.posicion
 
         WHEN MATCHED THEN UPDATE SET
+            tgt.fecha_contabilizacion = src.fecha_contabilizacion,
             tgt.fecha_compensacion = src.fecha_compensacion,
             tgt.monto_moneda_local = src.monto_moneda_local,
             tgt.documento_compensacion = src.documento_compensacion,
@@ -663,10 +692,10 @@ BEGIN
 
         WHEN NOT MATCHED THEN
         INSERT (sociedad, cliente_id, ejercicio, documento_id, posicion,
-                fecha_documento, fecha_compensacion, monto_moneda_local,
+                fecha_documento, fecha_contabilizacion, fecha_compensacion, monto_moneda_local,
                 documento_compensacion, ejercicio_compensacion)
         VALUES (src.sociedad, src.cliente_id, src.ejercicio, src.documento_id, src.posicion,
-                src.fecha_documento, src.fecha_compensacion, src.monto_moneda_local,
+                src.fecha_documento, src.fecha_contabilizacion, src.fecha_compensacion, src.monto_moneda_local,
                 src.documento_compensacion, src.ejercicio_compensacion);
 
         SET @rows_count = @@ROWCOUNT;
