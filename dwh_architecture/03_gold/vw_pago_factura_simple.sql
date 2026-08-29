@@ -113,6 +113,28 @@
 -- amount) for anyone who genuinely needs to see the original payment
 -- document's value on each row - just never SUM() it directly.
 --
+-- AMBIGUITY GATE REDEFINED 2026-08-29 (same day, later session): "don't guess"
+-- now means num_pagos_candidatos>1 AND num_facturas_candidatas>1 together (a
+-- true many-to-many group), not just num_pagos_candidatos>1 alone. Found from
+-- a real SAP screenshot (customer group 1402614232): 2 payment candidates
+-- (a $10,403.21 deposit + a $0.10 leftover, both self-referencing/direct,
+-- neither excluded by the self-canceling-pair fix since there's no matching
+-- opposite-side line) but only 1 invoice ($10,403.31 - the two payments sum
+-- to it exactly). With only 1 invoice in the group there's nothing to
+-- mis-attribute: every payment candidate necessarily applies to that same
+-- invoice, whether there's 1 or 5 of them - the risk this gate protects
+-- against (2+ payments each possibly matching a DIFFERENT invoice) simply
+-- doesn't exist when there's at most 1 invoice. Validated against real July
+-- data before implementing: of the 27 groups the OLD gate still excluded
+-- after the self-canceling-pair fix, 23 have exactly 1 invoice ($120,710.99
+-- - the exact pattern above, now resolved) and only 4 have many invoices
+-- (5/7/10/13 - genuinely ambiguous many-to-many, $166,221.23, correctly still
+-- excluded). monto_pago_asignado's existing proration math already handles
+-- this correctly with no formula change: with exactly 1 invoice,
+-- suma_facturas_grupo equals that invoice's own amount, so
+-- p.monto*f.monto/suma_facturas_grupo simplifies to p.monto - each payment
+-- counts in full, nothing double-counted or dropped.
+--
 -- INNER JOIN -> LEFT JOIN on gold.fact_facturas_compensadas, 2026-08-29:
 -- a payment with no matching invoice in its compensation group ("pago a
 -- cuenta", confirmed with real July data: 1,411 of 1,426 such cases have
@@ -164,7 +186,9 @@ grupo_rfc_unico AS (
     HAVING COUNT(DISTINCT ISNULL(k.rfc, 'SIN_RFC_' + k.cliente_id)) = 1
 ),
 facturas_por_grupo AS (
-    SELECT documento_compensacion, ejercicio_compensacion, SUM(monto_moneda_local) AS suma_facturas_grupo
+    SELECT documento_compensacion, ejercicio_compensacion,
+           COUNT(*) AS num_facturas_candidatas,
+           SUM(monto_moneda_local) AS suma_facturas_grupo
     FROM gold.fact_facturas_compensadas
     GROUP BY documento_compensacion, ejercicio_compensacion
 )
@@ -218,7 +242,6 @@ FROM gold.fact_pagos_compensados p
 INNER JOIN pagos_por_grupo g
     ON g.documento_compensacion = p.documento_compensacion
    AND g.ejercicio_compensacion = p.ejercicio_compensacion
-   AND g.num_pagos_candidatos = 1
 INNER JOIN grupo_rfc_unico gr
     ON gr.documento_compensacion = p.documento_compensacion
    AND gr.ejercicio_compensacion = p.ejercicio_compensacion
@@ -238,5 +261,6 @@ LEFT JOIN gold.dim_cliente kf
 WHERE dc.canal_distribucion IN ('10', '40', '60')  -- '20' (menudeo) agregado y luego REVERTIDO 2026-08-27, mismo día: este DWH es explícitamente para mayoreo - canal 20 SÍ son clientes reales (por eso NO se tocó FUERA_DE_ALCANCE en vw_cliente_canal_estatus), simplemente están fuera de la misión de este reporte. Revertir esto también evitó tener que investigar CP (Cobranza POS) - ver dwh-ciosa-project-status.md en memoria para el hallazgo completo de por qué canal 20 casi no tiene DZ.
   AND dc.estatus_comercial <> 'FUERA_DE_ALCANCE'
   AND k.tipo_cliente <> 'SIN_RFC'  -- confirmado 2026-08-27 por un usuario clave del negocio: clientes sin RFC no son clientes reales, no deben entrar en análisis de cartera. Renombrado de DIRECCION_ALTERNA a SIN_RFC el mismo día (misma condición, solo cambia el nombre) - y las cuentas de marketplace/pasarela de pago que antes caían aquí (RFC nulo) ahora son tipo_cliente='MARKETPLACE' en vez de 'SIN_RFC', así que dejan de excluirse por esta condición.
-  AND (kf.tipo_cliente IS NULL OR kf.tipo_cliente <> 'SIN_RFC');  -- kf.tipo_cliente es NULL cuando no hay factura (LEFT JOIN, 2026-08-29) - no debe excluir el pago por eso
+  AND (kf.tipo_cliente IS NULL OR kf.tipo_cliente <> 'SIN_RFC')  -- kf.tipo_cliente es NULL cuando no hay factura (LEFT JOIN, 2026-08-29) - no debe excluir el pago por eso
+  AND NOT (g.num_pagos_candidatos > 1 AND ISNULL(fpg.num_facturas_candidatas, 0) > 1);  -- ambigüedad real solo cuando AMBOS lados tienen 2+ candidatos - ver nota "AMBIGUITY GATE REDEFINED" arriba
 GO
