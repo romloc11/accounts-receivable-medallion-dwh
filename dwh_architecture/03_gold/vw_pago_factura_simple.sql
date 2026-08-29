@@ -112,6 +112,20 @@
 -- monto_pago_virgen is kept as-is (the raw, per-row-repeated deposit
 -- amount) for anyone who genuinely needs to see the original payment
 -- document's value on each row - just never SUM() it directly.
+--
+-- INNER JOIN -> LEFT JOIN on gold.fact_facturas_compensadas, 2026-08-29:
+-- a payment with no matching invoice in its compensation group ("pago a
+-- cuenta", confirmed with real July data: 1,411 of 1,426 such cases have
+-- NO invoice or any other document at all sharing the group - genuine
+-- cash with no due date to compare against) used to disappear from this
+-- view entirely via the INNER JOIN, even when it was a real, fully valid
+-- payment (same root investigation that led to the sgtxt fix in
+-- gold.load_fact_pagos_compensados - see dwh-ciosa-project-status.md in
+-- memory). Now it stays, tagged 'SIN_FACTURA_IDENTIFICADA' in
+-- clasificacion_cobranza (MARKETPLACE still resolves to 'MARKETPLACE'
+-- regardless of invoice presence, same as before). monto_pago_asignado
+-- falls back to the full payment amount when there's no invoice to
+-- prorate against (nothing to split).
 -- ==========================================================
 IF OBJECT_ID('gold.vw_pago_factura_simple', 'V') IS NOT NULL DROP VIEW gold.vw_pago_factura_simple;
 GO
@@ -152,19 +166,21 @@ SELECT
     p.documento_id        AS documento_pago,
     p.fecha_documento     AS fecha_pago,
     p.monto_moneda_local  AS monto_pago_virgen, -- repeats per row when the group has 2+ facturas - do not SUM() directly, see header warning
-    p.monto_moneda_local * f.monto_moneda_local
-        / NULLIF(fpg.suma_facturas_grupo, 0)      AS monto_pago_asignado, -- safe to SUM(): payment split proportionally across the invoices it settled
+    CASE
+        WHEN f.documento_id IS NULL THEN p.monto_moneda_local -- no factura to prorate against - nothing to split, the full payment counts once
+        ELSE p.monto_moneda_local * f.monto_moneda_local / NULLIF(fpg.suma_facturas_grupo, 0)
+    END                                        AS monto_pago_asignado, -- safe to SUM(): payment split proportionally across the invoices it settled
     f.documento_id        AS documento_factura,
     f.fecha_documento     AS fecha_factura,
     f.fecha_vencimiento,
     f.monto_moneda_local  AS monto_factura,
-    DATEDIFF(DAY, f.fecha_vencimiento, p.fecha_documento) AS dias_pago, -- negative = paid before due, positive = paid late
-    -- No NULL-guard on fecha_vencimiento intentional: every invoice in this
-    -- business is required to carry a due date, confirmed with real data
-    -- 2026-08-26 (0 rows with fecha_vencimiento IS NULL). If it were ever
-    -- NULL, both WHEN comparisons evaluate to UNKNOWN and the CASE falls
-    -- through to PAGO_ANTICIPADO by SQL default - don't assume that's still
-    -- safe if this business rule ever changes.
+    DATEDIFF(DAY, f.fecha_vencimiento, p.fecha_documento) AS dias_pago, -- NULL when there's no factura (nothing to compare against) - negative = paid before due, positive = paid late
+    -- No NULL-guard on fecha_vencimiento for the CARTERA_VENCIDA/DEL_MES/
+    -- ANTICIPADO branches: every invoice in this business is required to
+    -- carry a due date, confirmed with real data 2026-08-26 (0 rows with
+    -- fecha_vencimiento IS NULL). The only way f.fecha_vencimiento is NULL
+    -- here is f.documento_id also being NULL (no factura at all), already
+    -- handled by its own branch below before these run.
     CASE
         -- MARKETPLACE/Contado added 2026-08-27, checked by the PAYER's
         -- tipo_cliente (k, not kf) - same "group by who paid" convention
@@ -173,9 +189,16 @@ SELECT
         -- pattern (marketplace settlement batches, or generic cash-type
         -- accounts), so they're pulled out before the date-based CASE runs
         -- at all, instead of trying to force them into VENCIDA/DEL_MES/
-        -- ANTICIPADO.
+        -- ANTICIPADO. Resolves to MARKETPLACE even with no factura (Kushky-
+        -- style accounts routinely clear DZ-against-DZ with no invoice at
+        -- all - see dwh-ciosa-project-status.md in memory).
         WHEN k.tipo_cliente = 'MARKETPLACE' THEN 'MARKETPLACE'
         WHEN k.tipo_cliente = 'GENERICO' THEN 'CONTADO'
+        -- Added 2026-08-29 alongside the INNER->LEFT JOIN change on
+        -- gold.fact_facturas_compensadas: a real payment with no invoice
+        -- in its compensation group ("pago a cuenta") is documented here
+        -- instead of silently dropped from the view.
+        WHEN f.documento_id IS NULL THEN 'SIN_FACTURA_IDENTIFICADA'
         WHEN f.fecha_vencimiento < DATEFROMPARTS(YEAR(p.fecha_documento), MONTH(p.fecha_documento), 1) THEN 'CARTERA_VENCIDA'
         WHEN f.fecha_vencimiento <= EOMONTH(p.fecha_documento) THEN 'CARTERA_DEL_MES'
         ELSE 'PAGO_ANTICIPADO'
@@ -188,10 +211,10 @@ INNER JOIN pagos_por_grupo g
 INNER JOIN grupo_rfc_unico gr
     ON gr.documento_compensacion = p.documento_compensacion
    AND gr.ejercicio_compensacion = p.ejercicio_compensacion
-INNER JOIN gold.fact_facturas_compensadas f
+LEFT JOIN gold.fact_facturas_compensadas f
     ON f.documento_compensacion = p.documento_compensacion
    AND f.ejercicio_compensacion = p.ejercicio_compensacion
-INNER JOIN facturas_por_grupo fpg
+LEFT JOIN facturas_por_grupo fpg
     ON fpg.documento_compensacion = p.documento_compensacion
    AND fpg.ejercicio_compensacion = p.ejercicio_compensacion
 INNER JOIN gold.dim_cliente_comercial dc
@@ -199,10 +222,10 @@ INNER JOIN gold.dim_cliente_comercial dc
    AND p.fecha_documento BETWEEN dc.fecha_inicio_vigencia AND ISNULL(dc.fecha_fin_vigencia, '99991231')
 INNER JOIN gold.dim_cliente k
     ON k.cliente_id = p.cliente_id
-INNER JOIN gold.dim_cliente kf
+LEFT JOIN gold.dim_cliente kf
     ON kf.cliente_id = f.cliente_id
 WHERE dc.canal_distribucion IN ('10', '40', '60')  -- '20' (menudeo) agregado y luego REVERTIDO 2026-08-27, mismo día: este DWH es explícitamente para mayoreo - canal 20 SÍ son clientes reales (por eso NO se tocó FUERA_DE_ALCANCE en vw_cliente_canal_estatus), simplemente están fuera de la misión de este reporte. Revertir esto también evitó tener que investigar CP (Cobranza POS) - ver dwh-ciosa-project-status.md en memoria para el hallazgo completo de por qué canal 20 casi no tiene DZ.
   AND dc.estatus_comercial <> 'FUERA_DE_ALCANCE'
   AND k.tipo_cliente <> 'SIN_RFC'  -- confirmado 2026-08-27 por un usuario clave del negocio: clientes sin RFC no son clientes reales, no deben entrar en análisis de cartera. Renombrado de DIRECCION_ALTERNA a SIN_RFC el mismo día (misma condición, solo cambia el nombre) - y las cuentas de marketplace/pasarela de pago que antes caían aquí (RFC nulo) ahora son tipo_cliente='MARKETPLACE' en vez de 'SIN_RFC', así que dejan de excluirse por esta condición.
-  AND kf.tipo_cliente <> 'SIN_RFC';
+  AND (kf.tipo_cliente IS NULL OR kf.tipo_cliente <> 'SIN_RFC');  -- kf.tipo_cliente es NULL cuando no hay factura (LEFT JOIN, 2026-08-29) - no debe excluir el pago por eso
 GO

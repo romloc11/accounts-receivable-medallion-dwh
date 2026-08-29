@@ -625,7 +625,16 @@ BEGIN
                 documento_compensacion, ejercicio_compensacion
             FROM silver.sap_bsad
             WHERE clase_documento = 'DZ'
-              AND sgtxt = 'Asignación Aut. Deposito'
+              -- sgtxt IS NOT NULL (not sgtxt = 'Asignación Aut. Deposito') - fix 2026-08-29,
+              -- see dwh-ciosa-project-status.md in memory for the full investigation. The exact-text
+              -- match was too strict: real July data showed 99.3% of DZ rows carry SOME line-item
+              -- text (not always that literal phrase), and the rows that genuinely have no text at
+              -- all are exactly the self-referencing/mirror/reallocation placeholder lines that
+              -- shouldn't be counted as separate cash anyway (confirmed against real SAP documents,
+              -- including a large multi-invoice payment that would have been double-counted by an
+              -- earlier, more complex fix attempt that tried to specifically detect and re-admit
+              -- those reallocation lines - IS NOT NULL alone already excludes them correctly).
+              AND sgtxt IS NOT NULL
               AND debe_haber <> 'S' -- excludes the "child" document's mirror/offsetting line (fix 2026-08-19, see ddl_gold.sql)
               AND monto_moneda_local > 0 -- excludes $0.00 technical residuals (fix 2026-08-19, see ddl_gold.sql)
               AND fecha_compensacion >= @mes_anterior_inicio
