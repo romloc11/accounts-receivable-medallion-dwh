@@ -183,6 +183,49 @@
 -- regardless of invoice presence, same as before). monto_pago_asignado
 -- falls back to the full payment amount when there's no invoice to
 -- prorate against (nothing to split).
+--
+-- REDESIGN 2026-08-30 (Power BI report rediseño, see powerbi/_brief/
+-- pagos-cobranza-rediseno-analisis.md for the full architecture discussion):
+--
+-- 1. estatus_identificacion + motivo_no_identificado ADDED, replacing the
+--    old approach of overloading clasificacion_cobranza with non-behavior
+--    values (MARKETPLACE/CONTADO/SIN_FACTURA_IDENTIFICADA/LOTE_CONCILIACION
+--    all lived in that one column). Named "identificacion", not
+--    "conciliacion", on the user's explicit instruction: every payment in
+--    this view already comes from silver.sap_bsad (already compensated/
+--    cleared in SAP), never from bsid (open/not-yet-applied) - calling it
+--    "no conciliado" reads as "still pending", which is never true here.
+--    "No identificada" means only that THIS project couldn't attribute the
+--    payment to one specific invoice with certainty - the cash itself is
+--    never in question. A 2-physical-table design (separate fact_pagos vs
+--    fact_conciliacion) was evaluated and explicitly rejected: real July
+--    numbers (82.0% identificada/$137.4M, 10.4% no identificada/$17.5M,
+--    7.6% correctly out of scope/$12.75M) showed monto_pago_asignado
+--    already makes the mixed grain numerically safe (no fan-out risk) -
+--    splitting into 2 tables would only add 2 SQL views + 2 Power BI
+--    tables to keep in sync forever, for zero additional numeric benefit.
+--
+-- 2. clasificacion_cobranza renamed (CARTERA_VENCIDA->PAGO_A_VENCIMIENTO,
+--    CARTERA_DEL_MES->PAGO_A_MES, PAGO_ANTICIPADO unchanged) - a pure
+--    rename, the month-cohort date logic itself does NOT change (still
+--    validated 2026-08-26, see the note further up). MARKETPLACE/CONTADO
+--    are REMOVED as clasificacion_cobranza values entirely - tipo_cliente
+--    is a customer attribute, not a payment-behavior classification, and
+--    now lives only on gold.dim_cliente (imported directly into Power BI's
+--    dim_cliente table, not through this view). A Marketplace/Contado
+--    payment that DOES have an identified invoice now gets a real
+--    PAGO_A_VENCIMIENTO/PAGO_A_MES/PAGO_ANTICIPADO value like any other
+--    payment; one that doesn't gets NULL here (via estatus_identificacion
+--    instead), exactly like any other unidentified payment.
+--
+-- 3. cliente_credito_sk ADDED (LEFT JOIN, same temporal-SCD2 pattern as
+--    cliente_comercial_sk) so Power BI can relate this view to
+--    gold.dim_cliente_credito for Ejecutivo de Crédito/Cobrador analysis -
+--    this relationship never existed before (dim_cliente_credito was only
+--    wired to fact_cartera). LEFT JOIN, not INNER: not every cliente_id has
+--    a silver.sap_knkk record (documented gap in gold.fact_movimientos_
+--    compensados's own history - ~135 cliente_ids, mostly non-credit
+--    account types), so cliente_credito_sk can be legitimately NULL.
 -- ==========================================================
 IF OBJECT_ID('gold.vw_pago_factura_simple', 'V') IS NOT NULL DROP VIEW gold.vw_pago_factura_simple;
 GO
@@ -245,39 +288,28 @@ SELECT
     f.fecha_vencimiento,
     f.monto_moneda_local  AS monto_factura,
     DATEDIFF(DAY, f.fecha_vencimiento, p.fecha_documento) AS dias_pago, -- NULL when there's no factura (nothing to compare against) - negative = paid before due, positive = paid late
-    -- No NULL-guard on fecha_vencimiento for the CARTERA_VENCIDA/DEL_MES/
+    dcr.id_surrogate       AS cliente_credito_sk, -- added 2026-08-30: LEFT JOIN, resolved by SCD2 in the ETL same as cliente_comercial_sk - lets Power BI relate Ejecutivo de Crédito/Cobrador to this view. NULL for cliente_ids with no silver.sap_knkk record (documented gap, see note above).
+    -- estatus_identificacion/motivo_no_identificado added 2026-08-30 -
+    -- see "REDESIGN 2026-08-30" note above for why these are named
+    -- "identificacion", not "conciliacion".
+    CASE WHEN f.documento_id IS NULL THEN 'FACTURA_NO_IDENTIFICADA' ELSE 'FACTURA_IDENTIFICADA' END AS estatus_identificacion,
+    CASE
+        WHEN f.documento_id IS NOT NULL THEN NULL
+        WHEN g.num_pagos_candidatos > 1 AND ISNULL(fpg.num_facturas_candidatas, 0) > 1 THEN 'LOTE_CONCILIACION'
+        ELSE 'SIN_FACTURA_IDENTIFICADA'
+    END AS motivo_no_identificado,
+    -- No NULL-guard on fecha_vencimiento for the PAGO_A_VENCIMIENTO/A_MES/
     -- ANTICIPADO branches: every invoice in this business is required to
     -- carry a due date, confirmed with real data 2026-08-26 (0 rows with
     -- fecha_vencimiento IS NULL). The only way f.fecha_vencimiento is NULL
-    -- here is f.documento_id also being NULL (no factura at all), already
-    -- handled by its own branch below before these run.
+    -- here is f.documento_id also being NULL (no factura identificada),
+    -- already handled by the first branch below before these run.
+    -- MARKETPLACE/CONTADO removed as values here 2026-08-30 - see
+    -- "REDESIGN 2026-08-30" note above, that's tipo_cliente now (dim_cliente).
     CASE
-        -- MARKETPLACE/Contado added 2026-08-27, checked by the PAYER's
-        -- tipo_cliente (k, not kf) - same "group by who paid" convention
-        -- already established 2026-08-26 for cliente_id itself. These
-        -- customers never really have a "vencimiento"-driven payment
-        -- pattern (marketplace settlement batches, or generic cash-type
-        -- accounts), so they're pulled out before the date-based CASE runs
-        -- at all, instead of trying to force them into VENCIDA/DEL_MES/
-        -- ANTICIPADO. Resolves to MARKETPLACE even with no factura (Kushky-
-        -- style accounts routinely clear DZ-against-DZ with no invoice at
-        -- all - see dwh-ciosa-project-status.md in memory).
-        WHEN k.tipo_cliente = 'MARKETPLACE' THEN 'MARKETPLACE'
-        WHEN k.tipo_cliente = 'GENERICO' THEN 'CONTADO'
-        -- LOTE_CONCILIACION added 2026-08-29 - see the "LOTE_CONCILIACION
-        -- added" note above. Checked before SIN_FACTURA_IDENTIFICADA:
-        -- f.documento_id is also NULL for these rows (the invoice JOIN below
-        -- is deliberately suppressed for this exact condition), but the
-        -- reason is different - there ARE invoices in the group, just too
-        -- many to attribute safely, not zero.
-        WHEN g.num_pagos_candidatos > 1 AND ISNULL(fpg.num_facturas_candidatas, 0) > 1 THEN 'LOTE_CONCILIACION'
-        -- Added 2026-08-29 alongside the INNER->LEFT JOIN change on
-        -- gold.fact_facturas_compensadas: a real payment with no invoice
-        -- in its compensation group ("pago a cuenta") is documented here
-        -- instead of silently dropped from the view.
-        WHEN f.documento_id IS NULL THEN 'SIN_FACTURA_IDENTIFICADA'
-        WHEN f.fecha_vencimiento < DATEFROMPARTS(YEAR(p.fecha_documento), MONTH(p.fecha_documento), 1) THEN 'CARTERA_VENCIDA'
-        WHEN f.fecha_vencimiento <= EOMONTH(p.fecha_documento) THEN 'CARTERA_DEL_MES'
+        WHEN f.documento_id IS NULL THEN NULL -- no factura identificada - nothing to classify (see estatus_identificacion/motivo_no_identificado above)
+        WHEN f.fecha_vencimiento < DATEFROMPARTS(YEAR(p.fecha_documento), MONTH(p.fecha_documento), 1) THEN 'PAGO_A_VENCIMIENTO'
+        WHEN f.fecha_vencimiento <= EOMONTH(p.fecha_documento) THEN 'PAGO_A_MES'
         ELSE 'PAGO_ANTICIPADO'
     END AS clasificacion_cobranza
 FROM gold.fact_pagos_compensados p
@@ -303,6 +335,9 @@ LEFT JOIN gold.fact_facturas_compensadas f
 INNER JOIN gold.dim_cliente_comercial dc
     ON dc.cliente_id = p.cliente_id
    AND p.fecha_documento BETWEEN dc.fecha_inicio_vigencia AND ISNULL(dc.fecha_fin_vigencia, '99991231')
+LEFT JOIN gold.dim_cliente_credito dcr -- added 2026-08-30, see "REDESIGN 2026-08-30" note above - LEFT JOIN, not every cliente_id has a silver.sap_knkk record
+    ON dcr.cliente_id = p.cliente_id
+   AND p.fecha_documento BETWEEN dcr.fecha_inicio_vigencia AND ISNULL(dcr.fecha_fin_vigencia, '99991231')
 INNER JOIN gold.dim_cliente k
     ON k.cliente_id = p.cliente_id
 LEFT JOIN gold.dim_cliente kf
