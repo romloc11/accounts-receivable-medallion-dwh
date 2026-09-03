@@ -210,6 +210,15 @@ CREATE TABLE silver.sap_bsid (
     condicion_pago           VARCHAR(4),    -- ZTERM
     dias_plazo               DECIMAL(15,2), -- ZBD1T
 
+    -- Added 2026-09-03 for the fact_aplicacion v2 design (see DESIGN.md): open items are a
+    -- source of applications too (a partial payment in progress and the invoice it references
+    -- both live only here), so bsid needs the same application fields bsad already has.
+    clave_contabilizacion         VARCHAR(2),  -- BSCHL: SAP posting key. The single most informative field for the application logic: 11 = virgin deposit (with REBZG='V'), 15 = referenced payment, 08 = child mirror, 17 = credit re-applied, 02/05/12 = reversal of 11/15/01. Verified against SAP GUI (FB03) 2026-09-03.
+    sgtxt                         VARCHAR(50), -- SGTXT: line item text ('Asignación Aut. Deposito' = virgin deposit)
+    factura_referencia_documento  VARCHAR(10), -- REBZG: invoice this line references. 'V' is a SAP marker ("no invoice reference, own due date"), not a document number - treat as NULL
+    factura_referencia_ejercicio  INT,         -- REBZJ
+    factura_referencia_posicion   INT,         -- REBZZ
+
     -- Dunning at the line-item level
     area_reclamacion              VARCHAR(2), -- MABER
     nivel_reclamacion             CHAR(1),    -- MANST
@@ -257,6 +266,7 @@ CREATE TABLE silver.sap_bsad (
     clase_documento VARCHAR(2),
     codigo_impuesto VARCHAR(2), -- MWSKZ: VAT code, same as in silver.sap_bsid
     debe_haber CHAR(1), -- SHKZG
+    clave_contabilizacion VARCHAR(2), -- BSCHL: SAP posting key. Added 2026-09-03 (fact_aplicacion v2, see DESIGN.md): decides the role of an AB line (07/17 at $0.00 = clearing anchor, 17 with amount = credit re-applied, 15 = credit balance from pool account), separates the DZ virgin (11) from a referenced payment (15) and from the child mirror (08), and is the only signal of an FB08 reversal (paired keys 11<->02, 15<->05, 01<->12) since XSTOV is blank on every row. On an existing server this column is added with 02_silver/alter_bsad_bsid_clave_contabilizacion.sql (ALTER + year-chunked backfill from bronze), NOT by re-running this file.
     fecha_vencimiento DATE, -- ZFBDT: kept from bsid to be able to measure late payments (fecha_compensacion - fecha_vencimiento)
     monto_moneda_local DECIMAL(15,2),
     monto_moneda_doc DECIMAL(15,2),

@@ -301,6 +301,8 @@ BEGIN
             fecha_contabilizacion, fecha_documento, fecha_registro_sistema, fecha_vencimiento,
             clase_documento, codigo_impuesto, debe_haber, monto_moneda_local, monto_moneda_doc,
             moneda, condicion_pago, dias_plazo,
+            clave_contabilizacion, sgtxt,
+            factura_referencia_documento, factura_referencia_ejercicio, factura_referencia_posicion,
             area_reclamacion, nivel_reclamacion, clave_reclamacion_legal,
             bloqueo_reclamacion_temporal, fecha_ultima_reclamacion
         )
@@ -327,6 +329,11 @@ BEGIN
             NULLIF(LTRIM(RTRIM(WAERS)), ''),  -- currency
             NULLIF(LTRIM(RTRIM(ZTERM)), ''),  -- payment terms
             ISNULL(ZBD1T, 0),     -- term days
+            NULLIF(LTRIM(RTRIM(BSCHL)), ''),  -- posting key (added 2026-09-03, fact_aplicacion v2 - see ddl_silver.sql)
+            NULLIF(LTRIM(RTRIM(SGTXT)), ''),  -- line item text
+            NULLIF(LTRIM(RTRIM(REBZG)), ''),  -- invoice reference ('V' = no reference, kept raw here, interpreted in gold)
+            TRY_CAST(NULLIF(LTRIM(RTRIM(REBZJ)), '') AS INT),
+            TRY_CAST(NULLIF(LTRIM(RTRIM(REBZZ)), '') AS INT),
             NULLIF(LTRIM(RTRIM(MABER)), ''),  -- dunning area
             NULLIF(LTRIM(RTRIM(MANST)), ''),  -- dunning level
             NULLIF(LTRIM(RTRIM(MSCHL)), ''),  -- legal dunning key
@@ -381,6 +388,7 @@ BEGIN
                 NULLIF(LTRIM(RTRIM(BLART)), '') AS clase_documento,
                 NULLIF(LTRIM(RTRIM(MWSKZ)), '') AS codigo_impuesto,
                 NULLIF(LTRIM(RTRIM(SHKZG)), '') AS debe_haber,
+                NULLIF(LTRIM(RTRIM(BSCHL)), '') AS clave_contabilizacion, -- posting key (added 2026-09-03, fact_aplicacion v2 - see ddl_silver.sql)
                 DATEADD(DAY, ISNULL(ZBD1T, 0), TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(ZFBDT)), '00000000'), 112)) AS fecha_vencimiento, -- real due date = ZFBDT + dias_plazo (bug fixed 2026-08-13, see the note in the bsid step above)
                 ISNULL(DMBTR, 0) AS monto_moneda_local,
                 ISNULL(WRBTR, 0) AS monto_moneda_doc,
@@ -421,6 +429,7 @@ BEGIN
             tgt.fecha_compensacion = src.fecha_compensacion,
             tgt.documento_compensacion = src.documento_compensacion,
             tgt.ejercicio_compensacion = src.ejercicio_compensacion,
+            tgt.clave_contabilizacion = src.clave_contabilizacion, -- immutable in SAP; updated here only so rows inside the window get populated right after the 2026-09-03 ALTER without waiting for the backfill
             tgt.sgtxt = src.sgtxt,
             tgt.factura_referencia_documento = src.factura_referencia_documento,
             tgt.factura_referencia_ejercicio = src.factura_referencia_ejercicio,
@@ -441,6 +450,7 @@ BEGIN
             asignacion, referencia, documento_ventas, posicion,
             fecha_contabilizacion, fecha_documento, fecha_registro_sistema, fecha_compensacion,
             documento_compensacion, ejercicio_compensacion, clase_documento, codigo_impuesto, debe_haber,
+            clave_contabilizacion,
             fecha_vencimiento, monto_moneda_local,
             monto_moneda_doc, moneda, condicion_pago, dias_plazo, sgtxt,
             factura_referencia_documento, factura_referencia_ejercicio, factura_referencia_posicion,
@@ -452,6 +462,7 @@ BEGIN
             src.asignacion, src.referencia, src.documento_ventas, src.posicion,
             src.fecha_contabilizacion, src.fecha_documento, src.fecha_registro_sistema, src.fecha_compensacion,
             src.documento_compensacion, src.ejercicio_compensacion, src.clase_documento, src.codigo_impuesto, src.debe_haber,
+            src.clave_contabilizacion,
             src.fecha_vencimiento, src.monto_moneda_local,
             src.monto_moneda_doc, src.moneda, src.condicion_pago, src.dias_plazo, src.sgtxt,
             src.factura_referencia_documento, src.factura_referencia_ejercicio, src.factura_referencia_posicion,
