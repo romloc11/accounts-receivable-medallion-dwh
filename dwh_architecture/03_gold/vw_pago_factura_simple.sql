@@ -226,6 +226,23 @@
 --    a silver.sap_knkk record (documented gap in gold.fact_movimientos_
 --    compensados's own history - ~135 cliente_ids, mostly non-credit
 --    account types), so cliente_credito_sk can be legitimately NULL.
+--
+-- FECHA_PAGO / DIAS_PAGO / CLASIFICACION_COBRANZA rebased to fecha_contabilizacion
+-- 2026-08-31: these 3 date-dependent outputs used p.fecha_documento since the
+-- view's creation - a bug flagged during the 2026-08-30 redesign but deliberately
+-- left unfixed that day. fecha_contabilizacion is the field already validated
+-- (2026-08-29, see gold.fact_pagos_compensados's own column comment and
+-- dwh-ciosa-project-status.md in memory) as the one that actually matches SAP's
+-- own monthly payment report period - fecha_documento and fecha_compensacion were
+-- both tried and ruled out for that same purpose. Validated against real July
+-- 2026 data before applying: of the 12,177 payments that fall in July under BOTH
+-- date bases, 0 change clasificacion_cobranza - the only effect is 43 payments
+-- moving across the month boundary (22 leave July, 21 enter), a +$1.43M/+0.93%
+-- shift in July's total (fan-out on those 43 payments' compensation groups
+-- explains the larger +5.2% row-count shift). This is a pure relabeling: the
+-- view's total row count and total monto_pago_asignado across all history are
+-- unchanged, only which period-bucket each payment falls into shifts at the
+-- margins.
 -- ==========================================================
 IF OBJECT_ID('gold.vw_pago_factura_simple', 'V') IS NOT NULL DROP VIEW gold.vw_pago_factura_simple;
 GO
@@ -277,7 +294,7 @@ SELECT
     dc.estatus_comercial,
     dc.id_surrogate        AS cliente_comercial_sk, -- added 2026-08-26: lets Power BI relate to gold.dim_cliente_comercial by key (star schema) instead of embedding canal_distribucion/estatus_comercial as plain text columns
     p.documento_id        AS documento_pago,
-    p.fecha_documento     AS fecha_pago,
+    p.fecha_contabilizacion AS fecha_pago, -- cambiado de fecha_documento 2026-08-31: fecha_contabilizacion es el campo validado contra SAP para el reporte mensual de pagos (ni fecha_documento ni fecha_compensacion coinciden con el periodo real de SAP - ver dwh-ciosa-project-status.md en memoria). Validado antes de aplicar: 0 de 12,177 pagos que se quedan en julio bajo ambas fechas cambian de clasificacion_cobranza; el efecto es solo 43 pagos moviendose por el borde del mes (+$1.43M / +0.93% en el total de julio).
     p.monto_moneda_local  AS monto_pago_virgen, -- repeats per row when the group has 2+ facturas - do not SUM() directly, see header warning
     CASE
         WHEN f.documento_id IS NULL THEN p.monto_moneda_local -- no factura to prorate against - nothing to split, the full payment counts once
@@ -287,7 +304,7 @@ SELECT
     f.fecha_documento     AS fecha_factura,
     f.fecha_vencimiento,
     f.monto_moneda_local  AS monto_factura,
-    DATEDIFF(DAY, f.fecha_vencimiento, p.fecha_documento) AS dias_pago, -- NULL when there's no factura (nothing to compare against) - negative = paid before due, positive = paid late
+    DATEDIFF(DAY, f.fecha_vencimiento, p.fecha_contabilizacion) AS dias_pago, -- NULL when there's no factura (nothing to compare against) - negative = paid before due, positive = paid late. Base fecha cambiada a fecha_contabilizacion 2026-08-31 junto con fecha_pago, misma razon.
     dcr.id_surrogate       AS cliente_credito_sk, -- added 2026-08-30: LEFT JOIN, resolved by SCD2 in the ETL same as cliente_comercial_sk - lets Power BI relate Ejecutivo de Crédito/Cobrador to this view. NULL for cliente_ids with no silver.sap_knkk record (documented gap, see note above).
     -- estatus_identificacion/motivo_no_identificado added 2026-08-30 -
     -- see "REDESIGN 2026-08-30" note above for why these are named
@@ -308,8 +325,8 @@ SELECT
     -- "REDESIGN 2026-08-30" note above, that's tipo_cliente now (dim_cliente).
     CASE
         WHEN f.documento_id IS NULL THEN NULL -- no factura identificada - nothing to classify (see estatus_identificacion/motivo_no_identificado above)
-        WHEN f.fecha_vencimiento < DATEFROMPARTS(YEAR(p.fecha_documento), MONTH(p.fecha_documento), 1) THEN 'PAGO_A_VENCIMIENTO'
-        WHEN f.fecha_vencimiento <= EOMONTH(p.fecha_documento) THEN 'PAGO_A_MES'
+        WHEN f.fecha_vencimiento < DATEFROMPARTS(YEAR(p.fecha_contabilizacion), MONTH(p.fecha_contabilizacion), 1) THEN 'PAGO_A_VENCIMIENTO' -- base fecha cambiada a fecha_contabilizacion 2026-08-31, misma razon que fecha_pago
+        WHEN f.fecha_vencimiento <= EOMONTH(p.fecha_contabilizacion) THEN 'PAGO_A_MES'
         ELSE 'PAGO_ANTICIPADO'
     END AS clasificacion_cobranza
 FROM gold.fact_pagos_compensados p
