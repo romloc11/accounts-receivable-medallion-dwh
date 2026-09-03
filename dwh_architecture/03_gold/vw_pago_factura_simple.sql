@@ -358,6 +358,51 @@ grupo_resuelto AS (
     LEFT JOIN facturas_por_grupo fpg_final
         ON fpg_final.documento_compensacion = gfu.grupo_final
        AND fpg_final.ejercicio_compensacion = gfu.ejercicio_grupo_final
+),
+-- REEMBOLSO agregado 2026-09-03 (investigacion arrancada de un ejemplo real de SAP que el
+-- usuario compartio, documento 1402626246, cliente 10015304): a veces un cliente deposita
+-- 2 veces el mismo monto (duplicado/error) - un deposito se aplica a la factura real, el
+-- otro se liquida contra un asiento clase SA con texto "REEM ##.../REEMBOLSO..." (senal de
+-- que ese efectivo especifico esta destinado a devolverse al cliente, no es cobranza real
+-- retenida). Contarlo en Cobranza Total infla el monto real cobrado, porque ese efectivo no
+-- se queda - sale de nuevo como reembolso. Confirmado con un caso real: deposito 1402626246
+-- ($9,422.30) se liquido contra el asiento SA "REEM 01 10015304 LOPEZ CELIS GRACIELA"
+-- ($9,422.30 exacto) mientras un deposito GEMELO (1402626207, mismo cliente, mismo monto,
+-- misma Asignacion) si pago la factura real 7404816359 por separado.
+--
+-- sa_reem_en_grupo: suma de lineas clase SA con texto que empieza "REEM" (cubre tanto "REEM
+-- ## <cliente> <nombre>" como "REEMBOLSO..."), por grupo de compensacion.
+sa_reem_en_grupo AS (
+    SELECT documento_compensacion, ejercicio_compensacion,
+           SUM(monto_moneda_local) AS monto_sa_reem
+    FROM silver.sap_bsad
+    WHERE clase_documento = 'SA' AND sgtxt LIKE 'REEM%'
+    GROUP BY documento_compensacion, ejercicio_compensacion
+),
+-- reembolso_limpio: solo se excluye cuando el grupo tiene EXACTAMENTE 1 pago candidato
+-- (pagos_por_grupo) Y ese pago coincide con el monto de la linea SA/REEM al centavo - "no
+-- adivinar", mismo principio del resto de esta vista. Validado 2026-09-03 con datos reales:
+-- de 251 grupos historicos donde un pago candidato comparte grupo con una linea SA/REEM,
+-- la mayoria (76 grupos, $37.76M) es un pago GRANDE que por coincidencia comparte grupo con
+-- un ajuste SA/REEM chico y NO relacionado (ej. redondeo) - esos NO se excluyen, el pago es
+-- real. Solo cuando el pago coincide EXACTO con la linea SA (dentro de 1 centavo) Y es el
+-- unico candidato del grupo se confirma el patron limpio "deposito duplicado -> reembolso":
+-- 164 grupos, $2,907,987.30 en toda la historia (2022-2026), de los cuales 3 grupos /
+-- $22,984.10 son de julio 2026. Los casos donde 2-3 pagos SUMAN exacto contra la misma
+-- linea SA (10 grupos/$159,848.33 y 1 grupo/$15,761.22) se dejan SIN excluir a proposito -
+-- no se sabe cual de esos pagos es especificamente el reembolsado. Ver
+-- dwh-ciosa-project-status.md en memoria para el detalle completo de la investigacion.
+reembolso_limpio AS (
+    SELECT g.documento_compensacion, g.ejercicio_compensacion
+    FROM pagos_por_grupo g
+    INNER JOIN gold.fact_pagos_compensados p2
+        ON p2.documento_compensacion = g.documento_compensacion
+       AND p2.ejercicio_compensacion = g.ejercicio_compensacion
+    INNER JOIN sa_reem_en_grupo sr
+        ON sr.documento_compensacion = g.documento_compensacion
+       AND sr.ejercicio_compensacion = g.ejercicio_compensacion
+    WHERE g.num_pagos_candidatos = 1
+      AND ABS(p2.monto_moneda_local - sr.monto_sa_reem) < 1.0
 )
 SELECT
     p.cliente_id, -- the PAYER, not the invoice's own owner (f.cliente_id, not exposed) - confirmed 2026-08-26 this is intentional: the report groups by who paid, not by who originally owed the invoice. If that ever needs to change, f.cliente_id is available on the fact_facturas_compensadas join (f) already in this view.
@@ -441,7 +486,11 @@ INNER JOIN gold.dim_cliente k
     ON k.cliente_id = p.cliente_id
 LEFT JOIN gold.dim_cliente kf
     ON kf.cliente_id = f.cliente_id
-WHERE dc.canal_distribucion IN ('10', '40', '60')  -- '20' (menudeo) agregado y luego REVERTIDO 2026-08-27, mismo día: este DWH es explícitamente para mayoreo - canal 20 SÍ son clientes reales (por eso NO se tocó FUERA_DE_ALCANCE en vw_cliente_canal_estatus), simplemente están fuera de la misión de este reporte. Revertir esto también evitó tener que investigar CP (Cobranza POS) - ver dwh-ciosa-project-status.md en memoria para el hallazgo completo de por qué canal 20 casi no tiene DZ.
+LEFT JOIN reembolso_limpio rl -- ver nota "REEMBOLSO" arriba
+    ON rl.documento_compensacion = p.documento_compensacion
+   AND rl.ejercicio_compensacion = p.ejercicio_compensacion
+WHERE rl.documento_compensacion IS NULL -- excluye depositos duplicados destinados a reembolso (ver nota "REEMBOLSO" arriba) - no son cobranza real retenida
+  AND dc.canal_distribucion IN ('10', '40', '60')  -- '20' (menudeo) agregado y luego REVERTIDO 2026-08-27, mismo día: este DWH es explícitamente para mayoreo - canal 20 SÍ son clientes reales (por eso NO se tocó FUERA_DE_ALCANCE en vw_cliente_canal_estatus), simplemente están fuera de la misión de este reporte. Revertir esto también evitó tener que investigar CP (Cobranza POS) - ver dwh-ciosa-project-status.md en memoria para el hallazgo completo de por qué canal 20 casi no tiene DZ.
   AND dc.estatus_comercial <> 'FUERA_DE_ALCANCE'
   AND k.tipo_cliente <> 'SIN_RFC'  -- confirmado 2026-08-27 por un usuario clave del negocio: clientes sin RFC no son clientes reales, no deben entrar en análisis de cartera. Renombrado de DIRECCION_ALTERNA a SIN_RFC el mismo día (misma condición, solo cambia el nombre) - y las cuentas de marketplace/pasarela de pago que antes caían aquí (RFC nulo) ahora son tipo_cliente='MARKETPLACE' en vez de 'SIN_RFC', así que dejan de excluirse por esta condición.
   AND (kf.tipo_cliente IS NULL OR kf.tipo_cliente <> 'SIN_RFC');  -- kf.tipo_cliente es NULL cuando no hay factura (LEFT JOIN, 2026-08-29) - no debe excluir el pago por eso. Nota: ya NO hay exclusion por ambiguedad aqui - los grupos many-to-many (2+ pagos Y 2+ facturas) ahora se incluyen, etiquetados LOTE_CONCILIACION (ver nota arriba) en vez de excluirse por completo.
