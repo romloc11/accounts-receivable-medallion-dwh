@@ -286,6 +286,78 @@ facturas_por_grupo AS (
            SUM(monto_moneda_local) AS suma_facturas_grupo
     FROM gold.fact_facturas_compensadas
     GROUP BY documento_compensacion, ejercicio_compensacion
+),
+-- CADENA DE 2 SALTOS agregada 2026-09-03 (investigacion arrancada de un ejemplo real de
+-- SAP que el usuario compartio, documento 1402621305 - ver dwh-ciosa-project-status.md en
+-- memoria para el detalle completo): SAP a veces liquida un deposito en 2 pasos - el
+-- deposito se liquida primero contra un documento_compensacion "intermedio" (que NO es una
+-- factura, es otro documento tecnico de liquidacion), y ESE documento intermedio se liquida
+-- despues, en un SEGUNDO grupo de compensacion, contra la factura real (a veces junto con
+-- otros pagos). El JOIN normal de esta vista solo busca la factura en el grupo DIRECTO del
+-- pago - si la factura esta un salto mas abajo, el pago quedaba "SIN_FACTURA_IDENTIFICADA"
+-- aunque el dinero si tenga una factura real detras. Caso real confirmado: deposito
+-- 1402621305 ($2,801.85) se liquido en el grupo intermedio 1402621328, que a su vez (junto
+-- con otro deposito de $540.20) liquido la factura 7404802497 ($3,342.05 exacto) en el
+-- grupo final 8501578933.
+--
+-- salto_h: para cada documento_id, su(s) propia(s) liquidacion(es) como linea 'H' (la
+-- liquidacion real hacia adelante, no el 'S' que es el mirror/hijo del propio grupo) hacia
+-- OTRO documento_compensacion - es decir, tratando el documento_id como si fuera el "hijo"
+-- de una liquidacion anterior.
+salto_h AS (
+    SELECT documento_id AS grupo_intermedio,
+           documento_compensacion AS grupo_final,
+           ejercicio_compensacion AS ejercicio_grupo_final
+    FROM silver.sap_bsad
+    WHERE debe_haber = 'H'
+      AND documento_compensacion <> documento_id -- excluye el self-ref (ya es el propio grupo directo)
+    GROUP BY documento_id, documento_compensacion, ejercicio_compensacion
+),
+-- grupo_final_unico: solo se sigue el salto cuando el documento intermedio aterriza en
+-- EXACTAMENTE 1 grupo final distinto - "no adivinar", mismo principio que el resto de esta
+-- vista. Si un mismo documento intermedio se repartio entre varios grupos finales (un
+-- deposito grande dividido en varias aplicaciones), no sabemos que parte corresponde a
+-- cual grupo, asi que ese caso se deja SIN resolver a proposito.
+grupo_final_unico AS (
+    SELECT grupo_intermedio,
+           MIN(grupo_final) AS grupo_final,
+           MIN(ejercicio_grupo_final) AS ejercicio_grupo_final
+    FROM salto_h
+    GROUP BY grupo_intermedio
+    HAVING COUNT(DISTINCT grupo_final) = 1
+),
+-- grupo_resuelto: el grupo de compensacion que realmente se debe usar para buscar la
+-- factura de cada pago - el grupo DIRECTO si ya tiene factura(s) ahi mismo, o el grupo
+-- FINAL de la cadena de 2 saltos si el directo no tiene factura Y el salto es unico Y el
+-- grupo final si tiene factura(s). Validado 2026-09-03 con datos reales de julio antes de
+-- implementar: de los 1,430 pagos SIN_FACTURA_IDENTIFICADA de julio ($17.45M), 1,099
+-- ($7,493,413.67, 43% del monto) se resuelven limpio con esta regla; el resto se queda sin
+-- resolver a proposito (261/$4.6M ambiguos - varios grupos finales candidatos; 36/$5.1M el
+-- grupo final tampoco tiene factura directa, necesitaria un 3er salto; 34/$258K sin ningun
+-- salto encontrado, genuinamente sin factura). Ver dwh-ciosa-project-status.md en memoria.
+grupo_resuelto AS (
+    SELECT
+        g.documento_compensacion,
+        g.ejercicio_compensacion,
+        CASE
+            WHEN fpg_directo.num_facturas_candidatas > 0 THEN g.documento_compensacion
+            WHEN fpg_final.num_facturas_candidatas > 0 THEN gfu.grupo_final
+            ELSE g.documento_compensacion
+        END AS documento_compensacion_resuelto,
+        CASE
+            WHEN fpg_directo.num_facturas_candidatas > 0 THEN g.ejercicio_compensacion
+            WHEN fpg_final.num_facturas_candidatas > 0 THEN gfu.ejercicio_grupo_final
+            ELSE g.ejercicio_compensacion
+        END AS ejercicio_compensacion_resuelto
+    FROM pagos_por_grupo g
+    LEFT JOIN facturas_por_grupo fpg_directo
+        ON fpg_directo.documento_compensacion = g.documento_compensacion
+       AND fpg_directo.ejercicio_compensacion = g.ejercicio_compensacion
+    LEFT JOIN grupo_final_unico gfu
+        ON gfu.grupo_intermedio = g.documento_compensacion
+    LEFT JOIN facturas_por_grupo fpg_final
+        ON fpg_final.documento_compensacion = gfu.grupo_final
+       AND fpg_final.ejercicio_compensacion = gfu.ejercicio_grupo_final
 )
 SELECT
     p.cliente_id, -- the PAYER, not the invoice's own owner (f.cliente_id, not exposed) - confirmed 2026-08-26 this is intentional: the report groups by who paid, not by who originally owed the invoice. If that ever needs to change, f.cliente_id is available on the fact_facturas_compensadas join (f) already in this view.
@@ -298,7 +370,7 @@ SELECT
     p.monto_moneda_local  AS monto_pago_virgen, -- repeats per row when the group has 2+ facturas - do not SUM() directly, see header warning
     CASE
         WHEN f.documento_id IS NULL THEN p.monto_moneda_local -- no factura to prorate against - nothing to split, the full payment counts once
-        ELSE p.monto_moneda_local * f.monto_moneda_local / NULLIF(fpg.suma_facturas_grupo, 0)
+        ELSE p.monto_moneda_local * f.monto_moneda_local / NULLIF(fpg_res.suma_facturas_grupo, 0) -- fpg_res: grupo RESUELTO (directo o, si aplica, el final de la cadena de 2 saltos - ver nota "CADENA DE 2 SALTOS" arriba)
     END                                        AS monto_pago_asignado, -- safe to SUM(): payment split proportionally across the invoices it settled
     f.documento_id        AS documento_factura,
     f.fecha_documento     AS fecha_factura,
@@ -339,9 +411,19 @@ INNER JOIN grupo_rfc_unico gr
 LEFT JOIN facturas_por_grupo fpg
     ON fpg.documento_compensacion = p.documento_compensacion
    AND fpg.ejercicio_compensacion = p.ejercicio_compensacion
+   -- fpg (grupo DIRECTO) - se mantiene sin cambios, solo alimenta el gate de
+   -- LOTE_CONCILIACION mas abajo (esa ambiguedad es sobre el grupo directo, no
+   -- se ve afectada por la cadena de 2 saltos: un pago solo intenta el salto
+   -- cuando su grupo directo YA no tiene factura, nunca cuando es LOTE_CONCILIACION).
+LEFT JOIN grupo_resuelto gres -- ver nota "CADENA DE 2 SALTOS" arriba
+    ON gres.documento_compensacion = p.documento_compensacion
+   AND gres.ejercicio_compensacion = p.ejercicio_compensacion
+LEFT JOIN facturas_por_grupo fpg_res
+    ON fpg_res.documento_compensacion = gres.documento_compensacion_resuelto
+   AND fpg_res.ejercicio_compensacion = gres.ejercicio_compensacion_resuelto
 LEFT JOIN gold.fact_facturas_compensadas f
-    ON f.documento_compensacion = p.documento_compensacion
-   AND f.ejercicio_compensacion = p.ejercicio_compensacion
+    ON f.documento_compensacion = gres.documento_compensacion_resuelto
+   AND f.ejercicio_compensacion = gres.ejercicio_compensacion_resuelto
    -- Suppressed for LOTE_CONCILIACION groups (see note above): forces
    -- f.* to NULL for these rows, which also means the LEFT JOIN produces
    -- exactly 1 row per payment here instead of fanning out per invoice.
