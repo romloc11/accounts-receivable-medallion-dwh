@@ -627,6 +627,7 @@ BEGIN
 
         SELECT s.sociedad, s.cliente_id, s.ejercicio, s.documento_id, s.posicion,
                CAST(CASE
+                    WHEN s.clase_documento = 'DZ' AND s.sgtxt LIKE 'CHEQUE DEVUELTO%' THEN 'CHEQUE_DEVUELTO'   -- bounced check: the key-11 credit + its key-01/05 charge net to zero, no cash (user decision 2026-09-03)
                     WHEN s.clave_contabilizacion IN ('02','05','12') THEN 'REVERSO'
                     WHEN s.clase_documento = 'CP' AND s.clave_contabilizacion = '15' THEN 'PAGO_DIRECTO'
                     WHEN s.clase_documento = 'DZ' AND s.clave_contabilizacion = '11' THEN 'VIRGEN'
@@ -638,6 +639,7 @@ BEGIN
                     ELSE 'OTRO'
                END AS VARCHAR(16)) AS tipo_linea,
                CAST(CASE
+                    WHEN s.clase_documento = 'DZ' AND s.sgtxt LIKE 'CHEQUE DEVUELTO%' THEN NULL
                     WHEN s.clave_contabilizacion IN ('02','05','12') THEN NULL
                     WHEN s.clase_documento = 'DZ' AND s.clave_contabilizacion = '11' THEN 'BANCO'
                     WHEN s.clase_documento = 'CP' AND s.clave_contabilizacion = '15' THEN 'DIRECTO'
@@ -1073,6 +1075,7 @@ BEGIN
         LEFT JOIN gold.fact_pagos c ON c.sociedad = p.sociedad AND c.documento_id = r.c_documento AND c.ejercicio = r.c_ejercicio AND c.posicion = r.c_posicion
         LEFT JOIN #hijo1 h1 ON h1.sociedad = c.sociedad AND h1.ejercicio = c.ejercicio AND h1.documento_id = c.documento_id
         WHERE p.tipo_linea = 'PAGO_DIRECTO' AND p.es_efectivo = 0 AND p.revertido = 0
+          AND ISNULL(c.tipo_linea, '') <> 'CHEQUE_DEVUELTO'   -- a re-issue of a bounced check carries no money either
           AND p.fecha_contabilizacion >= @fecha_desde
           AND (@fecha_hasta IS NULL OR p.fecha_contabilizacion < @fecha_hasta);
 
@@ -1501,6 +1504,12 @@ BEGIN
                v.monto - ISNULL(ao.aplicado, 0),
                'PAGO', 'NO_IDENTIFICADA',
                CASE WHEN v.estado_sap = 'ABIERTO' THEN 'ORIGEN_ABIERTO'
+                    -- the remainder is (at most) what the child still holds OPEN in bsid: SAP has not applied it yet
+                    WHEN h.documento_id IS NOT NULL
+                     AND v.monto - ISNULL(ao.aplicado, 0) <= 1.00 + ISNULL((SELECT SUM(c.monto_moneda_local) FROM gold.fact_pagos c
+                                                                          WHERE c.sociedad = v.sociedad AND c.ejercicio = h.ejercicio AND c.documento_id = h.documento_id
+                                                                            AND c.tipo_linea = 'APLICACION_HIJO' AND c.estado_sap = 'ABIERTO'), 0)
+                         THEN 'SOBRANTE_EN_HIJO'
                     WHEN ISNULL(g.num_recibe, 0) >= 1 THEN 'GRUPO_AMBIGUO'   -- 2+ receiving docs with 2+ candidates, or candidates that do not fit / were capped
                     WHEN EXISTS (SELECT 1 FROM gold.fact_pagos c WHERE c.sociedad = v.sociedad AND c.ejercicio = h.ejercicio AND c.documento_id = h.documento_id AND c.tipo_linea = 'APLICACION_HIJO') THEN 'CADENA_AMBIGUA'
                     WHEN ISNULL(g.num_recibe, 0) = 0 THEN 'SIN_DOCUMENTO_EN_GRUPO'
@@ -1563,6 +1572,130 @@ BEGIN
                  OR EXISTS (SELECT 1 FROM #veh  w WHERE w.documento_id = v.origen_documento AND w.ejercicio = v.origen_ejercicio AND w.posicion = v.origen_posicion AND w.es_origen_efectivo = 0))
           );
         SET @n_r0 = @n_r0 + @@ROWCOUNT;
+
+        -- ------------------------------------------------------------------
+        -- Step 5c: R6 - identified at LOT level (user decision 2026-09-03). The money
+        -- demonstrably went into a set of invoices, but the split per invoice is not unique
+        -- (several candidates, notes referencing invoices paid elsewhere, K deposits merged
+        -- into one child). The row keeps documento_recibe NULL and records the lot instead.
+        -- Never a guess: nothing is attributed to any single invoice.
+        -- ------------------------------------------------------------------
+        DECLARE @lote_max_facturas INT = 20;          -- a lot a person can still read
+        DECLARE @lote_min_cobertura DECIMAL(5,4) = 0.50;  -- or the money is most of the lot
+
+        -- (a) LOTE_EN_GRUPO: the unidentified candidates of a cleared group fit in what its
+        --     invoices have left after every identified row of that group.
+        IF OBJECT_ID('tempdb..#lote_grupo') IS NOT NULL DROP TABLE #lote_grupo;
+        SELECT r.documento_compensacion, r.ejercicio_compensacion,
+               COUNT(*) AS num_facturas, SUM(r.monto_moneda_local) AS monto_facturas,
+               SUM(r.monto_moneda_local) - ISNULL(MAX(i.identificado), 0) AS restante,
+               ISNULL(MAX(u.no_identificado), 0) AS no_identificado
+        INTO #lote_grupo
+        FROM #recibe r
+        LEFT JOIN (SELECT documento_compensacion, ejercicio_compensacion, SUM(monto_aplicado) AS identificado
+                   FROM gold.fact_aplicacion WHERE regla <> 'R0' GROUP BY documento_compensacion, ejercicio_compensacion) i
+               ON i.documento_compensacion = r.documento_compensacion AND i.ejercicio_compensacion = r.ejercicio_compensacion
+        LEFT JOIN (SELECT documento_compensacion, ejercicio_compensacion, SUM(monto_aplicado) AS no_identificado
+                   FROM gold.fact_aplicacion WHERE regla = 'R0' AND estatus_identificacion = 'NO_IDENTIFICADA' AND documento_compensacion IS NOT NULL
+                   GROUP BY documento_compensacion, ejercicio_compensacion) u
+               ON u.documento_compensacion = r.documento_compensacion AND u.ejercicio_compensacion = r.ejercicio_compensacion
+        WHERE r.documento_compensacion IS NOT NULL
+        GROUP BY r.documento_compensacion, r.ejercicio_compensacion
+        HAVING ISNULL(MAX(u.no_identificado), 0) > 0
+           AND ISNULL(MAX(u.no_identificado), 0) <= SUM(r.monto_moneda_local) - ISNULL(MAX(i.identificado), 0) + 1.00;
+        CREATE UNIQUE CLUSTERED INDEX IX_lg ON #lote_grupo (documento_compensacion, ejercicio_compensacion);
+
+        UPDATE f
+        SET f.estatus_identificacion = 'IDENTIFICADA_LOTE',
+            f.motivo_no_identificado = 'LOTE_EN_GRUPO',
+            f.nivel_certeza          = 3,
+            f.documento_lote         = l.documento_compensacion,
+            f.ejercicio_lote         = l.ejercicio_compensacion,
+            f.num_facturas_lote      = l.num_facturas,
+            f.monto_facturas_lote    = l.monto_facturas
+        FROM gold.fact_aplicacion f
+        JOIN #lote_grupo l ON l.documento_compensacion = f.documento_compensacion AND l.ejercicio_compensacion = f.ejercicio_compensacion
+        WHERE f.regla = 'R0' AND f.estatus_identificacion = 'NO_IDENTIFICADA'
+          AND f.motivo_no_identificado IN ('GRUPO_AMBIGUO', 'SIN_REGLA')
+          -- gate: a lot is only an identification when the ambiguity is bounded. Either the
+          -- lot is small enough to be read by a person, or the money is essentially the whole
+          -- lot. "$300 somewhere inside 1,400 invoices" is noise, not an identification.
+          AND (l.num_facturas <= @lote_max_facturas
+               OR (l.monto_facturas > 0 AND f.monto_aplicado >= @lote_min_cobertura * l.monto_facturas))
+          AND f.fecha_aplica >= @fecha_desde AND (@fecha_hasta IS NULL OR f.fecha_aplica < @fecha_hasta);
+
+        -- (b) LOTE_EN_HIJO: K deposits merged into one child whose lines are all applied (or
+        --     still open) and together account for those deposits: each deposit is identified
+        --     through the child, without knowing which invoice took which deposit.
+        IF OBJECT_ID('tempdb..#lote_hijo') IS NOT NULL DROP TABLE #lote_hijo;
+        -- (this server cannot aggregate an expression that contains a subquery, so the
+        --  per-line flag and the per-child totals are materialised step by step)
+        IF OBJECT_ID('tempdb..#hijo_lin') IS NOT NULL DROP TABLE #hijo_lin;
+        SELECT c.sociedad, c.ejercicio, c.documento_id, c.posicion, c.monto_moneda_local,
+               CAST(CASE WHEN c.estado_sap = 'ABIERTO' THEN 1
+                         WHEN EXISTS (SELECT 1 FROM gold.fact_aplicacion a
+                                       WHERE a.sociedad         = c.sociedad
+                                         AND a.documento_aplica = c.documento_id
+                                         AND a.ejercicio_aplica = c.ejercicio
+                                         AND a.posicion_aplica  = c.posicion
+                                         AND a.regla <> 'R0') THEN 1
+                         ELSE 0 END AS TINYINT) AS aplicada_o_abierta
+        INTO #hijo_lin
+        FROM gold.fact_pagos c
+        JOIN #hijo1 h ON h.sociedad = c.sociedad AND h.ejercicio = c.ejercicio AND h.documento_id = c.documento_id
+        WHERE c.tipo_linea = 'APLICACION_HIJO';
+
+        IF OBJECT_ID('tempdb..#hijo_tot') IS NOT NULL DROP TABLE #hijo_tot;
+        SELECT sociedad, ejercicio, documento_id,
+               SUM(monto_moneda_local) AS total_hijo,
+               SUM(CASE WHEN aplicada_o_abierta = 1 THEN monto_moneda_local ELSE 0 END) AS aplicado_o_abierto
+        INTO #hijo_tot
+        FROM #hijo_lin
+        GROUP BY sociedad, ejercicio, documento_id;
+
+        -- invoices actually reached through that child (the lot the money went into)
+        IF OBJECT_ID('tempdb..#hijo_fac') IS NOT NULL DROP TABLE #hijo_fac;
+        SELECT a.sociedad, a.ejercicio_aplica AS ejercicio, a.documento_aplica AS documento_id,
+               COUNT(DISTINCT a.documento_recibe) AS num_facturas,
+               SUM(a.monto_aplicado)              AS monto_facturas
+        INTO #hijo_fac
+        FROM gold.fact_aplicacion a
+        JOIN #hijo1 h ON h.sociedad = a.sociedad AND h.ejercicio = a.ejercicio_aplica AND h.documento_id = a.documento_aplica
+        WHERE a.regla <> 'R0'
+        GROUP BY a.sociedad, a.ejercicio_aplica, a.documento_aplica;
+
+        SELECT t.sociedad, t.ejercicio, t.documento_id,
+               ISNULL(fc.num_facturas, 0)   AS num_facturas,
+               ISNULL(fc.monto_facturas, 0) AS monto_facturas
+        INTO #lote_hijo
+        FROM #hijo_tot t
+        JOIN (SELECT v.sociedad, v.ejercicio_hijo, v.documento_hijo, SUM(v.monto_moneda_local) AS total_virgenes
+              FROM gold.fact_pagos v WHERE v.tipo_linea = 'VIRGEN' AND v.revertido = 0 AND v.es_reembolso = 0
+              GROUP BY v.sociedad, v.ejercicio_hijo, v.documento_hijo) tv
+          ON tv.sociedad = t.sociedad AND tv.ejercicio_hijo = t.ejercicio AND tv.documento_hijo = t.documento_id
+        LEFT JOIN #hijo_fac fc
+          ON fc.sociedad = t.sociedad AND fc.ejercicio = t.ejercicio AND fc.documento_id = t.documento_id
+        WHERE t.aplicado_o_abierto >= t.total_hijo - 1.00
+          AND t.total_hijo         >= tv.total_virgenes - 1.00;
+        CREATE UNIQUE CLUSTERED INDEX IX_lh ON #lote_hijo (sociedad, ejercicio, documento_id);
+
+        UPDATE f
+        SET f.estatus_identificacion = 'IDENTIFICADA_LOTE',
+            f.motivo_no_identificado = 'LOTE_EN_HIJO',
+            f.nivel_certeza          = 3,
+            f.documento_lote         = l.documento_id,
+            f.ejercicio_lote         = l.ejercicio,
+            f.num_facturas_lote      = l.num_facturas,
+            f.monto_facturas_lote    = l.monto_facturas
+        FROM gold.fact_aplicacion f
+        JOIN gold.fact_pagos p ON p.sociedad = f.sociedad AND p.documento_id = f.documento_aplica AND p.ejercicio = f.ejercicio_aplica AND p.posicion = f.posicion_aplica
+        JOIN #lote_hijo l ON l.sociedad = p.sociedad AND l.ejercicio = p.ejercicio_hijo AND l.documento_id = p.documento_hijo
+        WHERE f.regla = 'R0' AND f.estatus_identificacion = 'NO_IDENTIFICADA' AND f.tipo_aplicacion = 'PAGO'
+          AND f.motivo_no_identificado IN ('CADENA_AMBIGUA', 'SIN_DOCUMENTO_EN_GRUPO', 'GRUPO_AMBIGUO', 'SIN_REGLA')
+          -- same gate as (a); a child's lot is small by construction, this only keeps it that way
+          AND (l.num_facturas <= @lote_max_facturas
+               OR (l.monto_facturas > 0 AND f.monto_aplicado >= @lote_min_cobertura * l.monto_facturas))
+          AND f.fecha_aplica >= @fecha_desde AND (@fecha_hasta IS NULL OR f.fecha_aplica < @fecha_hasta);
 
         -- ------------------------------------------------------------------
         -- SCD2 keys of the payer, resolved on the origin date when known

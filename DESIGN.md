@@ -159,7 +159,7 @@ Documented here because the full design was already discussed, but building them
 
 ### `gold.fact_aplicacion` — application-of-money fact, v2 strategy (designed and PROTOTYPED 2026-09-03)
 
-**Status: built on the server as a prototype for the July-2026-onward window, gated, and compared against the current view (Phase 7 below). Decision on which strategy survives: pending the user.** It is a parallel strategy to `gold.vw_pago_factura_simple` / `fact_pagos_compensados` / `fact_facturas_compensadas`, which stay untouched. Objects: `gold.dim_tipo_documento`, `gold.fact_facturas`, `gold.fact_notas`, `gold.fact_pagos`, `gold.fact_aplicacion` (plural names, user decision) — DDL in `03_gold/ddl_fact_aplicacion.sql` (**each section is DROP+CREATE: run only the section you need, never the whole file**), procedures in `03_gold/sp_load_fact_aplicacion.sql` (safe to run whole), comparison in `03_gold/comparacion_fact_aplicacion_vs_vw_simple.sql` (read-only). Phases 1–4 were run against `silver.sap_bsad`/`silver.sap_bsid`/`bronze.sap_bsid`; the numbers in the BLART table come from those queries.
+**Status: ADOPTED (user decision 2026-09-04). v2 is the strategy going forward.** `gold.vw_pago_factura_simple` is *not* deleted: it stays as the dashboard's source until the operational work in "What is left before v2 replaces the view" is done, so there is a working reference to fall back on. Built and loaded for the July-2026-onward window, gated, compared against the view (Phase 7), then extended with rules R6 and the bounced-check exclusion (Phase 8). It is a parallel strategy to `gold.vw_pago_factura_simple` / `fact_pagos_compensados` / `fact_facturas_compensadas`, which stay untouched. Objects: `gold.dim_tipo_documento`, `gold.fact_facturas`, `gold.fact_notas`, `gold.fact_pagos`, `gold.fact_aplicacion` (plural names, user decision) — DDL in `03_gold/ddl_fact_aplicacion.sql` (**each section is DROP+CREATE: run only the section you need, never the whole file**), procedures in `03_gold/sp_load_fact_aplicacion.sql` (safe to run whole), comparison in `03_gold/comparacion_fact_aplicacion_vs_vw_simple.sql` (read-only). Phases 1–4 were run against `silver.sap_bsad`/`silver.sap_bsid`/`bronze.sap_bsid`; the numbers in the BLART table come from those queries.
 
 #### Phase 6 — what was built, how it was gated (2026-09-03)
 
@@ -198,6 +198,45 @@ Every object was loaded with `EXEC gold.load_<x> '2026-07-01'` and had to pass a
 | v2 unidentified, non-marketplace customers | | $1.06M of $142.4M (**99.3%** identified) |
 
 Reading: both strategies agree on the cash of the month to within the double-counted child lines. Coverage is equivalent (93.5% vs 92.7%) — and the 0.8 points the view has on top are almost entirely Mercado Libre groups where a deposit is prorated across many invoices while SA commission credits sit in the same group, which is a guess the design forbids. v2 adds CP, open partial payments, 2-hop chains, AB credit re-applications, reversal exclusion, and a `regla`/`nivel_certeza`/`origen` on every row. **Recommendation: v2.** What remains before it can replace the view is operational, not analytical: historical backfill (2022→2026, by fiscal year), wiring into `gold.load_gold`, `clasificacion_cobranza` agreed with the business, and the `PASARELA` split (open item 4).
+
+#### Phase 8 — what the residual unidentified population turned out to be (2026-09-04)
+
+Phase 7 left $5.6M of July cash unidentified inside the view's scope. Reading the real documents in SAP (three cases the user pulled up in FB03) split that population into five patterns, and only two of them were worth a rule.
+
+**Bounced checks are not cash.** A DZ carrying `sgtxt LIKE 'CHEQUE DEVUELTO%'` posts a key-11 credit and a key-01/05 charge that net to zero: the money never arrived. It was being counted as a virgin deposit and then reported as unidentified, which is doubly wrong. `tipo_linea='CHEQUE_DEVUELTO'` now takes precedence over every other classification in `fact_pagos`, with `origen_efectivo=NULL` and `es_efectivo=0`; a re-issue of a bounced check is not a vehicle either. July: 21 lines across 5 documents leave the cash (case `1402610262`, $3,287.01).
+
+**Leftovers inside a child are their own motive.** When a deposit's child has applied everything it could and the remainder is sitting in an open line of that same child, the deposit is not ambiguous — it is partly unapplied. `SOBRANTE_EN_HIJO` (28 rows / $38,787 in July) separates that from real ambiguity. Case `1402610486`: $30,835.20 of $32,238.60 identified by R4 across 21 invoices, $1,403.40 still open in the child.
+
+**Lot-level identification (R6).** The genuinely ambiguous cases are Mercado Libre multi-invoice/multi-note groups and merged-deposit children: SAP proves *which set* of invoices took the money, not which invoice took which peso. R6 records the set. It is deliberately a third status (`IDENTIFICADA_LOTE`), not `IDENTIFICADA` — a lot is evidence, not an application, and `monto_aplicado` still never lands on an invoice.
+
+R6 was **wrong on first build and was tightened before adoption**: without a gate it marked $17.67M in July at an average lot size of **667 invoices**, and 426 of its 998 rows covered less than 50% of their lot. "This $300 entered one of 1,400 invoices" is noise wearing the label of a result, and it would have summed as identified in a dashboard — exactly what the "prefer `Pago no identificado`" principle exists to prevent. With the gate (`num_facturas_lote <= 20` **or** coverage `>= 50%`, both `DECLARE`d at the top of the R6 block so they can be re-tuned):
+
+| July 2026, all customers | rows | amount |
+|---|---:|---:|
+| `IDENTIFICADA` | 85,206 | $190,597,188.98 |
+| `IDENTIFICADA_LOTE` / `LOTE_EN_GRUPO` | 572 | $17,117,339.09 |
+| `IDENTIFICADA_LOTE` / `LOTE_EN_HIJO` | 14 | $62,931.41 |
+| `NO_IDENTIFICADA` / `CADENA_AMBIGUA` | 627 | $9,428,408.77 |
+| `NO_IDENTIFICADA` / `GRUPO_AMBIGUO` | 1,786 | $3,350,354.29 |
+| `NO_IDENTIFICADA` / `SIN_DOCUMENTO_EN_GRUPO` | 2,251 | $2,700,623.67 |
+| `NO_IDENTIFICADA` / `ORIGEN_ABIERTO` | 573 | $820,467.21 |
+| `NO_IDENTIFICADA` / `SOBRANTE_EN_HIJO` | 28 | $38,787.20 |
+
+The gate returned $548,411.75 (426 rows) to `GRUPO_AMBIGUO`. Of the $16.3M of large-lot money that survives it, $12.75M is two deposits from a single `PADRE` customer that pay essentially a whole cleared group, and $3.7M is `MARKETPLACE`.
+
+**R6 barely moves the business scorecard, and that is the honest headline.** Inside the view's scope (DZ virgins, channels 10/40/60, no `SIN_RFC`/`FUERA_DE_ALCANCE`) July ends at 10,937 deposits / $135,208,456 identified, 25 / $239,017 at lot level, and **166 deposits / $5,683,948 still unidentified** — the payment-gateway money (Kushky, Conekta) plus Mercado Libre groups, which no strategy can resolve from `bsad` alone. The big lots R6 does capture live outside that scope. R6 earns its place by being correct, not by improving the number.
+
+All three invariants stayed at `0 | 0 | 0` through every iteration of this phase.
+
+#### What is left before v2 replaces the view
+
+Operational, not analytical — the view stays the dashboard's source until these are done:
+
+1. Historical backfill 2022→2026 of `fact_facturas`, `fact_notas`, `fact_pagos`, `fact_aplicacion`, by fiscal year, same 2GB-log discipline as `silver.sap_bsad`.
+2. Wire the five procedures into `gold.load_gold` (plain `EXEC` lines, in dependency order, only after each has run clean alone).
+3. Agree `clasificacion_cobranza` with the business (open item 1 below).
+4. The `PASARELA` / `MARKETPLACE` split (open item 4 below) — it is what makes "unidentifiable by nature" reportable separately from "we failed to identify it".
+5. Cosmetic: `SIN_REGLA` still appears as a `motivo_no_identificado` value in the R6 filters although the loader no longer emits it.
 
 #### Goal and grain
 
@@ -269,6 +308,7 @@ All three `fact_doc_*` tables carry `clave_contabilizacion`, `fecha_registro_sis
 | **R3 — single-invoice group** (certainty 2) | any group with exactly 1 receiving document and 1+ applying documents (no `REBZG`) | every applying document applies its full amount to that one invoice — there is nothing to mis-attribute (this is the gate already validated on 2026-08-29 in `vw_pago_factura_simple`) | never used when the group has 2+ receiving documents |
 | **R4 — DZ virgin → child → invoice** (certainty 3) | DZ virgins whose child group contains receiving documents | walk `documento_hijo`; inside the child group apply R1 if `REBZG` present, else R3. A 2nd hop (child cleared further, exactly one onward group) is followed once, same as the 2026-09-03 `salto_h` logic in `vw_pago_factura_simple`; 3+ hops → `SALTO_NO_RESUELTO` | never allocates proportionally (see below) |
 | **R5 — AB credit re-application** (certainty 1 with `REBZG`, 2 by group) | AB lines with **posting key 17 or 15 and amount > 0** (never by text) | R1 if `REBZG` (65,590 lines / $164.6M), else R3 on the line's own group; `tipo_aplicacion='CREDITO_REAPLICADO'` (key 17) or `'SALDO_A_FAVOR'` (key 15, pool account `10006317`). `documento_origen_credito` = the document(s) cleared by the same AB's key-07 twin line in *its* group (C1 `3100754232` in the real case) — recorded when that group has exactly one credit document, else `NULL`; origin certainty is independent of application certainty | never applies a $0.00 line, a key-07 line, or a same-customer 17/07 re-posting pair on its own (that credit applies later, in the group where the 17 line is finally cleared) |
+| **R6 — identified at LOT level** (certainty 3, added 2026-09-04) | R0 rows whose money demonstrably entered a *set* of invoices, but whose split per invoice is not unique | two shapes. (a) `LOTE_EN_GRUPO`: the unidentified money of a cleared group fits in what that group's invoices have left after every identified row of the group. (b) `LOTE_EN_HIJO`: K deposits merged into one child whose lines are all applied or still open and together account for those deposits. Both keep `documento_recibe` NULL and record the lot instead (`documento_lote`, `ejercicio_lote`, `num_facturas_lote`, `monto_facturas_lote`), `estatus_identificacion='IDENTIFICADA_LOTE'`. **Bounded-ambiguity gate:** only accepted when `num_facturas_lote <= @lote_max_facturas` (20) **or** the money covers `>= @lote_min_cobertura` (50%) of the lot | never attributes anything to a single invoice; never calls it identified when the ambiguity is unbounded — "$300 somewhere inside 1,400 invoices" goes back to `NO_IDENTIFICADA` |
 | **R0 — unidentified** | everything that survives none of the above | row with receiving side NULL, `monto_aplicado` = the applying document's amount, `motivo_no_identificado` set | never invents a match |
 
 **Deliberate difference from `vw_pago_factura_simple`: no proportional allocation.** `monto_pago_asignado` there splits one payment across N invoices by invoice weight — safe for summing, but it is a heuristic, and this fact promises "the amount SAP lets us prove". When a group has M payments and N invoices and no `REBZG` on either side, the correspondence is genuinely unknowable and every payment in it goes to R0 with `GRUPO_AMBIGUO` — less coverage, no invented rows. The 4 July-2026 `LOTE_CONCILIACION` groups ($166K) are exactly this case and stay unidentified here too.
@@ -296,12 +336,14 @@ Against SAP: total of DZ+CP virgins per month by `fecha_contabilizacion` = the S
 3. **`REBZG='V'`** — "no invoice reference, own due date"; treated as empty. See "Compensation mechanics".
 4. **Reversals** — no `BKPF` needed: original + reversal always share a group anchored by the reversal, net zero, paired posting keys. See "Reversal map" and R2(b). `BKPF` (`TCODE`, `USNAM`, `STBLG`) was still the only way to *see* who/what generates each document during this investigation — the note in `01_bronze/ddl_bronze.sql` saying it has no consumer is now only true for the pipeline, not for analysis; sourcing it stays optional.
 
-#### Still open (decide before Phase 6)
+#### Still open
 
 1. **`clasificacion_cobranza`:** the three labels (`PAGO_ANTICIPADO` / `PAGO_A_VENCIMIENTO` / `PAGO_A_MES`) are deliberately not defined here — the month-cohort vs exact-day question was quantified on 2026-08-26 for the current view (<4% either way) but has to be re-agreed with the business for this fact, which now also covers open partial payments.
 2. **Documents that vanish from `bsid` without reaching `bsad`:** with the reversal mechanics now understood (a reversal always lands in `bsad` together with its original), a document missing from both sources is most likely an archived or re-keyed item, not a reversal — confirm with a real case before deciding between `REVERTIDO` and a different status name.
-3. **AB key-17 lines without `REBZG` and without a same-amount twin (34,010 / $459.2M):** quantify in Phase 6 how many resolve by R3 (single invoice in their group) vs. stay `GRUPO_AMBIGUO`.
+3. ~~**AB key-17 lines without `REBZG` and without a same-amount twin (34,010 / $459.2M):** quantify how many resolve by R3 vs. stay `GRUPO_AMBIGUO`.~~ Resolved in Phase 6: they resolve through R3/R4 in their own group; what remains is in the `GRUPO_AMBIGUO` line of the Phase 8 table.
 4. **`PASARELA` vs `MARKETPLACE` in `gold.dim_cliente.tipo_cliente` (backlog, approved 2026-09-03):** the single `MARKETPLACE` value today covers two different behaviours. Payment gateways (Kushky, Conekta, Openpay "INGRESOS TRANSITORIA", Mercado Pago) receive aggregated end-buyer money and clear DZ against DZ or SA with no customer invoice — unidentifiable by nature, for any strategy. Marketplaces proper (Amazon, Mercado Libre and variants, Claro Shop) hold real F4 invoices and their payments are identifiable like anyone else's (with `SA "COMISIONES MELI"` netting in between). Splitting them is a small additive change to `dim_cliente` and its load — deliberately outside this design's scope; until then the Phase 7 scorecard breaks unidentified cash down by account name inside `MARKETPLACE`.
 5. **`vw_pago_factura_simple` and reversed deposits (outside this design's scope, flagged only):** its virgin filter (`sgtxt` text + `debe_haber<>'S'`) admits a reversed virgin (key 11, with text) and nothing removes it, because the reversal line (key 02, `S`) is filtered out — the 537 key-02 lines / $17.9M are the upper bound of the effect. Measure before touching that view; not part of this proposal.
+
+Decisions already taken on 2026-09-04: **v2 is adopted**; `vw_pago_factura_simple` is kept, not deleted, until the operational list above is done; ambiguity is reported at lot level (`IDENTIFICADA_LOTE`) only when it is bounded; bounced checks are not cash.
 
 Decisions already taken on 2026-09-03: one general `fact_aplicacion` (not cash-only); CP is included even though 99.6% of it is channel 20; D1 sits on the debt side; `bsid` is a source for all three document families; AB enters only through R5 by posting key; ZY, ZZ, SA (except `REEM*`) and every reversed pair are out.

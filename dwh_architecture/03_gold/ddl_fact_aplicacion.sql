@@ -192,6 +192,8 @@ GO
 --      TRASPASO_08      DZ key 08 (S) in a non-child document - consumes some other credit (see origen_efectivo of its 15 sibling)
 --      CONSUME_CREDITO  DZ key 07 (S) - clears an existing credit, like AB 07
 --      REVERSO          key 02/05/12 (S) - the FB08 reversal document's own line
+--      CHEQUE_DEVUELTO  any DZ line with sgtxt 'CHEQUE DEVUELTO%' - a bounced check: the key-11 credit
+--                       and its key-01/05 charge net to zero, no cash (user decision 2026-09-03)
 --      OTRO             01/04/06/16 - manual postings and payment differences
 --    origen_efectivo (only for VIRGEN / PAGO_DIRECTO; NULL otherwise). For a PAGO_DIRECTO
 --    whose document carries a key-08 sibling, the origin is what that 08 line consumes in
@@ -332,8 +334,12 @@ CREATE TABLE gold.fact_aplicacion (
 
     -- classification
     tipo_aplicacion              VARCHAR(20)   NOT NULL,  -- PAGO / NOTA_CREDITO / DEVOLUCION / CREDITO_REAPLICADO / SALDO_A_FAVOR
-    estatus_identificacion       VARCHAR(20)   NOT NULL,  -- IDENTIFICADA / NO_IDENTIFICADA
-    motivo_no_identificado       VARCHAR(30)   NULL,      -- SIN_DOCUMENTO_EN_GRUPO / GRUPO_AMBIGUO / CADENA_AMBIGUA / ORIGEN_ABIERTO / SIN_REGLA
+    estatus_identificacion       VARCHAR(20)   NOT NULL,  -- IDENTIFICADA (one invoice) / IDENTIFICADA_LOTE (a set of invoices, split not unique - rule R6) / NO_IDENTIFICADA
+    motivo_no_identificado       VARCHAR(30)   NULL,      -- NO_IDENTIFICADA: SIN_DOCUMENTO_EN_GRUPO / GRUPO_AMBIGUO / CADENA_AMBIGUA / ORIGEN_ABIERTO / SOBRANTE_EN_HIJO / SIN_REGLA. IDENTIFICADA_LOTE: LOTE_EN_GRUPO / LOTE_EN_HIJO
+    documento_lote               VARCHAR(10)   NULL,      -- R6 only: the compensation group (LOTE_EN_GRUPO) or the child document (LOTE_EN_HIJO) that absorbed the money
+    ejercicio_lote               INT           NULL,
+    num_facturas_lote            INT           NULL,      -- how many invoices the lot settled
+    monto_facturas_lote          DECIMAL(15,2) NULL,      -- their total
 
     -- traceability
     documento_compensacion       VARCHAR(10)   NULL,      -- group where vehicle and receiving document met (NULL when the receiving is still open)
