@@ -23,8 +23,8 @@ fecha_aplica (its VEHICLE's posting date). Those are different axes: an applicat
 vehicle posted in 2023-12 but cleared in 2024-01 belongs to Phase B chunk 2023H2 while
 its payment row belongs to Phase A chunk 2024H1. So:
 
-  PHASE A - fact_facturas, fact_notas, fact_pagos, ALL 9 chunks, 2022H1 -> 2026H1.
-  PHASE B - fact_aplicacion, all 9 chunks, ONLY after Phase A is completely finished.
+  PHASE A - fact_facturas, fact_notas, fact_pagos, ALL 5 chunks, 2022 -> 2026H1.
+  PHASE B - fact_aplicacion, all 5 chunks, ONLY after Phase A is completely finished.
 
 fact_aplicacion reads all three document facts; the three document facts do not read each
 other, so their order inside a chunk is free.
@@ -41,7 +41,9 @@ RULES
 3. Every chunk is idempotent. fact_aplicacion deletes its window and rebuilds it; the
    document facts UPDATE by PK and INSERT what is new. Re-running a chunk that failed
    halfway (or where the VPN dropped) is safe.
-4. Msg 9002 (transaction log full, 2 GB fixed): split THAT chunk into quarters and run each
+4. CHUNK SIZE IS ONE YEAR. Msg 9002 (transaction log full, 2 GB fixed): split THAT year into
+   two halves ('2023-01-01','2023-07-01' then '2023-07-01','2024-01-01'), and if a half still
+   breaks, into quarters. Re-run each
    separately with the same EXEC and a narrower range. Same discipline as the
    silver.sap_bsad backfill. Recovery model is SIMPLE and the procedures use no explicit
    transactions, so the log truncates between statements.
@@ -60,12 +62,23 @@ EXPECTED, NOT A BUG
 - Each Phase B chunk is slower than the last. R6 and the cumulative caps read the whole
   fact (a clearing group can span windows - that is deliberate), so the scans grow with
   the table.
+- CORRECTION 2026-09-04: an earlier version of this header claimed the caps already read the
+  whole fact. They did not - all three were filtered to the load window, so an invoice paid
+  across two chunks was capped twice against an empty slate. The first backfill attempt ended
+  with 605 over-applied invoices ($1.10M) and 22 over-applied origins, growing with every
+  chunk. Fixed in sp_load_fact_aplicacion.sql: the three caps are now global, and the
+  per-receiving and per-origin caps order chronologically FIRST so the earliest application
+  consumes the document and a later window can never trim a row an earlier one wrote. This
+  was a latent bug in daily mode too, not only in the backfill.
 - 6.6% of clearing groups (181,128 of 2,760,534) have documents posted in two different
   half-years. That is normal SAP behaviour and the Phase A / Phase B separation handles it.
   The one residual effect: for an early chunk, R6's "what the group has left" cannot see
   applications that later chunks will add, so early chunks may mark slightly more
   IDENTIFICADA_LOTE than a single full-history pass would. Validation query 4 measures it;
   if it looks material, re-run Phase B a second time in the same order.
+- AFTER Phase B, re-run the daily window so it is rebuilt under the same global caps:
+      EXEC gold.load_fact_aplicacion '2026-07-01';
+  Its rows are chronologically last, so they are the ones that must yield to history.
 
 --------------------------------------------------------------------------------------
 SIZING (measured 2026-09-04)
@@ -87,71 +100,39 @@ GO
 
 
 -- ########################################################################################
--- PHASE A - document facts. All 9 chunks before touching Phase B.
+-- PHASE A - document facts. All 5 chunks before touching Phase B.
 -- ########################################################################################
 
--- ---------------------------------------------------------------- 2022H1
-EXEC gold.load_fact_facturas '2022-01-01', '2022-07-01';
+-- ---------------------------------------------------------------- 2022
+EXEC gold.load_fact_facturas '2022-01-01', '2023-01-01';
 GO
-EXEC gold.load_fact_notas    '2022-01-01', '2022-07-01';
+EXEC gold.load_fact_notas    '2022-01-01', '2023-01-01';
 GO
-EXEC gold.load_fact_pagos    '2022-01-01', '2022-07-01';
-GO
-
--- ---------------------------------------------------------------- 2022H2
-EXEC gold.load_fact_facturas '2022-07-01', '2023-01-01';
-GO
-EXEC gold.load_fact_notas    '2022-07-01', '2023-01-01';
-GO
-EXEC gold.load_fact_pagos    '2022-07-01', '2023-01-01';
+EXEC gold.load_fact_pagos    '2022-01-01', '2023-01-01';
 GO
 
--- ---------------------------------------------------------------- 2023H1
-EXEC gold.load_fact_facturas '2023-01-01', '2023-07-01';
+-- ---------------------------------------------------------------- 2023
+EXEC gold.load_fact_facturas '2023-01-01', '2024-01-01';
 GO
-EXEC gold.load_fact_notas    '2023-01-01', '2023-07-01';
+EXEC gold.load_fact_notas    '2023-01-01', '2024-01-01';
 GO
-EXEC gold.load_fact_pagos    '2023-01-01', '2023-07-01';
-GO
-
--- ---------------------------------------------------------------- 2023H2
-EXEC gold.load_fact_facturas '2023-07-01', '2024-01-01';
-GO
-EXEC gold.load_fact_notas    '2023-07-01', '2024-01-01';
-GO
-EXEC gold.load_fact_pagos    '2023-07-01', '2024-01-01';
+EXEC gold.load_fact_pagos    '2023-01-01', '2024-01-01';
 GO
 
--- ---------------------------------------------------------------- 2024H1
-EXEC gold.load_fact_facturas '2024-01-01', '2024-07-01';
+-- ---------------------------------------------------------------- 2024
+EXEC gold.load_fact_facturas '2024-01-01', '2025-01-01';
 GO
-EXEC gold.load_fact_notas    '2024-01-01', '2024-07-01';
+EXEC gold.load_fact_notas    '2024-01-01', '2025-01-01';
 GO
-EXEC gold.load_fact_pagos    '2024-01-01', '2024-07-01';
-GO
-
--- ---------------------------------------------------------------- 2024H2
-EXEC gold.load_fact_facturas '2024-07-01', '2025-01-01';
-GO
-EXEC gold.load_fact_notas    '2024-07-01', '2025-01-01';
-GO
-EXEC gold.load_fact_pagos    '2024-07-01', '2025-01-01';
+EXEC gold.load_fact_pagos    '2024-01-01', '2025-01-01';
 GO
 
--- ---------------------------------------------------------------- 2025H1
-EXEC gold.load_fact_facturas '2025-01-01', '2025-07-01';
+-- ---------------------------------------------------------------- 2025
+EXEC gold.load_fact_facturas '2025-01-01', '2026-01-01';
 GO
-EXEC gold.load_fact_notas    '2025-01-01', '2025-07-01';
+EXEC gold.load_fact_notas    '2025-01-01', '2026-01-01';
 GO
-EXEC gold.load_fact_pagos    '2025-01-01', '2025-07-01';
-GO
-
--- ---------------------------------------------------------------- 2025H2
-EXEC gold.load_fact_facturas '2025-07-01', '2026-01-01';
-GO
-EXEC gold.load_fact_notas    '2025-07-01', '2026-01-01';
-GO
-EXEC gold.load_fact_pagos    '2025-07-01', '2026-01-01';
+EXEC gold.load_fact_pagos    '2025-01-01', '2026-01-01';
 GO
 
 -- ---------------------------------------------------------------- 2026H1
@@ -174,36 +155,20 @@ GO
 -- Check "invariants -> 0 | 0 | 0" after each chunk before running the next.
 -- ########################################################################################
 
--- ---------------------------------------------------------------- 2022H1
-EXEC gold.load_fact_aplicacion '2022-01-01', '2022-07-01';
+-- ---------------------------------------------------------------- 2022
+EXEC gold.load_fact_aplicacion '2022-01-01', '2023-01-01';
 GO
 
--- ---------------------------------------------------------------- 2022H2
-EXEC gold.load_fact_aplicacion '2022-07-01', '2023-01-01';
+-- ---------------------------------------------------------------- 2023
+EXEC gold.load_fact_aplicacion '2023-01-01', '2024-01-01';
 GO
 
--- ---------------------------------------------------------------- 2023H1
-EXEC gold.load_fact_aplicacion '2023-01-01', '2023-07-01';
+-- ---------------------------------------------------------------- 2024
+EXEC gold.load_fact_aplicacion '2024-01-01', '2025-01-01';
 GO
 
--- ---------------------------------------------------------------- 2023H2
-EXEC gold.load_fact_aplicacion '2023-07-01', '2024-01-01';
-GO
-
--- ---------------------------------------------------------------- 2024H1
-EXEC gold.load_fact_aplicacion '2024-01-01', '2024-07-01';
-GO
-
--- ---------------------------------------------------------------- 2024H2
-EXEC gold.load_fact_aplicacion '2024-07-01', '2025-01-01';
-GO
-
--- ---------------------------------------------------------------- 2025H1
-EXEC gold.load_fact_aplicacion '2025-01-01', '2025-07-01';
-GO
-
--- ---------------------------------------------------------------- 2025H2
-EXEC gold.load_fact_aplicacion '2025-07-01', '2026-01-01';
+-- ---------------------------------------------------------------- 2025
+EXEC gold.load_fact_aplicacion '2025-01-01', '2026-01-01';
 GO
 
 -- ---------------------------------------------------------------- 2026H1

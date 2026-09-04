@@ -1228,9 +1228,17 @@ BEGIN
         -- ------------------------------------------------------------------
         -- Delete the window before inserting
         -- ------------------------------------------------------------------
-        DELETE FROM gold.fact_aplicacion
-        WHERE fecha_aplica >= @fecha_desde AND (@fecha_hasta IS NULL OR fecha_aplica < @fecha_hasta);
-        SET @n_del = @@ROWCOUNT;
+        -- Batched: a full-year window is ~1M rows and one DELETE fills the 2GB log
+        -- ('ACTIVE_TRANSACTION'). 50K at a time lets SIMPLE recovery truncate between batches.
+        SET @n_del = 0;
+        DECLARE @lote_borrado INT = 1;
+        WHILE @lote_borrado > 0
+        BEGIN
+            DELETE TOP (50000) FROM gold.fact_aplicacion
+            WHERE fecha_aplica >= @fecha_desde AND (@fecha_hasta IS NULL OR fecha_aplica < @fecha_hasta);
+            SET @lote_borrado = @@ROWCOUNT;
+            SET @n_del = @n_del + @lote_borrado;
+        END
 
         -- ------------------------------------------------------------------
         -- Step 3: R1 - REBZG. Counts only when vehicle and receiving document met in the
@@ -1372,7 +1380,17 @@ BEGIN
           AND v.monto >= g4.restante_recibe - 1.00
           AND (g4.num_recibe >= 2 OR v.monto > g4.restante_recibe + 1.00)   -- the single-receiver "fits" case belongs to R3
           AND r.monto_moneda_local - ISNULL(a.aplicado_r1, 0) > 0.01
-          AND NOT EXISTS (SELECT 1 FROM #r1 x WHERE x.sociedad = v.sociedad AND x.cliente_id = v.cliente_id AND x.ejercicio = v.ejercicio AND x.documento_id = v.documento_id AND x.posicion = v.posicion);
+          AND NOT EXISTS (SELECT 1 FROM #r1 x WHERE x.sociedad = v.sociedad AND x.cliente_id = v.cliente_id AND x.ejercicio = v.ejercicio AND x.documento_id = v.documento_id AND x.posicion = v.posicion)
+          -- and never a (vehicle, receiving) pair R1 or R3 already wrote: R3 settles the pair and
+          -- R4 would add its rounding remainder as a second row (fixed 2026-09-04)
+          AND NOT EXISTS (SELECT 1 FROM gold.fact_aplicacion e
+                          WHERE e.sociedad          = v.sociedad
+                            AND e.documento_aplica  = v.documento_id
+                            AND e.ejercicio_aplica  = v.ejercicio
+                            AND e.posicion_aplica   = v.posicion
+                            AND e.documento_recibe  = r.documento_id
+                            AND e.ejercicio_recibe  = r.ejercicio
+                            AND e.posicion_recibe   = r.posicion);
         SET @n_r3 = @n_r3 + @@ROWCOUNT;
 
         -- ------------------------------------------------------------------
@@ -1389,8 +1407,7 @@ BEGIN
                        ORDER BY CASE regla WHEN 'R1' THEN 0 ELSE 1 END, monto_aplicado DESC, documento_recibe, posicion_recibe
                        ROWS UNBOUNDED PRECEDING) AS acumulado
             FROM gold.fact_aplicacion
-            WHERE regla <> 'R0'
-              AND fecha_aplica >= @fecha_desde AND (@fecha_hasta IS NULL OR fecha_aplica < @fecha_hasta)
+            WHERE regla <> 'R0'   -- NOT windowed: a document's rows can live in several load windows (fixed 2026-09-04)
         )
         UPDATE cap_veh
         SET monto_aplicado = CASE WHEN acumulado - monto_aplicado >= monto_documento_aplica THEN 0
@@ -1398,8 +1415,7 @@ BEGIN
         WHERE acumulado > monto_documento_aplica + 1.00;
 
         DELETE FROM gold.fact_aplicacion
-        WHERE regla <> 'R0' AND monto_aplicado <= 0
-          AND fecha_aplica >= @fecha_desde AND (@fecha_hasta IS NULL OR fecha_aplica < @fecha_hasta);
+        WHERE regla <> 'R0' AND monto_aplicado <= 0;   -- NOT windowed: matches the cap above
 
         -- ------------------------------------------------------------------
         -- Step 4b: cumulative cap per RECEIVING document. Two credit notes can both
@@ -1411,11 +1427,12 @@ BEGIN
             SELECT id_aplicacion, monto_aplicado, monto_documento_recibe,
                    SUM(monto_aplicado) OVER (
                        PARTITION BY documento_recibe, ejercicio_recibe, posicion_recibe
-                       ORDER BY CASE regla WHEN 'R1' THEN 0 ELSE 1 END, fecha_aplica, documento_aplica, posicion_aplica
+                       -- chronological FIRST: the earliest application consumes the invoice, so a later
+                       -- load window can never trim a row an earlier one already wrote (fixed 2026-09-04)
+                       ORDER BY fecha_aplica, CASE regla WHEN 'R1' THEN 0 ELSE 1 END, documento_aplica, posicion_aplica
                        ROWS UNBOUNDED PRECEDING) AS acumulado
             FROM gold.fact_aplicacion
-            WHERE regla <> 'R0'
-              AND fecha_aplica >= @fecha_desde AND (@fecha_hasta IS NULL OR fecha_aplica < @fecha_hasta)
+            WHERE regla <> 'R0'   -- NOT windowed
         )
         UPDATE cap_recibe
         SET monto_aplicado = CASE WHEN acumulado - monto_aplicado >= monto_documento_recibe THEN 0
@@ -1423,8 +1440,7 @@ BEGIN
         WHERE acumulado > monto_documento_recibe + 1.00;   -- $1.00 tolerance: SAP rounding lines (AB 07 of $0.01) make chains exceed by cents
 
         DELETE FROM gold.fact_aplicacion
-        WHERE regla <> 'R0' AND monto_aplicado <= 0
-          AND fecha_aplica >= @fecha_desde AND (@fecha_hasta IS NULL OR fecha_aplica < @fecha_hasta);
+        WHERE regla <> 'R0' AND monto_aplicado <= 0;   -- NOT windowed: matches the cap above
 
         -- ------------------------------------------------------------------
         -- Step 4c: cumulative cap per ORIGIN. A child (or an AB) can carry more than the
@@ -1441,11 +1457,10 @@ BEGIN
                    SUM(monto_aplicado) OVER (
                        PARTITION BY documento_origen, ejercicio_origen, posicion_origen
                        ORDER BY CASE WHEN documento_origen = documento_aplica AND ejercicio_origen = ejercicio_aplica AND posicion_origen = posicion_aplica THEN 0 ELSE 1 END,
-                                CASE regla WHEN 'R1' THEN 0 ELSE 1 END, fecha_aplica, documento_aplica, posicion_aplica
+                                fecha_aplica, CASE regla WHEN 'R1' THEN 0 ELSE 1 END, documento_aplica, posicion_aplica
                        ROWS UNBOUNDED PRECEDING) AS acumulado
             FROM gold.fact_aplicacion
-            WHERE regla <> 'R0' AND documento_origen IS NOT NULL
-              AND fecha_aplica >= @fecha_desde AND (@fecha_hasta IS NULL OR fecha_aplica < @fecha_hasta)
+            WHERE regla <> 'R0' AND documento_origen IS NOT NULL   -- NOT windowed
         )
         UPDATE cap_origen
         SET documento_origen = NULL, origen_resuelto = 0
@@ -1454,7 +1469,7 @@ BEGIN
         UPDATE gold.fact_aplicacion
         SET ejercicio_origen = NULL, posicion_origen = NULL, clase_documento_origen = NULL, fecha_origen = NULL, monto_documento_origen = NULL
         WHERE documento_origen IS NULL AND origen_resuelto = 0 AND regla <> 'R0'
-          AND fecha_aplica >= @fecha_desde AND (@fecha_hasta IS NULL OR fecha_aplica < @fecha_hasta);
+          AND ejercicio_origen IS NOT NULL;   -- NOT windowed: matches the cap above
 
         -- ------------------------------------------------------------------
         -- Step 5: R0 - unidentified. (a) cash origins: whatever of the deposit is not explained
