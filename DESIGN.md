@@ -157,9 +157,47 @@ Documented here because the full design was already discussed, but building them
 - **Stage 2 of the collections report** ("expected budget" — overdue/upcoming balance at the start of the month) — `vw_cartera_abierta` only solves the *forward-looking* half (from today onward). Retroactively reconstructing past months requires combining `bsid` (what's still open today and was already open on that date) with `bsad` (what was open on that date but has since been settled) — a non-trivial design, still unresolved.
 - **Collections management, write-offs/bad debt, credit-limit approval** — real business processes with no confirmed data source yet. Not designed until confirming with the team where that information lives (SAP, Excel, another system).
 
-### `gold.fact_aplicacion` — application-of-money fact, v2 strategy (designed 2026-09-03, NOT built)
+### `gold.fact_aplicacion` — application-of-money fact, v2 strategy (designed and PROTOTYPED 2026-09-03)
 
-**Status: design only. Nothing from this section exists on the server.** It is a parallel strategy to `gold.vw_pago_factura_simple` / `fact_pagos_compensados` / `fact_facturas_compensadas`, which stay untouched until the reconciliation in "Phase 7" below decides which strategy survives. Phases 1–4 (exploration, understanding, hypotheses, validation with real data) were run on 2026-09-03 against `silver.sap_bsad`/`silver.sap_bsid`/`bronze.sap_bsid`; the numbers quoted here come from those queries.
+**Status: built on the server as a prototype for the July-2026-onward window, gated, and compared against the current view (Phase 7 below). Decision on which strategy survives: pending the user.** It is a parallel strategy to `gold.vw_pago_factura_simple` / `fact_pagos_compensados` / `fact_facturas_compensadas`, which stay untouched. Objects: `gold.dim_tipo_documento`, `gold.fact_facturas`, `gold.fact_notas`, `gold.fact_pagos`, `gold.fact_aplicacion` (plural names, user decision) — DDL in `03_gold/ddl_fact_aplicacion.sql` (**each section is DROP+CREATE: run only the section you need, never the whole file**), procedures in `03_gold/sp_load_fact_aplicacion.sql` (safe to run whole), comparison in `03_gold/comparacion_fact_aplicacion_vs_vw_simple.sql` (read-only). Phases 1–4 were run against `silver.sap_bsad`/`silver.sap_bsid`/`bronze.sap_bsid`; the numbers in the BLART table come from those queries.
+
+#### Phase 6 — what was built, how it was gated (2026-09-03)
+
+Every object was loaded with `EXEC gold.load_<x> '2026-07-01'` and had to pass a numeric gate before the next one was written:
+
+| Object | Rows (Jul-2026 → today) | Gate |
+|---|---:|---|
+| `dim_tipo_documento` | 23 | 20 business-catalog types + Z4/ZZ/DI, `T003`/`T003T` values |
+| `fact_facturas` | 278,979 | open rows = `silver.sap_bsid` exactly (71,529 / $378.19M); cleared = `bsad` window minus the 47 FBRA-reset duplicates where `bsid` wins; `anulada` = Z1 lines of the window (5,153); SCD2 99.8%; 0 open rows with `AUGBL` |
+| `fact_notas` | 25,332 | same checks; `anulada` 6 C1 (Z2) + 12 C5 (Z3) |
+| `fact_pagos` | 134,693 | July DZ cash reconciles to `fact_pagos_compensados` **to the cent by PK** once separated: identical money $166.07M; the old fact counts **$1.77M more** (123 child re-application lines = the same deposit twice in the month, 7 re-issues, 21 $0 lines) and **$0.06M of reversed/refund deposits**; v2 counts **$3.15M more** (deposits and direct payments without the validated `sgtxt`) plus **CP $34.64M** the old fact never had. `origen_efectivo` splits re-issued credits: `REEMISION_PAGO_SA` (cash re-issued from an SA 'PAGO%' credit, e.g. 'PAGO ATM-CIOSA' $12.75M) counts; `REEMISION_CREDITO` ($13.6M) and `REEMISION_AJUSTE_SA` ($1.96M, 'COMISIONES MELI') do not. |
+| `fact_aplicacion` | 175,645 rows for the window | the three invariants at 0 (over-applied receiving documents, over-applied origins, duplicate pairs); cash conservation per origin (DZ $169,165,324 vs $169,165,263 in `fact_pagos`, $60 of rounding tolerance); the investigation's real cases reproduced (F4 `7404832874` = DZ $7,812.61 + AB17 $1,676.11 with origin C1 `3100754232`; deposit `1402626920` → child `1402626948` → 3 grandchild groups → 3 R1 rows; the 2-hop `1402621305` → `1402621328` → F4 `7404802497`; open partial payments as `BSID` rows) |
+
+**What the gates changed in the design (each found by a failing invariant, fixed one at a time):**
+- *Vehicle / origin / receiving* are three roles per row. A child's key-15 line, an AB key-17 line or a re-issued credit is the **vehicle**; the deposit or credit behind it is the **origin** (1 or 2 hops); the invoice is the **receiver**. Certainty of the application and certainty of the origin are independent.
+- **R4** was added: exactly one candidate vehicle in the group and it covers what R1 left of every receiving document → each receiving document settled in full. Not proration — every row is a whole remainder. R3 keeps the other certain shape (several candidates that all fit in one receiving document).
+- **Cumulative caps** per receiving document, per vehicle and per origin (the origin's own rows consume it first), all with a **$1.00 tolerance**: SAP posts rounding lines (AB 07 of $0.01), and chains re-apply $27,645.96 of a $27,645.93 deposit. A row that no longer fits loses its origin (`origen_resuelto=0`, `CADENA_AMBIGUA`) — it is never stretched.
+- **Step 2e**: a payment line consumed by another DZ document's key-08 mirror **of the same amount** in the same group is not a candidate there — the mirror's document re-issues it through its own key-15 lines, which are. Only DZ mirrors: an SA 08/15 pair is the POS transit and there the CP line *is* the vehicle. A broader version ("anything cleared into a child-anchored group") was tried and dropped: the most common shape is {deposit, N invoices, child 08 carrying the leftover} and there the deposit is the vehicle.
+- **Step 2f**: the anchor document's own key-15 line inside its own group, without `REBZG`, when another candidate exists, is the clearing's payment difference ($0.01 / $7.23), not an applicator (2,490 groups / $36.3M in July would otherwise be "ambiguous").
+- **Re-issued credits are vehicles** even when they are not cash (`REEMISION_CREDITO`): their origin is the credit whose amount equals their key-08 sibling (or the single credit), traced one more hop if that credit is itself a child line.
+- Cash origins are snapshotted before vehicles are removed, so a deposit that is not a vehicle anywhere still reports its unexplained remainder.
+
+#### Phase 7 — July 2026, same customer scope as the view (canal 10/40/60, no `SIN_RFC`, no `FUERA_DE_ALCANCE`), DZ only
+
+| | `vw_pago_factura_simple` | `fact_aplicacion` v2 |
+|---|---:|---:|
+| Payments / cash of the month | 12,195 / **$155,068,233** | 12,322 / **$154,851,609** |
+| Identified | 11,857 / $144,963,319 (**93.5%**) | 12,045 / $143,588,820 (**92.7%**) |
+| Both identify | 11,675 payments / $138.1M — identical invoice sets on 9,950; v2 finds *more* invoices on 1,704 (partial payments, notes, 2nd hops); the view more on 18; disagreement on 3 | |
+| View identifies, v2 does not | 36 / $5.11M — 22 are Mercado Libre groups with SA commission netting (v2: `GRUPO_AMBIGUO`), the rest chains with 2+ candidate deposits | |
+| v2 identifies, view does not | 284 / $4.68M (2-hop chains, AB re-applications) + 86 / $1.14M deposits the view does not carry at all | |
+| Neither | 45 / $5.34M | |
+| Counted as cash only by the view | 145 / **$1.69M**: 123 child re-application lines (the deposit already counted in the same month), 7 re-issues, 21 $0 lines | — |
+| Reversed deposits counted | 1 identified ($28,942) + 3 not | 0 (excludes 33 more, $3.73M, that the view never had) |
+| Unidentified by nature (payment gateways) | in the totals above | Kushky $4.98M (0% identified), Conekta $0.29M — `CADENA_AMBIGUA` / `SIN_DOCUMENTO_EN_GRUPO` |
+| v2 unidentified, non-marketplace customers | | $1.06M of $142.4M (**99.3%** identified) |
+
+Reading: both strategies agree on the cash of the month to within the double-counted child lines. Coverage is equivalent (93.5% vs 92.7%) — and the 0.8 points the view has on top are almost entirely Mercado Libre groups where a deposit is prorated across many invoices while SA commission credits sit in the same group, which is a guess the design forbids. v2 adds CP, open partial payments, 2-hop chains, AB credit re-applications, reversal exclusion, and a `regla`/`nivel_certeza`/`origen` on every row. **Recommendation: v2.** What remains before it can replace the view is operational, not analytical: historical backfill (2022→2026, by fiscal year), wiring into `gold.load_gold`, `clasificacion_cobranza` agreed with the business, and the `PASARELA` split (open item 4).
 
 #### Goal and grain
 
@@ -263,6 +301,7 @@ Against SAP: total of DZ+CP virgins per month by `fecha_contabilizacion` = the S
 1. **`clasificacion_cobranza`:** the three labels (`PAGO_ANTICIPADO` / `PAGO_A_VENCIMIENTO` / `PAGO_A_MES`) are deliberately not defined here — the month-cohort vs exact-day question was quantified on 2026-08-26 for the current view (<4% either way) but has to be re-agreed with the business for this fact, which now also covers open partial payments.
 2. **Documents that vanish from `bsid` without reaching `bsad`:** with the reversal mechanics now understood (a reversal always lands in `bsad` together with its original), a document missing from both sources is most likely an archived or re-keyed item, not a reversal — confirm with a real case before deciding between `REVERTIDO` and a different status name.
 3. **AB key-17 lines without `REBZG` and without a same-amount twin (34,010 / $459.2M):** quantify in Phase 6 how many resolve by R3 (single invoice in their group) vs. stay `GRUPO_AMBIGUO`.
-4. **`vw_pago_factura_simple` and reversed deposits (outside this design's scope, flagged only):** its virgin filter (`sgtxt` text + `debe_haber<>'S'`) admits a reversed virgin (key 11, with text) and nothing removes it, because the reversal line (key 02, `S`) is filtered out — the 537 key-02 lines / $17.9M are the upper bound of the effect. Measure before touching that view; not part of this proposal.
+4. **`PASARELA` vs `MARKETPLACE` in `gold.dim_cliente.tipo_cliente` (backlog, approved 2026-09-03):** the single `MARKETPLACE` value today covers two different behaviours. Payment gateways (Kushky, Conekta, Openpay "INGRESOS TRANSITORIA", Mercado Pago) receive aggregated end-buyer money and clear DZ against DZ or SA with no customer invoice — unidentifiable by nature, for any strategy. Marketplaces proper (Amazon, Mercado Libre and variants, Claro Shop) hold real F4 invoices and their payments are identifiable like anyone else's (with `SA "COMISIONES MELI"` netting in between). Splitting them is a small additive change to `dim_cliente` and its load — deliberately outside this design's scope; until then the Phase 7 scorecard breaks unidentified cash down by account name inside `MARKETPLACE`.
+5. **`vw_pago_factura_simple` and reversed deposits (outside this design's scope, flagged only):** its virgin filter (`sgtxt` text + `debe_haber<>'S'`) admits a reversed virgin (key 11, with text) and nothing removes it, because the reversal line (key 02, `S`) is filtered out — the 537 key-02 lines / $17.9M are the upper bound of the effect. Measure before touching that view; not part of this proposal.
 
 Decisions already taken on 2026-09-03: one general `fact_aplicacion` (not cash-only); CP is included even though 99.6% of it is channel 20; D1 sits on the debt side; `bsid` is a source for all three document families; AB enters only through R5 by posting key; ZY, ZZ, SA (except `REEM*`) and every reversed pair are out.

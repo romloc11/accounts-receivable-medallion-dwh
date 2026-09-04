@@ -193,16 +193,23 @@ GO
 --      CONSUME_CREDITO  DZ key 07 (S) - clears an existing credit, like AB 07
 --      REVERSO          key 02/05/12 (S) - the FB08 reversal document's own line
 --      OTRO             01/04/06/16 - manual postings and payment differences
---    origen_efectivo (only for VIRGEN / PAGO_DIRECTO; NULL otherwise):
---      BANCO            VIRGEN - cash from the bank
---      DIRECTO          PAGO_DIRECTO whose document has no key-08 sibling - cash
---      REEMISION_SA     PAGO_DIRECTO whose 08 sibling's group holds no DZ credit of another
---                       document (typically an SA 'PAGO ATM-CIOSA' credit) - cash, counted
---                       here because SA is excluded everywhere else
---      REEMISION_DZ     PAGO_DIRECTO whose 08 sibling's group holds a DZ 11/15 credit of
---                       ANOTHER document - a previous deposit re-issued. NOT cash (already counted)
---    es_efectivo = 1 for origen_efectivo IN (BANCO, DIRECTO, REEMISION_SA). Real cash of a
---      period = SUM(monto) WHERE es_efectivo=1 AND revertido=0 AND es_reembolso=0.
+--    origen_efectivo (only for VIRGEN / PAGO_DIRECTO; NULL otherwise). For a PAGO_DIRECTO
+--    whose document carries a key-08 sibling, the origin is what that 08 line consumes in
+--    ITS compensation group (checked 2026-09-03 on the July+ window: every such line had an
+--    identifiable origin):
+--      BANCO              VIRGEN - cash from the bank
+--      DIRECTO            PAGO_DIRECTO with no key-08 sibling - cash
+--      REEMISION_PAGO_SA  the 08 group holds an SA credit with text 'PAGO%' (e.g. 'PAGO
+--                         ATM-CIOSA', $12.75M) and NO DZ/CP/C* credit of another document
+--                         (AB 07/17 allowed - it is FB1D's transfer vehicle) - cash, counted
+--                         here because SA is excluded everywhere else
+--      REEMISION_CREDITO  the 08 group holds a DZ/CP/C1/C3/C4/C5 credit of ANOTHER document
+--                         - a deposit / return already counted, re-issued. NOT cash
+--      REEMISION_AJUSTE_SA the 08 group holds only SA credits without 'PAGO%' (e.g.
+--                         'COMISIONES MELI JUN 26' - marketplace commissions netted, no money
+--                         received) - NOT cash
+--    es_efectivo = 1 for origen_efectivo IN (BANCO, DIRECTO, REEMISION_PAGO_SA). Real cash
+--      of a period = SUM(monto) WHERE es_efectivo=1 AND revertido=0 AND es_reembolso=0.
 -- ============================================================================
 IF OBJECT_ID('gold.fact_pagos', 'U') IS NOT NULL DROP TABLE gold.fact_pagos;
 GO
@@ -218,8 +225,8 @@ CREATE TABLE gold.fact_pagos (
     debe_haber               CHAR(1)       NULL,
     estado_sap               VARCHAR(10)   NOT NULL,  -- ABIERTO / COMPENSADO / REVERTIDO
     tipo_linea               VARCHAR(16)   NOT NULL,  -- see header
-    origen_efectivo          VARCHAR(16)   NULL,      -- BANCO / DIRECTO / REEMISION_SA / REEMISION_DZ, see header
-    es_efectivo              BIT           NOT NULL,  -- origen_efectivo IN (BANCO, DIRECTO, REEMISION_SA)
+    origen_efectivo          VARCHAR(20)   NULL,      -- BANCO / DIRECTO / REEMISION_PAGO_SA / REEMISION_CREDITO / REEMISION_AJUSTE_SA, see header
+    es_efectivo              BIT           NOT NULL,  -- origen_efectivo IN (BANCO, DIRECTO, REEMISION_PAGO_SA)
     es_pago_virgen           BIT           NOT NULL,  -- VIRGEN only (kept for comparison with fact_pagos_compensados)
     texto_virgen_valido      BIT           NOT NULL,  -- sgtxt = 'Asignación Aut. Deposito' OR LIKE 'BB%' (the text safeguard validated on fact_pagos_compensados)
 
@@ -266,4 +273,87 @@ CREATE INDEX IX_fact_pagos_hijo  ON gold.fact_pagos (documento_hijo, ejercicio_h
 PRINT 'Table gold.fact_pagos created.';
 GO
 
--- Section 4 (fact_aplicacion) is added once the gate of section 3 passes - see DESIGN.md.
+-- ============================================================================
+-- 4. gold.fact_aplicacion - one row = one monetary application between a line
+--    that applies money/credit and a debt document that receives it.
+--    Gate of section 3 passed 2026-09-03.
+--
+--    Three roles per row (all degenerate document keys):
+--      aplica  - the VEHICLE: the line that sits in the receiving document's compensation
+--                group or carries the REBZG reference (a direct payment, a child's key-15
+--                line, a credit note, an AB key-17/15 line)
+--      origen  - where the money/credit comes from: the virgin deposit behind a child line,
+--                the credit consumed by an AB line's key-07 twin, or the vehicle itself
+--      recibe  - the debt document (fact_facturas: F1-F6, D1). NULL on unidentified rows.
+--    tipo_aplicacion follows the ORIGIN: PAGO (cash), NOTA_CREDITO, DEVOLUCION,
+--    CREDITO_REAPLICADO (AB 17), SALDO_A_FAVOR (AB 15 from the pool account).
+--    monto_aplicado is the only additive amount. Rules (regla): R1 = REBZG (certainty 1),
+--    R3 = single receiving document in the group (2), R0 = unidentified remainder of an
+--    origin (receiving side NULL). No proportional allocation anywhere.
+-- ============================================================================
+IF OBJECT_ID('gold.fact_aplicacion', 'U') IS NOT NULL DROP TABLE gold.fact_aplicacion;
+GO
+CREATE TABLE gold.fact_aplicacion (
+    id_aplicacion                INT IDENTITY(1,1) NOT NULL,
+
+    -- vehicle
+    sociedad                     VARCHAR(4)    NOT NULL,
+    documento_aplica             VARCHAR(10)   NOT NULL,
+    ejercicio_aplica             INT           NOT NULL,
+    posicion_aplica              INT           NOT NULL,
+    clase_documento_aplica       VARCHAR(2)    NOT NULL,
+    clave_contabilizacion_aplica VARCHAR(2)    NULL,
+    cliente_pagador_id           VARCHAR(10)   NOT NULL,
+    fecha_aplica                 DATE          NULL,      -- fecha_contabilizacion of the vehicle
+    monto_documento_aplica       DECIMAL(15,2) NOT NULL,  -- full amount of the vehicle line, repeated per row - never SUM it
+
+    -- origin
+    documento_origen             VARCHAR(10)   NULL,
+    ejercicio_origen             INT           NULL,
+    posicion_origen              INT           NULL,
+    clase_documento_origen       VARCHAR(2)    NULL,
+    fecha_origen                 DATE          NULL,      -- fecha_contabilizacion of the origin (the real deposit date for a chain)
+    monto_documento_origen       DECIMAL(15,2) NULL,
+    saltos                       TINYINT       NOT NULL DEFAULT 0,  -- 0 = vehicle is its own origin, 1 = virgin -> child, 2 = virgin -> child -> grandchild
+
+    -- receiving (NULL when unidentified)
+    documento_recibe             VARCHAR(10)   NULL,
+    ejercicio_recibe             INT           NULL,
+    posicion_recibe              INT           NULL,
+    clase_documento_recibe       VARCHAR(2)    NULL,
+    cliente_factura_id           VARCHAR(10)   NULL,
+    fecha_factura                DATE          NULL,
+    fecha_vencimiento            DATE          NULL,
+    monto_documento_recibe       DECIMAL(15,2) NULL,
+    estado_recibe                VARCHAR(10)   NULL,      -- ABIERTO (partial payment in progress) / COMPENSADO
+
+    -- measure
+    monto_aplicado               DECIMAL(15,2) NOT NULL,
+
+    -- classification
+    tipo_aplicacion              VARCHAR(20)   NOT NULL,  -- PAGO / NOTA_CREDITO / DEVOLUCION / CREDITO_REAPLICADO / SALDO_A_FAVOR
+    estatus_identificacion       VARCHAR(20)   NOT NULL,  -- IDENTIFICADA / NO_IDENTIFICADA
+    motivo_no_identificado       VARCHAR(30)   NULL,      -- SIN_DOCUMENTO_EN_GRUPO / GRUPO_AMBIGUO / CADENA_AMBIGUA / ORIGEN_ABIERTO / SIN_REGLA
+
+    -- traceability
+    documento_compensacion       VARCHAR(10)   NULL,      -- group where vehicle and receiving document met (NULL when the receiving is still open)
+    ejercicio_compensacion       INT           NULL,
+    fecha_compensacion           DATE          NULL,
+    fuente_sap                   VARCHAR(10)   NOT NULL,  -- BSAD / BSID / BSAD+BSID
+    regla                        VARCHAR(4)    NOT NULL,  -- R1 / R3 / R0
+    nivel_certeza                TINYINT       NOT NULL,  -- 1 = SAP's own pointer, 2 = single receiving document in the group, 0 = unidentified
+    origen_resuelto              BIT           NOT NULL DEFAULT 1,  -- 0 when the chain behind a child line has 2+ candidate deposits
+
+    moneda                       VARCHAR(5)    NULL,
+    cliente_comercial_sk         INT           NULL,      -- of the payer, resolved on fecha_origen (the real deposit date)
+    cliente_credito_sk           INT           NULL,
+    fecha_carga                  DATETIME      DEFAULT GETDATE(),
+    CONSTRAINT PK_fact_aplicacion PRIMARY KEY (id_aplicacion)
+);
+GO
+CREATE INDEX IX_fact_aplicacion_recibe  ON gold.fact_aplicacion (documento_recibe, ejercicio_recibe, posicion_recibe);
+CREATE INDEX IX_fact_aplicacion_origen  ON gold.fact_aplicacion (documento_origen, ejercicio_origen, posicion_origen);
+CREATE INDEX IX_fact_aplicacion_aplica  ON gold.fact_aplicacion (documento_aplica, ejercicio_aplica, posicion_aplica);
+CREATE INDEX IX_fact_aplicacion_fecha   ON gold.fact_aplicacion (fecha_aplica);
+PRINT 'Table gold.fact_aplicacion created.';
+GO
