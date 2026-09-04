@@ -238,6 +238,54 @@ Operational, not analytical — the view stays the dashboard's source until thes
 4. The `PASARELA` / `MARKETPLACE` split (open item 4 below) — it is what makes "unidentifiable by nature" reportable separately from "we failed to identify it".
 5. Cosmetic: `SIN_REGLA` still appears as a `motivo_no_identificado` value in the R6 filters although the loader no longer emits it.
 
+#### How to consume `fact_aplicacion` (read this before building anything on it)
+
+**It is not the collections ledger.** "How much did we collect" is answered by `fact_pagos`, never by summing `monto_aplicado`:
+
+```sql
+SELECT SUM(monto_moneda_local)
+FROM gold.fact_pagos
+WHERE tipo_linea = 'VIRGEN' AND revertido = 0 AND es_reembolso = 0
+  AND fecha_contabilizacion >= @desde AND fecha_contabilizacion < @hasta;
+```
+
+Every peso that arrived is in that number whether or not we know which invoice took it. `fact_aplicacion` answers only the *next* question — which debt document the money settled — so identification never moves a collection total, only the invoice-level detail.
+
+**The ambiguity is nine accounts, not a spread.** July 2026, by payer:
+
+| `tipo_cliente` | unidentified | of total | share |
+|---|---:|---:|---:|
+| `MARKETPLACE` (9 customers) | $9,734,589 | $18,256,015 | **53%** |
+| `PADRE` (713 of 3,713) | $3,432,565 | $142,739,237 | 2.4% |
+| `GENERICO` | $1,707,063 | $36,099,997 | 4.7% |
+| `FILIAL` | $1,187,557 | $26,743,985 | 4.4% |
+
+3,234 customers come out **100% identified**; another 540 are under 5% ambiguous; only 61 are over 50%. The top of the unidentified list is Kushky $4.98M, six Mercado Libre accounts ~$4.2M, Conekta $0.29M. Remove the payment gateways and the fact is ~97% clean — which is why the `PASARELA` split (open item 4) is not cosmetic: it turns "ambiguous" (reads as a defect) into "unidentifiable by nature" (a legitimate reportable category). A gateway aggregates end-buyer money that never had a CIOSA invoice; no strategy resolves that from `bsad`.
+
+**Two entry points, by question type.**
+
+- *Money questions* start at `fact_pagos`. Identification is irrelevant there.
+- *Invoice questions* (DSO, days-to-pay, payment behaviour) start at `fact_facturas` and join `fact_aplicacion` with an explicit status filter:
+
+```sql
+SELECT f.documento_id, f.fecha_vencimiento, MAX(a.fecha_aplica) AS fecha_pago,
+       DATEDIFF(DAY, f.fecha_vencimiento, MAX(a.fecha_aplica)) AS dias
+FROM gold.fact_facturas f
+JOIN gold.fact_aplicacion a
+  ON a.sociedad = f.sociedad AND a.documento_recibe = f.documento_id
+ AND a.ejercicio_recibe = f.ejercicio AND a.posicion_recibe = f.posicion
+WHERE a.estatus_identificacion = 'IDENTIFICADA'
+GROUP BY f.documento_id, f.fecha_vencimiento;
+```
+
+That drops ~7% of the money and keeps only rows provable against SAP. **Publish the coverage next to the metric**: "DSO 34 days over the 93% of collections that are identified" is an honest claim; "DSO 34 days" alone is not.
+
+**The three statuses are three different promises — never sum across them.** `IDENTIFICADA` = this invoice. `IDENTIFICADA_LOTE` = one of these ≤20 invoices (good for reconciling with the customer, not for DSO). `NO_IDENTIFICADA` = we do not know. A measure that adds them together silently converts evidence into a guess, which is the one thing this whole design exists to prevent.
+
+**`NO_IDENTIFICADA` is a work queue for Credit & Collections, not a defect to hide.** Every `motivo_no_identificado` is actionable in SAP: `SOBRANTE_EN_HIJO` = money left unapplied inside the deposit's own child, `ORIGEN_ABIERTO` = payment still on account, `GRUPO_AMBIGUO` = someone cleared in bulk with no reference, `CADENA_AMBIGUA` = the chain has more than one candidate deposit. That breakdown is a deliverable in its own right.
+
+**Known limitation while the window is only July-2026-onward.** Of the invoices cleared in July, 17,520 ($24.0M) carry no application row — but only 4,862 ($3.46M) are real ambiguity. The other 12,658 ($20.57M) are a pure window artifact: the document that paid them was posted before `2026-07-01` and is therefore not loaded. **Until the historical backfill runs, every invoice-side metric on July reads low.** Money-side metrics are unaffected.
+
 #### Goal and grain
 
 One row = **one monetary application between a document that applies money/credit and a document that receives it**, with the exact amount, the SAP evidence it came from, and the rule that produced it. `DZ001 → F1001 = 50,000` and `DZ001 → F1002 = 30,000` are two rows. A payment SAP cannot tie to a specific debt document with certainty still gets a row, with the receiving side `NULL` and `estatus_identificacion='NO_IDENTIFICADA'` — never a guessed match (same "don't guess" principle as `vw_pago_factura_simple`, kept deliberately).
