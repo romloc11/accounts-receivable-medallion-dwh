@@ -228,15 +228,101 @@ The gate returned $548,411.75 (426 rows) to `GRUPO_AMBIGUO`. Of the $16.3M of la
 
 All three invariants stayed at `0 | 0 | 0` through every iteration of this phase.
 
+#### Re-examination of the decision, and the retirement criterion for the view (2026-09-04)
+
+Designing the payment-behaviour report forced a second look at whether `fact_aplicacion` is
+needed at all, and whether v2 really beats `vw_pago_factura_simple`. Two arguments that had
+been used in its favour do not survive the data, and are retracted here:
+
+- **"Without v2 you cannot know when the money actually arrived" — false.** The view already
+  defines `fecha_pago` as `p.fecha_contabilizacion` of the *virgin* payment, i.e. the real
+  deposit date, and already ships `dias_pago` and `clasificacion_cobranza`.
+- **"v2 produces a better DPP" — not demonstrated.** Head to head on July 2026: the view gives
+  −2.98 days (54,528 rows, weighted by `monto_pago_asignado`), v2 gives −1.09 (75,387 rows,
+  weighted by `monto_aplicado`). The 1.9-day gap is driven by different populations, not by
+  method — v2 covers 81,246 invoices against the view's 54,204 and includes CP. The gap was
+  not decomposed, so neither number is asserted to be the correct one for a shared universe.
+
+Related measurement, which is what makes the *date* matter at all: 90% of July's applied money
+clears the same day its deposit was posted, so on the aggregate the choice of date moves DPP by
+half a day (−0.55 by `fecha_compensacion` vs −1.05 by `fecha_origen`). At customer grain it is
+a different story — 293 customers shift by 2+ days and some flip sign (one customer reads 6.5
+days late by clearing date and 3.6 days *early* by deposit date). Aggregate KPIs are safe on
+`fecha_compensacion`; anything a collector takes to a customer is not.
+
+**What actually sustains the decision** is coverage and shape, not accuracy:
+
+| | `vw_pago_factura_simple` | `fact_aplicacion` v2 |
+|---|---|---|
+| Invoices covered (July 2026) | 54,204 | **81,246** |
+| Scope | DZ only | DZ + CP + notes + returns + AB credits |
+| Open partial payments | no | yes |
+| Proportional allocation (a heuristic) | yes | **no** |
+| Double-counted child lines | $1.77M/month | none |
+| Reversed deposits | included | excluded |
+| Per-row traceability | none | rule + certainty + origin |
+| Cost to query | recomputed over 4.7M rows | materialised |
+
+An invoice settled by a credit note, or paid in instalments, is invisible in the view — which is
+disqualifying for a payment-behaviour report specifically. And the view is a *report*: it answers
+one question and cannot be extended. v2 is a *model* that shares dimensions with aging, open
+receivables and notes.
+
+**But today the view still does more for the collections report than v2 does**, because it has
+five years of history and the derived columns. The decision is right and its timing is not yet.
+
+**RETIREMENT CRITERION — do not drop `vw_pago_factura_simple` until v2 has all three:**
+
+1. The historical backfill 2022→2026 complete (**both phases** — see below).
+2. `dias_pago` computed on `fecha_pago_real`, plus `forma_liquidacion` (see the enrichment table).
+3. `clasificacion_cobranza` agreed with the business.
+
+Without all three, replacing the view is a functional regression for the only report currently in
+production.
+
+#### The enrichment that keeps analysts out of the bridge
+
+Four columns on `fact_facturas`, computed from `fact_aplicacion` during the load. They are what
+let the report be built on the document facts alone:
+
+| column | derivation | why |
+|---|---|---|
+| `fecha_pago_real` | `MIN(fecha_origen)` over its `tipo_aplicacion='PAGO'` rows | correct DPP at customer grain |
+| `forma_liquidacion` | `EFECTIVO` / `CREDITO` / `MIXTA` | excludes the 5,792 July invoices ($8.58M) settled with no cash, which otherwise count as payments |
+| `monto_liquidado_efectivo` | `SUM(monto_aplicado)` where `tipo_aplicacion='PAGO'` | real collection vs credit |
+| `dpp_confiable` | 1 when `fecha_pago_real` exists, else 0 | makes the fallback to `fecha_compensacion` visible instead of hiding it |
+
+`fecha_origen` only exists for identified applications (~95% of cash); the rest falls back to
+`fecha_compensacion` with `dpp_confiable = 0`.
+
+Power BI cannot relate on the 5-column composite PKs the document facts carry, so the model also
+needs deterministic single-column keys — `factura_key` / `pago_key` on the document facts and
+`recibe_key` / `aplica_key` on `fact_aplicacion`, all built as
+`sociedad|ejercicio|documento|posicion`. `(sociedad, ejercicio, documento_id, posicion)` was
+verified unique without `cliente_id` on all three facts. Relationships stay single-direction from
+each document fact to the bridge: `fact_aplicacion` already denormalises both sides, so the
+drill-through table needs no bidirectional filtering. Do not `SUM(monto_documento_recibe)` at
+application grain — it repeats per row; only `monto_aplicado` is additive there.
+
 #### What is left before v2 replaces the view
 
-Operational, not analytical — the view stays the dashboard's source until these are done:
-
-1. Historical backfill 2022→2026 of `fact_facturas`, `fact_notas`, `fact_pagos`, `fact_aplicacion`, by fiscal year, same 2GB-log discipline as `silver.sap_bsad`.
-2. Wire the five procedures into `gold.load_gold` (plain `EXEC` lines, in dependency order, only after each has run clean alone).
-3. Agree `clasificacion_cobranza` with the business (open item 1 below).
-4. The `PASARELA` / `MARKETPLACE` split (open item 4 below) — it is what makes "unidentifiable by nature" reportable separately from "we failed to identify it".
-5. Cosmetic: `SIN_REGLA` still appears as a `motivo_no_identificado` value in the R6 filters although the loader no longer emits it.
+1. Historical backfill 2022→2026 of `fact_facturas`, `fact_notas`, `fact_pagos`, `fact_aplicacion`
+   — `03_gold/backfill_fact_aplicacion_historico.sql`, two phases, 9 half-year chunks each.
+   **Phase B is not optional**: without application history there is no historical
+   `fecha_pago_real`, and without that v2 cannot replace the view.
+2. The four enrichment columns and the Power BI keys above.
+3. Wire the five procedures into `gold.load_gold` (plain `EXEC` lines, in dependency order, only
+   after each has run clean alone).
+4. Agree `clasificacion_cobranza` with the business (open item 1 below).
+5. The `PASARELA` / `MARKETPLACE` split (open item 4 below) — it is what makes "unidentifiable by
+   nature" reportable separately from "we failed to identify it".
+6. Retire the duplicate family once the above lands: `fact_facturas_compensadas` (4.7M rows),
+   `fact_pagos_compensados` (616K) and `vw_pago_factura_simple`. Carrying two parallel families
+   for the same question is the gold layer's biggest usability problem today — a newcomer cannot
+   tell which to use. Also check `vw_cartera_abierta` for overlap: `fact_facturas` now carries
+   open items at line level.
+7. Cosmetic: `SIN_REGLA` still appears as a `motivo_no_identificado` value in the R6 filters
+   although the loader no longer emits it.
 
 #### How to consume `fact_aplicacion` (read this before building anything on it)
 
