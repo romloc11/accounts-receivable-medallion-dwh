@@ -1578,13 +1578,19 @@ BEGIN
                                  THEN 1 ELSE 0 END AS excede) x
         WHERE v.es_origen_efectivo = 0
           AND v.monto - ISNULL(ao.aplicado, 0) - ISNULL(av.aplicado, 0) > 1.00
-          -- a vehicle whose resolved origin is another document IN THE WINDOW does not report its
-          -- own remainder: that money is reported once, at the origin (cash in (a), a note here)
+          -- A vehicle whose resolved origin is ANOTHER document never reports its own remainder:
+          -- that money is reported once, at the origin (cash in (a), a note here).
+          -- Fixed 2026-09-04: this test used to look the origin up in #cash / #veh, which are
+          -- scoped to the load window. Under a chunked backfill the origin usually sits in a
+          -- different window, the test failed to fire, and the same remainder was written twice -
+          -- once here and once at the origin. That was 342 over-applied origins ($636K), all of
+          -- them R0 rows. The window-scoped lookup is dropped: a resolved origin that is another
+          -- document is processed by whichever window owns it.
+          -- Trade-off: if the origin lies outside the loaded range entirely (a pre-2022 document),
+          -- its remainder goes unreported rather than double-reported. That is the safe direction.
           AND NOT (
                 v.origen_resuelto = 1
             AND NOT (v.origen_documento = v.documento_id AND v.origen_ejercicio = v.ejercicio AND v.origen_posicion = v.posicion)
-            AND (   EXISTS (SELECT 1 FROM #cash c WHERE c.documento_id = v.origen_documento AND c.ejercicio = v.origen_ejercicio AND c.posicion = v.origen_posicion)
-                 OR EXISTS (SELECT 1 FROM #veh  w WHERE w.documento_id = v.origen_documento AND w.ejercicio = v.origen_ejercicio AND w.posicion = v.origen_posicion AND w.es_origen_efectivo = 0))
           );
         SET @n_r0 = @n_r0 + @@ROWCOUNT;
 
