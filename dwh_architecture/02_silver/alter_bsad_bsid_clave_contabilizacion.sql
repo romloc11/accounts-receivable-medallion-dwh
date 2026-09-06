@@ -5,8 +5,12 @@ GO
 ========================================================================================
 ONE-TIME SCHEMA CHANGE + BACKFILL: posting key and application fields in silver
 ========================================================================================
-PURPOSE (2026-09-03, prerequisite of the fact_aplicacion v2 design - see DESIGN.md,
-"Proposals in design" -> "gold.fact_aplicacion"):
+PURPOSE (2026-09-03, originally a prerequisite of the fact_aplicacion v2 design - that
+design was retired 2026-09-05, see docs/archive/fact_aplicacion_v2_retirado.md):
+
+THIS CHANGE STAYS. It is source data, not v2 logic: the columns are already loaded by
+silver.load_silver on every run, and any application design that replaces v2 will need
+them. Do not revert it.
 
   1. silver.sap_bsad  +  clave_contabilizacion (BSCHL)
   2. silver.sap_bsid  +  clave_contabilizacion (BSCHL), sgtxt (SGTXT),

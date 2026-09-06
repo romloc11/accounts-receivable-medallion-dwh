@@ -1,2 +1,5 @@
 # Power BI project: exposes internal server IP/DB name, repo is public
 powerbi/
+
+# draw.io autosave/lock files
+.$*.dtmp
