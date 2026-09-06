@@ -304,7 +304,12 @@ BEGIN
             clave_contabilizacion, sgtxt,
             factura_referencia_documento, factura_referencia_ejercicio, factura_referencia_posicion,
             area_reclamacion, nivel_reclamacion, clave_reclamacion_legal,
-            bloqueo_reclamacion_temporal, fecha_ultima_reclamacion
+            bloqueo_reclamacion_temporal, fecha_ultima_reclamacion,
+            -- Added 2026-09-05: column parity with silver.sap_bsad. Always NULL here (BSID
+            -- is the OPEN items table - a line moves to BSAD when it gets cleared), but
+            -- mapped from AUGDT/AUGBL/AUGGJ with bsad's exact parsing instead of literal
+            -- NULL, so the loader states its source and a future non-NULL would surface.
+            fecha_compensacion, documento_compensacion, ejercicio_compensacion
         )
         SELECT
             LTRIM(RTRIM(MANDT)),  -- client (SAP mandante)
@@ -338,7 +343,17 @@ BEGIN
             NULLIF(LTRIM(RTRIM(MANST)), ''),  -- dunning level
             NULLIF(LTRIM(RTRIM(MSCHL)), ''),  -- legal dunning key
             NULLIF(LTRIM(RTRIM(MANSP)), ''),  -- temporary dunning block
-            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(MADAT)), '00000000'), 112) -- date of the last dunning notice
+            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(MADAT)), '00000000'), 112), -- date of the last dunning notice
+            -- Clearing fields, same parsing as silver.sap_bsad below. Expected to be NULL
+            -- on every row (see the note in the column list above).
+            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(AUGDT)), '00000000'), 112), -- clearing date
+            NULLIF(LTRIM(RTRIM(AUGBL)), ''),                                 -- clearing document
+            -- El segundo NULLIF ('0000') es obligatorio AQUI y no en bsad: en bsid SAP no deja
+            -- AUGGJ vacio, lo llena con '0000', asi que sin este NULLIF la columna quedaria en
+            -- 0 (un "ejercicio cero" falso) en vez de NULL. Verificado 2026-09-05: las 83,653
+            -- filas traen AUGGJ='0000', AUGDT='00000000' y AUGBL=' '. En bsad no aplica porque
+            -- toda fila compensada trae un ejercicio real (2022-2026 en las 12.47M filas).
+            TRY_CAST(NULLIF(NULLIF(LTRIM(RTRIM(AUGGJ)), ''), '0000') AS INT) -- clearing fiscal year
         FROM bronze.sap_bsid WITH (NOLOCK)
         WHERE MANDT = '400';
         SET @rows_count = @@ROWCOUNT;

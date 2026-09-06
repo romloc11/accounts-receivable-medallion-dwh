@@ -226,6 +226,26 @@ CREATE TABLE silver.sap_bsid (
     bloqueo_reclamacion_temporal  CHAR(1),    -- MANSP
     fecha_ultima_reclamacion      DATE,       -- MADAT
 
+    -- Added 2026-09-05 (user decision): bsid carries the SAME column set as bsad, so the
+    -- two can be read as one population without remembering which one lacks what. These
+    -- three are ALWAYS NULL here and that is correct, not a gap: BSID is SAP's OPEN items
+    -- table and a line moves to BSAD precisely when it gets cleared, so an open item has
+    -- no clearing document by definition. Verified on real data 2026-09-05: 0 of the
+    -- 83,653 bronze.sap_bsid rows carry AUGBL, AUGDT or AUGGJ. sp_load_silver.sql still
+    -- maps them from those fields with bsad's exact parsing rather than writing literal
+    -- NULL, so the loader documents its own source and a future non-NULL would surface
+    -- instead of being silently discarded.
+    --
+    -- POSITION: bsad keeps these at ordinals 14-16; here they are last, because the live
+    -- server got them via ALTER TABLE ADD (02_silver/alter_bsid_columnas_compensacion.sql)
+    -- and this file must describe the server as it actually is. Same column SET, different
+    -- ORDER - so any UNION between bsid and bsad MUST list columns explicitly. A
+    -- 'SELECT * FROM bsid UNION ALL SELECT * FROM bsad' compiles and silently pairs the
+    -- wrong columns.
+    fecha_compensacion            DATE,        -- AUGDT (always NULL in bsid)
+    documento_compensacion        VARCHAR(10), -- AUGBL (always NULL in bsid)
+    ejercicio_compensacion        INT,         -- AUGGJ (always NULL in bsid)
+
     fecha_carga              DATETIME DEFAULT GETDATE(),
     CONSTRAINT PK_silver_sap_bsid PRIMARY KEY (mandante, sociedad, cliente_id, ejercicio, documento_id, posicion)
 );
