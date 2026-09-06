@@ -154,17 +154,30 @@ BEGIN
                 -- because these named accounts span every RFC bucket: Amazon has a real RFC (would
                 -- otherwise fall to PADRE), most Mercado Libre/Claro Shop variants have RFC='XAXX010101000'
                 -- (would otherwise fall to GENERICO), and the payment-gateway clearing accounts
-                -- (Mercado Libre/Mercado Pago/Kushky/Conekta "INGRESOS TRANSITORIA") have RFC NULL
+                -- (Mercado Libre/Mercado Pago "INGRESOS TRANSITORIA") have RFC NULL
                 -- (would otherwise fall to SIN_RFC). Identified by name, not RFC - confirmed against
                 -- real data 2026-08-27 (see dwh-ciosa-project-status.md in memory for the full account
                 -- list, 30 rows checked one by one before writing this). 'OPENPAY INGRESOS TRANSITORIA'
                 -- uses an EXACT match, not LIKE 'OPENPAY%' - a real customer, 'OPENPAY SAPI DE CV'
                 -- (RFC OPE130906HN4, unrelated to the payment gateway), would have been caught by a
                 -- broader pattern - confirmed by the user this must NOT be MARKETPLACE.
+                -- TRANSITORIA added 2026-09-05 (user decision) - checked BEFORE MARKETPLACE
+                -- because these two used to fall in that bucket. Payment-gateway clearing
+                -- accounts: money lands here on the gateway's own settlement calendar and is
+                -- then moved to the real customer, so they are neither a sales channel nor a
+                -- customer with credit behaviour. Only the two that actually move money:
+                --   10012098 KUSHKY INGRESOS TRANSITORIA   (169 pagos / $33.66M in 2026)
+                --   10010943 CONEKTA OXXO INGRESOS TRANSITORIA (2 pagos / $40,588.82 in 2026)
+                -- The other three '%INGRESOS TRANSITORIA%' accounts (MERCADO LIBRE 10011518,
+                -- MERCADO PAGO 10011517, OPENPAY 10010814) carry $0 and stay MARKETPLACE by
+                -- the user's explicit decision - if any of them ever activates, this is the
+                -- branch to extend. Verified 2026-09-05: LIKE 'KUSHKY%'/'CONEKTA%' matches
+                -- exactly these two rows in silver.sap_kna1, nothing else.
+                WHEN k.nombre LIKE 'KUSHKY%' OR k.nombre LIKE 'CONEKTA%'
+                    THEN 'TRANSITORIA'
                 WHEN k.nombre = 'OPENPAY INGRESOS TRANSITORIA'
                      OR k.nombre LIKE 'MERCADO LIBRE%' OR k.nombre LIKE 'MERCADO PAGO%'
                      OR k.nombre LIKE '%AMAZON%' OR k.nombre LIKE 'CLAROSHOP%'
-                     OR k.nombre LIKE 'KUSHKY%' OR k.nombre LIKE 'CONEKTA%'
                     THEN 'MARKETPLACE'
                 WHEN kk.etiqueta_credito = 'FILIAL' THEN 'FILIAL'
                 -- Renamed from 'DIRECCION_ALTERNA' to 'SIN_RFC' 2026-08-27, user's own naming

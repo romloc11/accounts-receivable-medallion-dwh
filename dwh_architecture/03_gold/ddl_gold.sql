@@ -65,9 +65,12 @@ GO
 -- Key: cliente_id directly (no surrogate key - not needed for SCD1, and
 -- keeps consistency with the rest of the project, which uses business
 -- keys). mandante is NOT included (always '400', zero variation).
--- tipo_cliente = PADRE / FILIAL / SIN_RFC / GENERICO / MARKETPLACE (renamed
--- from DIRECCION_ALTERNA, MARKETPLACE added, both 2026-08-27), full logic
--- in gold.load_dim_cliente (sp_load_gold.sql).
+-- tipo_cliente = PADRE / FILIAL / SIN_RFC / GENERICO / MARKETPLACE /
+-- TRANSITORIA (SIN_RFC renamed from DIRECCION_ALTERNA and MARKETPLACE added
+-- 2026-08-27; TRANSITORIA added 2026-09-05 for the Kushky/Conekta payment-
+-- gateway clearing accounts, split out of MARKETPLACE), full logic in
+-- gold.load_dim_cliente (sp_load_gold.sql). Only SIN_RFC is used as a filter
+-- anywhere in gold (the two views exclude it); the rest are labels for slicing.
 -- ==========================================================
 IF OBJECT_ID('gold.dim_cliente', 'U') IS NOT NULL
     DROP TABLE gold.dim_cliente;
