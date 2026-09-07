@@ -2,10 +2,12 @@
 ========================================================================================
 dbo.fact_pagos  -  el dinero que ENTRO, una fila por linea de pago
 ========================================================================================
-Ventana: julio 2026 por fecha_compensacion. Alcance: canal 10/40/60, sin FUERA_DE_ALCANCE.
+Ventana: un mes por fecha_compensacion (hoy AGOSTO 2026, ver el WHERE).
+Alcance: canal 10/40/60, sin FUERA_DE_ALCANCE.
 
-CONTROL (2026-09-07): 12,053 filas / 12,050 documentos / $149,244,694.89
-  -> ese total es EXACTAMENTE el que reporta SAP para el mes.
+LINEA BASE VALIDADA - julio 2026: 12,053 filas / 12,050 documentos / $149,244,694.89
+  -> ese total es EXACTAMENTE el que reporta SAP para ese mes.
+  Agosto es la segunda corrida; sus cifras aun no estan contrastadas contra SAP.
   Por clave: 11 = 10,878 ($136,228,205.77) | 15 = 1,168 ($13,098,038.94)
              05 = 2 (-$68,705.85)          | 08 = 5 (-$12,843.97)
 
@@ -86,8 +88,8 @@ FROM silver.sap_bsad b
 WHERE b.mandante = '400'
   AND b.clase_documento = 'DZ'
   AND b.sgtxt = 'Asignación Aut. Deposito'
-  AND b.fecha_compensacion >= '2026-07-01'
-  AND b.fecha_compensacion <  '2026-08-01'
+  AND b.fecha_compensacion >= '2026-08-01'
+  AND b.fecha_compensacion <  '2026-09-01'
   AND b.cliente_id IN (
         SELECT c1.cliente_id
         FROM   gold.dim_cliente_comercial c1
@@ -112,9 +114,10 @@ GO
 -- ========================================================================================
 -- Verificacion
 -- ========================================================================================
-SELECT COUNT(*)                    AS filas,      -- 12,053
-       COUNT(DISTINCT documento_id) AS documentos, -- 12,050
-       CAST(SUM(monto) AS DECIMAL(18,2)) AS monto  -- 149,244,694.89
+SELECT COUNT(*)                    AS filas,
+       COUNT(DISTINCT documento_id) AS documentos,
+       CAST(SUM(monto) AS DECIMAL(18,2)) AS monto
+       -- julio fue: 12,053 / 12,050 / 149,244,694.89
 FROM   dbo.fact_pagos;
 
 SELECT clave_contabilizacion, COUNT(*) AS filas,

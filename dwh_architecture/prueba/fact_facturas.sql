@@ -6,19 +6,30 @@ Dos poblaciones en una tabla, separadas por flag_compensada:
   compensadas (bsad) -> ya liquidadas, tienen documento_compensacion
   abiertas    (bsid) -> siguen vivas, documento_compensacion NULL SIEMPRE
 
-CONTROL (2026-09-07): 217,086 filas = 146,119 compensadas + 70,967 abiertas
+CONTROL julio 2026: 217,086 filas = 146,119 compensadas + 70,967 abiertas
+Para AGOSTO: piso 2026-07-01 (un mes de margen), sin techo.
 
 LAS ABIERTAS NO PARTICIPAN DEL PUENTE. Verificado: 0 de ellas entran al join, porque
 no tienen documento_compensacion. Estan aqui para analisis de cartera y para la regla
 del pago parcial (R3, sin implementar), no para ligar pagos.
 
---- POR QUE LA VENTANA DE LAS COMPENSADAS NO TIENE TOPE SUPERIOR ---
-Se filtra `fecha_compensacion >= '2026-07-01'` SIN `< '2026-08-01'`, y no es un olvido.
-Un pago compensado en julio puede alcanzar, via el segundo salto
-(virgen -> hijo -> grupo final), una factura que se compenso DESPUES. La cadena solo
-avanza en el tiempo, nunca retrocede - medido: los grupos finales que faltaban cayeron
-en 2026-08 (290 facturas) y 2026-09 (3), ninguno antes de julio.
-El techo truncaba 157 pagos / $1,655,522. El piso es el que define el alcance.
+--- LA VENTANA DE LAS COMPENSADAS: SIN TECHO, Y CON UN MES DE MARGEN ABAJO ---
+SIN TECHO, y no es un olvido. Un pago compensado en el mes puede alcanzar, via el
+segundo salto (virgen -> hijo -> grupo final), una factura que se compenso DESPUES.
+Medido en julio: los grupos finales que faltaban cayeron en 2026-08 (290 facturas) y
+2026-09 (3). El techo truncaba 157 pagos / $1,655,522.
+
+CON UN MES DE MARGEN HACIA ATRAS (el piso va un mes antes que la ventana de pagos).
+OJO: una version anterior de este comentario afirmaba que "la cadena solo avanza en el
+tiempo, nunca retrocede". ESO ERA FALSO - se escribio con la evidencia de un solo mes.
+Al correr agosto aparecieron 2 grupos finales compensados en JULIO, es decir antes de
+la ventana de pagos. Son pocos (2 pagos / $40,427) pero el principio no se sostiene.
+El margen es una cobertura EMPIRICA, no una garantia: cubre el alcance hacia atras que
+hemos observado (1 mes), no uno que hayamos demostrado imposible de superar.
+Costo del margen en agosto: 78,819 filas sin el, ~146,119 con el. Tres meses de margen
+serian 272,186 y seis 460,147 - pagar por un riesgo que no hemos visto.
+Si alguna vez el alcance hacia atras crece, se detecta con la invariante de pagos sin
+ligar: subirian sin causa aparente.
 
 --- POR QUE fecha_compensacion Y NO fecha_documento ---
 Todas las lineas de un grupo comparten fecha_compensacion (verificado: 0 grupos con
@@ -85,7 +96,7 @@ FROM   silver.sap_bsad b
 WHERE  b.mandante = '400'
   AND  b.debe_haber = 'S'
   AND  (b.clase_documento LIKE 'F%' OR b.clase_documento = 'D1')
-  AND  b.fecha_compensacion >= '2026-07-01'      -- SIN tope superior, ver cabecera
+  AND  b.fecha_compensacion >= '2026-07-01'      -- 1 mes antes de la ventana de pagos (agosto)
   AND  b.cliente_id IN (
            SELECT c1.cliente_id FROM gold.dim_cliente_comercial c1
            WHERE  c1.estatus_comercial <> 'FUERA_DE_ALCANCE'
@@ -123,7 +134,7 @@ GO
 
 
 -- ========================================================================================
--- Verificacion:  compensadas 146,119  |  abiertas 70,967  |  total 217,086
+-- Verificacion. Julio fue: compensadas 146,119 | abiertas 70,967 | total 217,086
 -- ========================================================================================
 SELECT flag_compensada, COUNT(*) AS filas,
        CAST(SUM(monto) AS DECIMAL(18,2)) AS monto
