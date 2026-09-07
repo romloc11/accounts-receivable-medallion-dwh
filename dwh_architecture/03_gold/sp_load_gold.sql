@@ -895,10 +895,10 @@ GO
 -- alguien lo EJECUTA. Tenerlos en otro archivo significaba que correr solo
 -- sp_load_gold.sql dejaba un orquestador roto que se descubre en produccion.
 --
--- El DDL si va aparte, en ddl_fact_aplicacion_pagos.sql, y ahi la razon si existe:
--- ddl_gold.sql hace DROP de cada tabla de la capa, y estas cuatro no se pueden
--- recrear desde cero sin repetir el backfill historico. Este archivo, en cambio,
--- solo tiene CREATE PROCEDURE: es seguro correrlo completo.
+-- El DDL de las cuatro tablas esta en ddl_gold.sql, con las otras ocho, pero
+-- con una diferencia: las suyas dicen IF OBJECT_ID(...) IS NULL en vez de IS
+-- NOT NULL + DROP. Correr ddl_gold.sql NO las borra - contienen el backfill
+-- historico y recargarlo cuesta horas, no minutos como el resto de la capa.
 -- ##################################################################################
 
 /*
@@ -1567,8 +1567,8 @@ BEGIN
         -- ------------------------------------------------------------------
         -- Modelo de aplicacion de pagos (agregado 2026-09-07).
         -- Los cuatro procs estan definidos ARRIBA, en este mismo archivo.
-        -- DDL en 03_gold/ddl_fact_aplicacion_pagos.sql, historia 2022->
-        -- cargada con 03_gold/backfill_fact_aplicacion_pagos.sql.
+        -- DDL en 03_gold/ddl_gold.sql (sin DROP, ver la nota de alla),
+        -- historia 2022-> cargada con 03_gold/backfill_fact_aplicacion_pagos.sql.
         --
         -- EL ORDEN ENTRE ESTOS CUATRO NO ES NEGOCIABLE: el puente necesita
         -- pagos y facturas ya cargados, y la clasificacion de lo no ligado
