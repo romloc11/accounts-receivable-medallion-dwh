@@ -47,7 +47,16 @@ REFERENCIA dice "este pago ABONO a esta factura, que sigue abierta".
 Son dos afirmaciones distintas. Es la unica regla que aterriza en facturas abiertas -
 las otras dos van por documento_compensacion, y una partida abierta no lo tiene.
 
---- LO QUE QUEDA SIN LIGAR, CON NOMBRE ---
+--- LO QUE QUEDA SIN LIGAR VIVE EN OTRA TABLA ---
+dbo.fact_pagos_sin_aplicacion (ver su propio script): 37 lineas / $1,874,426.31, cada
+una con motivo. NO son un hueco: ese dinero SI entro y liquido documentos que no son
+facturas de cliente - SA (ajustes y comisiones) $1,282,187, AB $354,455. Por eso la
+etiqueta dice LIQUIDA_NO_FACTURA y no NO_IDENTIFICADO.
+Invariante verificada: aplicada $147,370,268.58 + sin aplicacion $1,874,426.31 =
+$149,244,694.89, la cobranza total. Todo pago esta en una tabla o en la otra, nunca en
+las dos ni en ninguna.
+
+--- DETALLE DE LO SIN LIGAR ---
 37 lineas / $1,874,426, mayormente: pagos cuyo salto llega a un grupo sin facturas, y
 pagos sin salto. Las 3 lineas clave 08 se excluyen a proposito (debitos espejo).
 Ahi adentro esta Kushky: el dinero de una pasarela llega agregado, no factura por
