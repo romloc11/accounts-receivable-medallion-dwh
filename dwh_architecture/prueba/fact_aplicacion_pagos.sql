@@ -2,12 +2,13 @@
 ========================================================================================
 dbo.fact_aplicacion_pagos  -  el PUENTE: que facturas toco cada pago
 ========================================================================================
-CONTROL (2026-09-07): 54,747 filas
+CONTROL (2026-09-07): 54,800 filas
     GRUPO          52,633 filas | 10,661 documentos | $135,929,118  (91.1%)
     SEGUNDO_SALTO   2,114 filas |  1,333 documentos | $ 11,364,353  ( 7.6%)
+    REFERENCIA         53 filas |    ~46 documentos | $     76,797  ( 0.1%)
     ----------------------------------------------------------------------
-    ligado                      | 11,994            | $147,293,472  (98.7%)
-    sin ligar                   |     58            | $  1,951,224  ( 1.3%)
+    ligado                                          | $147,370,269  (98.7%)
+    sin ligar                   |     37 lineas     | $  1,874,426  ( 1.3%)
 
 --- POR QUE ESTA TABLA NO TIENE COLUMNA DE MONTO ---
 Es la decision central del diseno. El join produce filas al grano (pago x factura), y
@@ -24,27 +25,34 @@ hace imposible un duplicado por construccion. Con menos no alcanza: el documento
 1402635349 tiene dos lineas de pago apuntando al mismo grupo, asi que (pago, factura)
 colisiona sin `posicion_pago`.
 
---- LAS DOS REGLAS ---
+--- LAS TRES REGLAS ---
 GRUPO          el grupo de compensacion del pago YA contiene las facturas. Es el caso
                normal: pago y factura se liquidaron en el mismo evento.
 SEGUNDO_SALTO  el grupo del pago NO trae facturas porque es un documento intermedio
                ("hijo"): reemite el dinero con lineas clave 15 que se compensan contra
                SU PROPIO grupo final, y ahi estan las facturas.
-Son mutuamente excluyentes por construccion (la segunda solo aplica donde la primera no
-encontro nada) - verificado: 0 colisiones.
-Ambas usan solo llaves nativas de SAP. No hay reparto proporcional ni heuristica en
+REFERENCIA     el hijo tiene una linea clave 15 que quedo ABIERTA, con REBZG apuntando
+               a una factura que TAMBIEN sigue abierta. Es el pago parcial: el dinero
+               entro y se abono, pero no alcanzo a liquidar la factura.
+Las tres usan solo llaves nativas de SAP. No hay reparto proporcional ni heuristica en
 ninguna: cada fila es algo que SAP afirma, no algo que nosotros dedujimos.
+GRUPO y SEGUNDO_SALTO son mutuamente excluyentes por construccion. REFERENCIA NO lo es,
+y a proposito: 26 de sus pagos ya estaban ligados por otra regla y ganan una factura
+mas (un deposito puede liquidar tres facturas y abonar a una cuarta). Verificado: 0
+colisiones de llave con lo ya cargado.
+
+--- QUE SIGNIFICA CADA FILA (leer antes de reportar) ---
+GRUPO y SEGUNDO_SALTO dicen "este pago LIQUIDO esta factura".
+REFERENCIA dice "este pago ABONO a esta factura, que sigue abierta".
+Son dos afirmaciones distintas. Es la unica regla que aterriza en facturas abiertas -
+las otras dos van por documento_compensacion, y una partida abierta no lo tiene.
 
 --- LO QUE QUEDA SIN LIGAR, CON NOMBRE ---
-21 pagos ($1,596,249) tienen salto pero el grupo final no trae facturas.
-34 pagos ($  366,149) no tienen salto.
- 3 lineas clave 08 excluidas a proposito (debitos espejo, -$11,174).
+37 lineas / $1,874,426, mayormente: pagos cuyo salto llega a un grupo sin facturas, y
+pagos sin salto. Las 3 lineas clave 08 se excluyen a proposito (debitos espejo).
 Ahi adentro esta Kushky: el dinero de una pasarela llega agregado, no factura por
 factura, asi que estructuralmente no tiene a que apuntar. No es un defecto por corregir.
 
-PENDIENTE: regla R3 del pago parcial via REBZG (56 lineas / $744,347 medidas a nivel
-silver). El deposito virgen NUNCA trae REBZG - 0 de 10,851 en julio, todos 'V'. La
-referencia vive en las lineas clave 15 ABIERTAS del hijo.
 ========================================================================================
 */
 
@@ -130,8 +138,9 @@ CREATE UNIQUE CLUSTERED INDEX ix_salto ON #salto(hijo, grupo_final);
 -- tambien participan del segundo salto - la estructura es la misma - y "un virgen
 -- detras" no significa nada cuando no hay virgen. Son 106 pagos / $552,054.
 --
--- Julio 2026: la guarda no excluye nada. Pero en toda la historia hay 81 intermedios
--- con varios pagos (750 documentos), asi que va en serio, no es decorativa.
+-- Julio 2026: en SEGUNDO_SALTO no excluye nada; en REFERENCIA excluye 1 fila de 54.
+-- Y en toda la historia hay 81 intermedios con varios pagos (750 documentos). No es
+-- decorativa: va en serio.
 IF OBJECT_ID('tempdb..#guarda') IS NOT NULL DROP TABLE #guarda;
 SELECT   documento_compensacion AS intermedio,
          COUNT(DISTINCT documento_id) AS n_pagos
@@ -174,19 +183,60 @@ GO
 
 
 -- ========================================================================================
+-- REGLA 3 - REFERENCIA       53 filas       (reutiliza #guarda de la regla 2)
+-- ========================================================================================
+INSERT INTO dbo.fact_aplicacion_pagos (
+    cliente_id, ejercicio_pago, pago_id, posicion_pago,
+    ejercicio_factura, factura_id, posicion_factura,
+    documento_compensacion, fecha_compensacion, regla
+)
+SELECT p.cliente_id,
+       p.ejercicio, p.documento_id, p.posicion,
+       f.ejercicio, f.documento_id, f.posicion,
+       p.documento_compensacion,   -- el hijo: la factura abierta no tiene grupo propio
+       p.fecha_compensacion,
+       'REFERENCIA'
+FROM   dbo.fact_pagos p
+-- La linea clave 15 del hijo que quedo ABIERTA, con REBZG: la referencia nativa de SAP
+-- a UNA factura. El deposito virgen NUNCA la trae - 0 de 10,851 en julio, todos 'V'.
+-- La referencia vive aqui, en la linea de aplicacion del hijo, no en el pago.
+JOIN   silver.sap_bsid a
+       ON  a.documento_id          = p.documento_compensacion
+       AND a.mandante              = '400'
+       AND a.clase_documento       = 'DZ'
+       AND a.clave_contabilizacion = '15'
+       AND a.factura_referencia_documento IS NOT NULL
+       AND a.factura_referencia_documento <> 'V'
+JOIN   dbo.fact_facturas f
+       ON  f.documento_id = a.factura_referencia_documento
+       AND f.ejercicio    = a.factura_referencia_ejercicio
+       -- SOLO facturas ABIERTAS. Sin esto entran 14 lineas mas ($1,488.12) donde la
+       -- linea de pago sigue abierta pero la factura ya se liquido: eso no es un pago
+       -- parcial, es dinero sin aplicar cuya factura se salda por otro lado.
+       -- Atribuirsela diria que este pago la liquido, y no fue asi.
+       AND f.flag_compensada = 0
+LEFT JOIN #guarda g ON g.intermedio = p.documento_compensacion
+WHERE  p.clave_contabilizacion IN ('11','15')
+  -- Aqui la guarda SI muerde: excluye 1 fila de 54. Es el unico caso medido donde un
+  -- hijo tiene varios pagos detras y el dinero se mezclo dentro.
+  AND  ISNULL(g.n_pagos, 1) = 1;
+GO
+
+
+-- ========================================================================================
 -- Verificacion
 -- ========================================================================================
 SELECT regla, COUNT(*) AS filas, COUNT(DISTINCT pago_id) AS pagos
 FROM   dbo.fact_aplicacion_pagos
 GROUP BY regla;
--- GRUPO 52,633 / 10,661   |   SEGUNDO_SALTO 2,114 / 1,333
+-- GRUPO 52,633 / 10,661   |   SEGUNDO_SALTO 2,114 / 1,333   |   REFERENCIA 53 / ~46
 
 
 -- ========================================================================================
 -- COMO SE CONSUME EL DINERO  -  NUNCA sumando sobre el puente
 -- ========================================================================================
 -- Cobranza aplicada a facturas. Sin join, imposible que infle.
-SELECT SUM(p.monto)      -- 147,293,471.51
+SELECT SUM(p.monto)      -- 147,370,268.58
 FROM   dbo.fact_pagos p
 WHERE  EXISTS (SELECT 1 FROM dbo.fact_aplicacion_pagos a
                WHERE  a.ejercicio_pago = p.ejercicio
