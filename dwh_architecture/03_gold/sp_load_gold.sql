@@ -909,6 +909,33 @@ BEGIN
         EXEC gold.load_fact_facturas_compensadas;
         EXEC gold.load_fact_saldo_cartera;
 
+        -- ------------------------------------------------------------------
+        -- Modelo de aplicacion de pagos (agregado 2026-09-07).
+        -- DDL en 03_gold/ddl_fact_aplicacion_pagos.sql, procs en
+        -- 03_gold/sp_load_fact_aplicacion_pagos.sql, historia 2022-> cargada
+        -- con 03_gold/backfill_fact_aplicacion_pagos.sql.
+        --
+        -- EL ORDEN ENTRE ESTOS CUATRO NO ES NEGOCIABLE: el puente necesita
+        -- pagos y facturas ya cargados, y la clasificacion de lo no ligado
+        -- necesita el puente terminado. Cambiar el orden no da error - da
+        -- filas faltantes en silencio.
+        --
+        -- Van DESPUES de las dimensiones porque resuelven llaves SCD2 por
+        -- vigencia contra fecha_contabilizacion.
+        --
+        -- Sin parametros = modo diario: desde el primer dia del mes anterior.
+        -- load_fact_facturas ademas recarga TODAS las abiertas (es una foto
+        -- del presente) e ignora el tope superior a proposito.
+        --
+        -- Conviven con fact_pagos_compensados / fact_facturas_compensadas y
+        -- vw_pago_factura_simple, que siguen vivos hasta que el reporte nuevo
+        -- este listo (decision del usuario 2026-09-07).
+        -- ------------------------------------------------------------------
+        EXEC gold.load_fact_pagos;
+        EXEC gold.load_fact_facturas;
+        EXEC gold.load_fact_aplicacion_pagos;
+        EXEC gold.load_fact_pagos_sin_aplicacion;
+
         SET @end_time = GETDATE();
         PRINT '===================================================';
         PRINT '>> Full gold refresh finished. Total duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
