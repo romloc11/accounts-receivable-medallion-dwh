@@ -1,6 +1,4 @@
 USE ANALISIS_DATOS;
-GO
-
 /*
 ===============================================================================
 PROJECT: Enterprise Data Warehouse (dwh-ciosa)
@@ -29,6 +27,8 @@ populate_dim_fecha.sql (its bootstrap logic - what to do when the table is
 empty - is now just the NULL case inside this procedure).
 ===============================================================================
 */
+GO
+
 
 -- ==========================================================
 -- gold.load_dim_fecha (Calendar, no SCD)
@@ -842,6 +842,87 @@ END;
 GO
 
 PRINT 'Procedure gold.load_dim_empleado created successfully.';
+/*
+========================================================================================
+PROCEDIMIENTOS DE CARGA del modelo de aplicacion de pagos
+========================================================================================
+Cuatro procs, incrementales por ventana de fecha_compensacion del PAGO. Se corren SIEMPRE
+en este orden - cada uno depende del anterior:
+
+    1. gold.load_fact_pagos
+    2. gold.load_fact_facturas
+    3. gold.load_fact_aplicacion_pagos
+    4. gold.load_fact_pagos_sin_aplicacion
+
+Firma comun: @fecha_desde DATE, @fecha_hasta DATE = NULL
+  @fecha_desde NULL  -> arranca en el primer dia del mes anterior (modo diario)
+  @fecha_hasta NULL  -> sin tope superior
+
+--- EL DEFAULT NULL ENVENENA EL PLAN: POR ESO HAY OPTION (RECOMPILE) ---
+Los cuatro procs declaran @fecha_desde DATE = NULL y calculan el default adentro
+(primer dia del mes anterior). Eso parece inofensivo y NO LO ES.
+
+SQL Server compila el cuerpo del proc con el valor RECIBIDO, no con el calculado.
+Llamado sin parametros -como lo hace gold.load_gold-, compila con @fecha_desde = NULL:
+"fecha_compensacion >= NULL" nunca es cierto, asi que ESTIMA 1 FILA y arma bucles
+anidados. Despues, en ejecucion, la variable ya vale una fecha real que trae ~80,000
+filas, y ese plan de "1 fila" las recorre una por una contra tablas de millones.
+
+Medido el 2026-09-07 sobre gold.load_fact_facturas, misma ventana en los tres casos:
+    EXEC load_fact_facturas                            >20 min  (sin terminar)
+    EXEC load_fact_facturas WITH RECOMPILE             >200 s   (compila con NULL igual)
+    EXEC load_fact_facturas '2026-08-01' WITH RECOMPILE   9.1 s
+Las mismas 4 sentencias corridas sueltas, con fecha literal: 11.2 s en total. El proc
+no era lento por lo que hace - era lento por con que valor se compilo.
+
+OPTION (RECOMPILE) va a NIVEL DE SENTENCIA a proposito: se compila cuando la variable
+YA tiene su valor real, en cada corrida. WITH RECOMPILE en el EXEC no sirve - compila
+al ENTRAR, cuando todavia es NULL. Cuesta milisegundos en procs que corren pocas veces
+al dia.
+
+OJO AL DEBUGGEAR: llamarlos a mano con fecha explicita puede salir rapido y esconder el
+problema, porque reusa el plan bueno que quedo en cache. La prueba honesta es sin
+parametros, que es como corren en produccion.
+
+--- ATOMICIDAD: EL DELETE Y EL INSERT VAN JUNTOS O NO VAN ---
+Cada proc borra su ventana antes de insertarla. Los dos van dentro de UNA transaccion,
+con XACT_ABORT ON y ROLLBACK en el CATCH.
+No es precaucion teorica: el 2026-09-07 estos procs fallaron dos veces en el dia y las
+dos dejaron la tabla mutilada, porque el DELETE ya habia entrado y el INSERT no.
+    load_fact_pagos     -> gold.fact_pagos bajo de 614,353 a 601,392 filas
+    load_fact_facturas  -> se perdieron las compensadas desde agosto (PK duplicada)
+Lo grave no fue perder las filas: fue que el proc muere con un mensaje que nadie tiene
+por que estar leyendo, y la tabla queda consultable, con menos dinero, sin senal alguna.
+Un reporte contra esa tabla se ve normal.
+
+--- BORRADO POR LOTES, NO DE UN JALON ---
+El DELETE va en lotes de 50,000 filas con WHILE + TOP. OJO: adentro de la transaccion el
+loteo YA NO acota el log - el log no puede truncarse hasta el COMMIT, asi que la ventana
+completa vive ahi de todas formas. Lo que sigue haciendo es evitar un solo DELETE gigante
+(escalamiento de bloqueos y un rollback monstruoso si truena).
+Lo que acota el log es el TAMANO DE LA VENTANA, y por eso estos procs son SOLO para carga
+incremental: una ventana diaria/mensual son ~150K filas y corre en segundos. El backfill
+historico NO los usa - inserta por anio en backfill_fact_aplicacion_pagos.sql, justamente
+porque un solo INSERT de 3.2M filas llena los 2 GB de log de este servidor (ya provoco
+Msg 9002 en este proyecto). No llames a estos procs con @fecha_desde en 2022.
+
+--- LAS FACTURAS LLEVAN UN PATRON MIXTO, Y NO ES UN DESCUIDO ---
+gold.fact_facturas junta dos poblaciones con ritmos distintos:
+  compensadas -> historia inmutable. Se cargan por ventana y ya no cambian.
+  abiertas    -> FOTO DEL PRESENTE. Cambian todos los dias: una factura abierta hoy
+                 puede estar compensada manana, y entonces tiene que DESAPARECER del
+                 lado abierto.
+Por eso el lado abierto se borra y recarga COMPLETO en cada corrida, sin ventana. Si se
+cargara por ventana, se acumularian facturas "abiertas" que se pagaron hace meses.
+Es la misma logica del reset FBRA aplicada a la carga: bsid manda sobre el estado de hoy.
+
+--- LOS TRES FILTROS QUE DEFINEN EL MODELO ---
+Aparecen en varios procs; si se cambian, hay que cambiarlos en todos:
+  1. alcance de cliente: canal 10/40/60, estatus <> FUERA_DE_ALCANCE
+  2. pagos: DZ + sgtxt 'Asignacion Aut. Deposito', EXCLUYENDO lineas de documento hijo
+  3. facturas: debe_haber='S', clase F% o D1, EXCLUYENDO resets FBRA del lado compensado
+========================================================================================
+*/
 GO
 
 -- ==========================================================
@@ -901,61 +982,6 @@ GO
 -- historico y recargarlo cuesta horas, no minutos como el resto de la capa.
 -- ##################################################################################
 
-/*
-========================================================================================
-PROCEDIMIENTOS DE CARGA del modelo de aplicacion de pagos
-========================================================================================
-Cuatro procs, incrementales por ventana de fecha_compensacion del PAGO. Se corren SIEMPRE
-en este orden - cada uno depende del anterior:
-
-    1. gold.load_fact_pagos
-    2. gold.load_fact_facturas
-    3. gold.load_fact_aplicacion_pagos
-    4. gold.load_fact_pagos_sin_aplicacion
-
-Firma comun: @fecha_desde DATE, @fecha_hasta DATE = NULL
-  @fecha_desde NULL  -> arranca en el primer dia del mes anterior (modo diario)
-  @fecha_hasta NULL  -> sin tope superior
-
---- ATOMICIDAD: EL DELETE Y EL INSERT VAN JUNTOS O NO VAN ---
-Cada proc borra su ventana antes de insertarla. Los dos van dentro de UNA transaccion,
-con XACT_ABORT ON y ROLLBACK en el CATCH.
-No es precaucion teorica: el 2026-09-07 estos procs fallaron dos veces en el dia y las
-dos dejaron la tabla mutilada, porque el DELETE ya habia entrado y el INSERT no.
-    load_fact_pagos     -> gold.fact_pagos bajo de 614,353 a 601,392 filas
-    load_fact_facturas  -> se perdieron las compensadas desde agosto (PK duplicada)
-Lo grave no fue perder las filas: fue que el proc muere con un mensaje que nadie tiene
-por que estar leyendo, y la tabla queda consultable, con menos dinero, sin senal alguna.
-Un reporte contra esa tabla se ve normal.
-
---- BORRADO POR LOTES, NO DE UN JALON ---
-El DELETE va en lotes de 50,000 filas con WHILE + TOP. OJO: adentro de la transaccion el
-loteo YA NO acota el log - el log no puede truncarse hasta el COMMIT, asi que la ventana
-completa vive ahi de todas formas. Lo que sigue haciendo es evitar un solo DELETE gigante
-(escalamiento de bloqueos y un rollback monstruoso si truena).
-Lo que acota el log es el TAMANO DE LA VENTANA, y por eso estos procs son SOLO para carga
-incremental: una ventana diaria/mensual son ~150K filas y corre en segundos. El backfill
-historico NO los usa - inserta por anio en backfill_fact_aplicacion_pagos.sql, justamente
-porque un solo INSERT de 3.2M filas llena los 2 GB de log de este servidor (ya provoco
-Msg 9002 en este proyecto). No llames a estos procs con @fecha_desde en 2022.
-
---- LAS FACTURAS LLEVAN UN PATRON MIXTO, Y NO ES UN DESCUIDO ---
-gold.fact_facturas junta dos poblaciones con ritmos distintos:
-  compensadas -> historia inmutable. Se cargan por ventana y ya no cambian.
-  abiertas    -> FOTO DEL PRESENTE. Cambian todos los dias: una factura abierta hoy
-                 puede estar compensada manana, y entonces tiene que DESAPARECER del
-                 lado abierto.
-Por eso el lado abierto se borra y recarga COMPLETO en cada corrida, sin ventana. Si se
-cargara por ventana, se acumularian facturas "abiertas" que se pagaron hace meses.
-Es la misma logica del reset FBRA aplicada a la carga: bsid manda sobre el estado de hoy.
-
---- LOS TRES FILTROS QUE DEFINEN EL MODELO ---
-Aparecen en varios procs; si se cambian, hay que cambiarlos en todos:
-  1. alcance de cliente: canal 10/40/60, estatus <> FUERA_DE_ALCANCE
-  2. pagos: DZ + sgtxt 'Asignacion Aut. Deposito', EXCLUYENDO lineas de documento hijo
-  3. facturas: debe_haber='S', clase F% o D1, EXCLUYENDO resets FBRA del lado compensado
-========================================================================================
-*/
 
 
 -- ========================================================================================
@@ -991,7 +1017,8 @@ BEGIN
         BEGIN
             DELETE TOP (50000) FROM gold.fact_pagos
             WHERE fecha_compensacion >= @fecha_desde
-              AND (@fecha_hasta IS NULL OR fecha_compensacion < @fecha_hasta);
+              AND (@fecha_hasta IS NULL OR fecha_compensacion < @fecha_hasta)
+              OPTION (RECOMPILE);   -- ver "EL DEFAULT NULL" en la cabecera
             SET @lote = @@ROWCOUNT;
         END
 
@@ -1037,7 +1064,8 @@ BEGIN
                 SELECT 1 FROM silver.sap_bsad h
                 WHERE h.mandante = '400' AND h.clase_documento = 'DZ'
                   AND h.clave_contabilizacion = '11'
-                  AND h.documento_compensacion = b.documento_id);
+                  AND h.documento_compensacion = b.documento_id)
+                  OPTION (RECOMPILE);   -- ver "EL DEFAULT NULL" en la cabecera
         SET @n = @@ROWCOUNT;
 
         COMMIT TRANSACTION;
@@ -1076,7 +1104,6 @@ BEGIN
 
     IF @fecha_desde IS NULL
         SET @fecha_desde = DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()) - 1, 0);
-
     /* @fecha_hasta SE IGNORA EN EL LADO COMPENSADO, Y ES DELIBERADO.
        Un pago compensado en el mes puede alcanzar, via el segundo salto
        (virgen -> hijo -> grupo final), una factura que se compenso DESPUES. Poner techo
@@ -1086,13 +1113,12 @@ BEGIN
        1,831). El parametro se acepta por consistencia de firma, pero aqui no aplica.
        Consecuencia: este proc siempre recarga de @fecha_desde en adelante. Para la carga
        diaria eso son ~2 meses; para el backfill se corre UNA sola vez desde 2022. */
+
     BEGIN TRY
         PRINT '>> gold.load_fact_facturas | compensadas desde la fecha (SIN techo) + abiertas recarga completa';
 
         -- Ver "ATOMICIDAD" en la cabecera. Todo lo que sigue va junto o no va.
         BEGIN TRANSACTION;
-
-        ------------------------------------------------------- BORRADO (LAS DOS)
         /* LOS DOS DELETE VAN ANTES DE LOS DOS INSERT, Y NO ES ESTILO.
            La PK es (sociedad, cliente_id, ejercicio, documento_id, posicion): NO lleva
            flag_compensada. Una factura que estaba abierta y ya se compenso ocupa esa PK
@@ -1104,13 +1130,16 @@ BEGIN
            (2000, <cliente-8>, 2026, <factura-7>, 1)", y habia 845 facturas en ese estado.
            No se veia en el backfill porque ahi la tabla arrancaba vacia. */
 
+        ------------------------------------------------------- BORRADO (LAS DOS)
+
         -- Compensadas: solo la ventana. SIN @fecha_hasta a proposito, ver nota arriba.
         SET @lote = 1;
         WHILE @lote > 0
         BEGIN
             DELETE TOP (50000) FROM gold.fact_facturas
             WHERE flag_compensada = 1
-              AND fecha_compensacion >= @fecha_desde;
+              AND fecha_compensacion >= @fecha_desde
+              OPTION (RECOMPILE);   -- ver "EL DEFAULT NULL" en la cabecera
             SET @lote = @@ROWCOUNT;
         END
 
@@ -1161,7 +1190,8 @@ BEGIN
                 SELECT 1 FROM silver.sap_bsid i
                 WHERE i.mandante = b.mandante AND i.sociedad = b.sociedad
                   AND i.cliente_id = b.cliente_id AND i.ejercicio = b.ejercicio
-                  AND i.documento_id = b.documento_id AND i.posicion = b.posicion);
+                  AND i.documento_id = b.documento_id AND i.posicion = b.posicion)
+                  OPTION (RECOMPILE);   -- ver "EL DEFAULT NULL" en la cabecera
         SET @n_comp = @@ROWCOUNT;
 
         ---------------------------------------------------------------- ABIERTAS
@@ -1244,7 +1274,8 @@ BEGIN
         BEGIN
             DELETE TOP (50000) FROM gold.fact_aplicacion_pagos
             WHERE fecha_compensacion >= @fecha_desde
-              AND (@fecha_hasta IS NULL OR fecha_compensacion < @fecha_hasta);
+              AND (@fecha_hasta IS NULL OR fecha_compensacion < @fecha_hasta)
+              OPTION (RECOMPILE);   -- ver "EL DEFAULT NULL" en la cabecera
             SET @lote = @@ROWCOUNT;
         END
 
@@ -1261,7 +1292,8 @@ BEGIN
                ON  f.documento_compensacion = p.documento_compensacion
                AND f.ejercicio_compensacion = p.ejercicio_compensacion
         WHERE  p.fecha_compensacion >= @fecha_desde
-          AND (@fecha_hasta IS NULL OR p.fecha_compensacion < @fecha_hasta);
+          AND (@fecha_hasta IS NULL OR p.fecha_compensacion < @fecha_hasta)
+          OPTION (RECOMPILE);   -- ver "EL DEFAULT NULL" en la cabecera
         SET @n1 = @@ROWCOUNT;
 
         -------------------------------------------------------- apoyos para 2 y 3
@@ -1320,7 +1352,8 @@ BEGIN
           -- Solo donde GRUPO no encontro nada. Esto las hace excluyentes.
           AND  NOT EXISTS (SELECT 1 FROM gold.fact_facturas ff
                            WHERE ff.documento_compensacion = p.documento_compensacion
-                             AND ff.ejercicio_compensacion = p.ejercicio_compensacion);
+                             AND ff.ejercicio_compensacion = p.ejercicio_compensacion)
+                             OPTION (RECOMPILE);   -- ver "EL DEFAULT NULL" en la cabecera
         SET @n2 = @@ROWCOUNT;
 
         -------------------------------------------------------- REGLA 3: REFERENCIA
@@ -1353,7 +1386,8 @@ BEGIN
         WHERE  p.fecha_compensacion >= @fecha_desde
           AND (@fecha_hasta IS NULL OR p.fecha_compensacion < @fecha_hasta)
           AND  p.clave_contabilizacion IN ('11','15')
-          AND  ISNULL(g.n_pagos, 1) = 1;
+          AND  ISNULL(g.n_pagos, 1) = 1
+          OPTION (RECOMPILE);   -- ver "EL DEFAULT NULL" en la cabecera
         SET @n3 = @@ROWCOUNT;
 
         COMMIT TRANSACTION;
@@ -1375,7 +1409,8 @@ BEGIN
           -- solo los que NO entraron por GRUPO: esos son los que de verdad se pierden
           AND  NOT EXISTS (SELECT 1 FROM gold.fact_facturas ff
                            WHERE ff.documento_compensacion = p.documento_compensacion
-                             AND ff.ejercicio_compensacion = p.ejercicio_compensacion);
+                             AND ff.ejercicio_compensacion = p.ejercicio_compensacion)
+                             OPTION (RECOMPILE);   -- ver "EL DEFAULT NULL" en la cabecera
 
         PRINT '   GRUPO: ' + CAST(@n1 AS VARCHAR(12))
             + ' | SEGUNDO_SALTO: ' + CAST(@n2 AS VARCHAR(12))
@@ -1426,7 +1461,8 @@ BEGIN
         BEGIN
             DELETE TOP (50000) FROM gold.fact_pagos_sin_aplicacion
             WHERE fecha_compensacion >= @fecha_desde
-              AND (@fecha_hasta IS NULL OR fecha_compensacion < @fecha_hasta);
+              AND (@fecha_hasta IS NULL OR fecha_compensacion < @fecha_hasta)
+              OPTION (RECOMPILE);   -- ver "EL DEFAULT NULL" en la cabecera
             SET @lote = @@ROWCOUNT;
         END
 
@@ -1497,7 +1533,8 @@ BEGIN
                                  AND a.posicion_pago  = p.posicion)
             GROUP BY p.sociedad, p.cliente_id, p.ejercicio, p.documento_id, p.posicion,
                      p.documento_compensacion, p.fecha_compensacion, p.clave_contabilizacion
-        ) x;
+        ) x
+        OPTION (RECOMPILE);   -- ver "EL DEFAULT NULL" en la cabecera
         SET @n = @@ROWCOUNT;
 
         COMMIT TRANSACTION;
@@ -1507,7 +1544,8 @@ BEGIN
         SELECT @revisar = COUNT(*) FROM gold.fact_pagos_sin_aplicacion
         WHERE motivo = 'REVISAR'
           AND fecha_compensacion >= @fecha_desde
-          AND (@fecha_hasta IS NULL OR fecha_compensacion < @fecha_hasta);
+          AND (@fecha_hasta IS NULL OR fecha_compensacion < @fecha_hasta)
+          OPTION (RECOMPILE);   -- ver "EL DEFAULT NULL" en la cabecera
 
         -- INVARIANTE DEL MODELO: todo pago esta en el puente O aqui, nunca en ninguno.
         SELECT @huerfanos = COUNT(*)
@@ -1519,7 +1557,8 @@ BEGIN
                              AND a.pago_id=p.documento_id AND a.posicion_pago=p.posicion)
           AND  NOT EXISTS (SELECT 1 FROM gold.fact_pagos_sin_aplicacion s
                            WHERE s.sociedad=p.sociedad AND s.ejercicio=p.ejercicio
-                             AND s.documento_id=p.documento_id AND s.posicion=p.posicion);
+                             AND s.documento_id=p.documento_id AND s.posicion=p.posicion)
+                             OPTION (RECOMPILE);   -- ver "EL DEFAULT NULL" en la cabecera
 
         PRINT '   Filas: ' + CAST(@n AS VARCHAR(12))
             + ' | Duracion: ' + CAST(DATEDIFF(SECOND, @t0, GETDATE()) AS VARCHAR(10)) + ' s';
