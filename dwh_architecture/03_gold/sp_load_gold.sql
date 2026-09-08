@@ -104,8 +104,47 @@ BEGIN
             SET @fecha_cursor = DATEADD(DAY, 1, @fecha_cursor);
         END
 
+        -- ------------------------------------------------------------------
+        -- DIAS HABILES: se recalculan COMPLETAS, no solo para los dias nuevos.
+        -- El WHILE de arriba solo INSERTA, y estas columnas no dependen solo de la
+        -- fila: dia_habil_del_mes y dias_habiles_mes dependen del MES entero, y todas
+        -- dependen de gold.dim_festivo, que puede crecer despues. Si se calcularan al
+        -- insertar, agregar un festivo de 2027 dejaria mal numerado todo ese mes y
+        -- nadie se enteraria. Son ~72K filas: recalcular todo cuesta menos de 1 s.
+        -- ------------------------------------------------------------------
+        UPDATE d
+        SET    d.es_festivo     = CASE WHEN f.fecha IS NULL THEN 0 ELSE 1 END,
+               d.nombre_festivo = f.nombre
+        FROM   gold.dim_fecha d
+        LEFT JOIN gold.dim_festivo f ON f.fecha = d.fecha;
+
+        UPDATE gold.dim_fecha
+        SET    es_dia_habil = CASE WHEN es_fin_de_semana = 0 AND es_festivo = 0 THEN 1 ELSE 0 END;
+
+        UPDATE gold.dim_fecha SET dia_habil_del_mes = NULL;
+
+        WITH h AS (
+            SELECT fecha, ROW_NUMBER() OVER (PARTITION BY anio, mes ORDER BY fecha) AS n
+            FROM   gold.dim_fecha WHERE es_dia_habil = 1)
+        UPDATE d SET d.dia_habil_del_mes = h.n
+        FROM   gold.dim_fecha d JOIN h ON h.fecha = d.fecha;
+
+        WITH t AS (
+            SELECT anio, mes, COUNT(*) AS n
+            FROM   gold.dim_fecha WHERE es_dia_habil = 1 GROUP BY anio, mes)
+        UPDATE d SET d.dias_habiles_mes = t.n
+        FROM   gold.dim_fecha d JOIN t ON t.anio = d.anio AND t.mes = d.mes;
+
+        -- El mismo dia si ya es habil; si no, el siguiente que lo sea. Aqui vive la
+        -- regla del pronostico: una fecha de pago predicha que cae en domingo o
+        -- festivo se RECORRE, no se pierde ni se reparte.
+        UPDATE d
+        SET    d.siguiente_dia_habil = (SELECT MIN(h.fecha) FROM gold.dim_fecha h
+                                        WHERE h.fecha >= d.fecha AND h.es_dia_habil = 1)
+        FROM   gold.dim_fecha d;
+
         SET @end_time = GETDATE();
-        PRINT 'New days added: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
+        PRINT 'New days added: ' + CAST(@rows_count AS NVARCHAR) + ' | dias habiles recalculados | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
     END TRY
     BEGIN CATCH
         PRINT 'ERROR in gold.dim_fecha: ' + ERROR_MESSAGE();
@@ -1431,6 +1470,104 @@ PRINT 'Procedure gold.load_fact_aplicacion_pagos created successfully.';
 GO
 
 
+
+-- ========================================================================================
+-- 4b. gold.load_fact_facturas_pago_efectivo
+--     Corre DESPUES del puente, y no puede ser de otra forma: estas tres columnas salen
+--     de gold.fact_aplicacion_pagos, que se carga despues de fact_facturas. Cuando corre
+--     load_fact_facturas el puente todavia trae la ventana anterior.
+-- ========================================================================================
+IF OBJECT_ID('gold.load_fact_facturas_pago_efectivo', 'P') IS NOT NULL
+    DROP PROCEDURE gold.load_fact_facturas_pago_efectivo;
+GO
+
+CREATE PROCEDURE gold.load_fact_facturas_pago_efectivo
+    @fecha_desde DATE = NULL,
+    @fecha_hasta DATE = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    DECLARE @t0 DATETIME = GETDATE(), @n_comp INT, @n_abie INT;
+
+    IF @fecha_desde IS NULL
+        SET @fecha_desde = DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()) - 1, 0);
+
+    BEGIN TRY
+        PRINT '>> gold.load_fact_facturas_pago_efectivo';
+
+        /* EL ULTIMO PAGO POR FACTURA SE PRECALCULA UNA VEZ, EN UNA TEMPORAL.
+           La version anterior traia un OUTER APPLY correlacionado y un OR en el WHERE
+           (abiertas O la ventana). Resultado: la subconsulta se evaluaba fila por fila
+           sobre las 3.27M, y el backfill llevaba 4,890 filas despues de varios minutos.
+           Precalcular y unir por JOIN convierte 3 millones de subconsultas en un join. */
+        IF OBJECT_ID('tempdb..#fpe') IS NOT NULL DROP TABLE #fpe;
+        SELECT   a.sociedad, a.ejercicio_factura, a.factura_id, a.posicion_factura,
+                 MAX(p.fecha_documento) AS fpe
+        INTO     #fpe
+        FROM     gold.fact_aplicacion_pagos a
+        JOIN     gold.fact_pagos p
+                 ON  p.sociedad = a.sociedad AND p.ejercicio = a.ejercicio_pago
+                 AND p.documento_id = a.pago_id AND p.posicion = a.posicion_pago
+        GROUP BY a.sociedad, a.ejercicio_factura, a.factura_id, a.posicion_factura;
+        CREATE UNIQUE CLUSTERED INDEX ix_fpe ON #fpe(sociedad, ejercicio_factura, factura_id, posicion_factura);
+
+        /* DOS SENTENCIAS, NO UNA CON OR. Un OR entre 'abiertas' y 'ventana de
+           compensadas' no es sargable y obliga a recorrer la tabla entera. */
+
+        -- 1. Compensadas de la ventana
+        UPDATE f
+        SET    f.fecha_pago_efectiva = x.fpe,
+               f.dias_pago = DATEDIFF(DAY, f.fecha_vencimiento, x.fpe),
+               f.clasificacion_cobranza =
+                   CASE WHEN x.fpe IS NULL THEN NULL
+                        WHEN f.fecha_vencimiento < DATEFROMPARTS(YEAR(x.fpe), MONTH(x.fpe), 1)
+                             THEN 'PAGO_A_VENCIMIENTO'
+                        WHEN f.fecha_vencimiento <= EOMONTH(x.fpe) THEN 'PAGO_A_MES'
+                        ELSE 'PAGO_ANTICIPADO' END
+        FROM   gold.fact_facturas f
+        /* LEFT JOIN, no INNER: una factura que PIERDE su pago -recompensacion- tiene
+           que volver a NULL, no quedarse con el valor viejo. */
+        LEFT JOIN #fpe x ON x.sociedad = f.sociedad AND x.ejercicio_factura = f.ejercicio
+                        AND x.factura_id = f.documento_id AND x.posicion_factura = f.posicion
+        WHERE  f.flag_compensada = 1
+          AND  f.fecha_compensacion >= @fecha_desde
+          AND (@fecha_hasta IS NULL OR f.fecha_compensacion < @fecha_hasta)
+        OPTION (RECOMPILE);
+        SET @n_comp = @@ROWCOUNT;
+
+        -- 2. Abiertas: SIEMPRE todas. Ese lado se reconstruye completo en cada corrida,
+        --    y una factura abierta SI puede tener pago (regla REFERENCIA, pagos parciales).
+        UPDATE f
+        SET    f.fecha_pago_efectiva = x.fpe,
+               f.dias_pago = DATEDIFF(DAY, f.fecha_vencimiento, x.fpe),
+               f.clasificacion_cobranza =
+                   CASE WHEN x.fpe IS NULL THEN NULL
+                        WHEN f.fecha_vencimiento < DATEFROMPARTS(YEAR(x.fpe), MONTH(x.fpe), 1)
+                             THEN 'PAGO_A_VENCIMIENTO'
+                        WHEN f.fecha_vencimiento <= EOMONTH(x.fpe) THEN 'PAGO_A_MES'
+                        ELSE 'PAGO_ANTICIPADO' END
+        FROM   gold.fact_facturas f
+        LEFT JOIN #fpe x ON x.sociedad = f.sociedad AND x.ejercicio_factura = f.ejercicio
+                        AND x.factura_id = f.documento_id AND x.posicion_factura = f.posicion
+        WHERE  f.flag_compensada = 0
+        OPTION (RECOMPILE);
+        SET @n_abie = @@ROWCOUNT;
+
+        PRINT '   Compensadas: ' + CAST(@n_comp AS VARCHAR(12))
+            + ' | Abiertas: ' + CAST(@n_abie AS VARCHAR(12))
+            + ' | Duracion: ' + CAST(DATEDIFF(SECOND, @t0, GETDATE()) AS VARCHAR(10)) + ' s';
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+        PRINT 'ERROR en gold.load_fact_facturas_pago_efectivo: ' + ERROR_MESSAGE();
+        THROW;
+    END CATCH;
+END;
+GO
+PRINT 'Procedure gold.load_fact_facturas_pago_efectivo created successfully.';
+GO
+
 -- ========================================================================================
 -- 4. gold.load_fact_pagos_sin_aplicacion
 -- ========================================================================================
@@ -1628,6 +1765,7 @@ BEGIN
         EXEC gold.load_fact_pagos;
         EXEC gold.load_fact_facturas;
         EXEC gold.load_fact_aplicacion_pagos;
+        EXEC gold.load_fact_facturas_pago_efectivo;
         EXEC gold.load_fact_pagos_sin_aplicacion;
 
         SET @end_time = GETDATE();
