@@ -435,8 +435,8 @@ BEGIN
         -- re-cleared (old fecha_compensacion in the target, new AUGDT in bronze because
         -- bronze doesn't keep history) was treated as "no match" and the MERGE tried a
         -- duplicate INSERT instead of updating the existing row - violating the PK. Real
-        -- case: document 7404597470/pos.1, originally cleared 2026-04-07 (doc.
-        -- 8501526715), reversed and re-cleared 2026-08-03 (doc. 1402639643). The window
+        -- case: document <factura-6>/pos.1, originally cleared 2026-04-07 (doc.
+        -- <grupo-5>), reversed and re-cleared 2026-08-03 (doc. <pago-13>). The window
         -- filter already lives in the src's WHERE (AUGDT >= @mes_anterior_inicio_str) -
         -- no need to repeat it in the ON.
 

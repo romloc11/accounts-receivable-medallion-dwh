@@ -203,7 +203,7 @@ SELECT @total = COUNT(*) FROM silver.sap_bsad;
 PRINT 'silver.sap_bsad rows: ' + CAST(@total AS VARCHAR) + ' | clave_contabilizacion IS NULL: ' + CAST(@nulos AS VARCHAR) + ' (expected 0)';
 
 -- Distribution sanity check against what the investigation measured in bronze on 2026-09-03
--- (DZ side H: 15 ~606K, 11 ~567K; AB: 07/17 in $0.00 ~304K lines; ZZ: 05 ~97K, 18 ~96K)
+-- (DZ side H: 15 ~606K, 11 ~567K; AB: 07/17 in $0 ~304K lines; ZZ: 05 ~97K, 18 ~96K)
 SELECT clase_documento, clave_contabilizacion, debe_haber, COUNT(*) AS filas
 FROM silver.sap_bsad
 WHERE clase_documento IN ('DZ', 'AB', 'ZZ', 'CP')

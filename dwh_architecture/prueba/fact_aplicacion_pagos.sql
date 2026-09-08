@@ -3,18 +3,18 @@
 dbo.fact_aplicacion_pagos  -  el PUENTE: que facturas toco cada pago
 ========================================================================================
 CONTROL (2026-09-07): 54,800 filas
-    GRUPO          52,633 filas | 10,661 documentos | $135,929,118  (91.1%)
-    SEGUNDO_SALTO   2,114 filas |  1,333 documentos | $ 11,364,353  ( 7.6%)
+    GRUPO          52,633 filas | 10,661 documentos | ~$135.9M  (91.1%)
+    SEGUNDO_SALTO   2,114 filas |  1,333 documentos | ~$11.4M  ( 7.6%)
     REFERENCIA         53 filas |    ~46 documentos | $     76,797  ( 0.1%)
     ----------------------------------------------------------------------
-    ligado                                          | $147,370,269  (98.7%)
+    ligado                                          | ~$147.4M  (98.7%)
     sin ligar                   |     37 lineas     | $  1,874,426  ( 1.3%)
 
 --- POR QUE ESTA TABLA NO TIENE COLUMNA DE MONTO ---
 Es la decision central del diseno. El join produce filas al grano (pago x factura), y
 ahi NINGUN monto es aditivo: ni el del pago ni el de la factura. Los dos vienen
 heredados de un grano mas grueso, asi que sumarlos duplica.
-    SUM(monto_pago) sobre el join = $11,427,680,334   <- 83x inflado
+    SUM(monto_pago) sobre el join = ~$11.4 mil millones   <- 83x inflado
     lo correcto                   = $  147,293,472
 El puente responde "que facturas toco este pago". El dinero se suma desde fact_pagos y
 fact_facturas, cada una en su propio grano, con EXISTS (ver el bloque de consumo abajo).
@@ -22,7 +22,7 @@ fact_facturas, cada una en su propio grano, con EXISTS (ver el bloque de consumo
 --- POR QUE LA PK TIENE SEIS COLUMNAS ---
 Es la llave natural completa: la PK del pago mas la PK de la factura. Se ve pesada pero
 hace imposible un duplicado por construccion. Con menos no alcanza: el documento
-1402635349 tiene dos lineas de pago apuntando al mismo grupo, asi que (pago, factura)
+<pago-16> tiene dos lineas de pago apuntando al mismo grupo, asi que (pago, factura)
 colisiona sin `posicion_pago`.
 
 --- LAS TRES REGLAS ---
@@ -48,16 +48,16 @@ Son dos afirmaciones distintas. Es la unica regla que aterriza en facturas abier
 las otras dos van por documento_compensacion, y una partida abierta no lo tiene.
 
 --- LO QUE QUEDA SIN LIGAR VIVE EN OTRA TABLA ---
-dbo.fact_pagos_sin_aplicacion (ver su propio script): 37 lineas / $1,874,426.31, cada
+dbo.fact_pagos_sin_aplicacion (ver su propio script): 37 lineas / ~$1.9M, cada
 una con motivo. NO son un hueco: ese dinero SI entro y liquido documentos que no son
-facturas de cliente - SA (ajustes y comisiones) $1,282,187, AB $354,455. Por eso la
+facturas de cliente - SA (ajustes y comisiones) ~$1.3M, AB ~$354K. Por eso la
 etiqueta dice LIQUIDA_NO_FACTURA y no NO_IDENTIFICADO.
-Invariante verificada: aplicada $147,370,268.58 + sin aplicacion $1,874,426.31 =
-$149,244,694.89, la cobranza total. Todo pago esta en una tabla o en la otra, nunca en
+Invariante verificada: aplicada ~$147.4M + sin aplicacion ~$1.9M =
+~$149.2M, la cobranza total. Todo pago esta en una tabla o en la otra, nunca en
 las dos ni en ninguna.
 
 --- DETALLE DE LO SIN LIGAR ---
-37 lineas / $1,874,426, mayormente: pagos cuyo salto llega a un grupo sin facturas, y
+37 lineas / ~$1.9M, mayormente: pagos cuyo salto llega a un grupo sin facturas, y
 pagos sin salto. Las 3 lineas clave 08 se excluyen a proposito (debitos espejo).
 Ahi adentro esta Kushky: el dinero de una pasarela llega agregado, no factura por
 factura, asi que estructuralmente no tiene a que apuntar. No es un defecto por corregir.
@@ -145,7 +145,7 @@ CREATE UNIQUE CLUSTERED INDEX ix_salto ON #salto(hijo, grupo_final);
 --
 -- Cuenta documentos de pago (claves 11 y 15), NO solo virgenes: los pagos directos
 -- tambien participan del segundo salto - la estructura es la misma - y "un virgen
--- detras" no significa nada cuando no hay virgen. Son 106 pagos / $552,054.
+-- detras" no significa nada cuando no hay virgen. Son 106 pagos / ~$552K.
 --
 -- Julio 2026: en SEGUNDO_SALTO no excluye nada; en REFERENCIA excluye 1 fila de 54.
 -- Y en toda la historia hay 81 intermedios con varios pagos (750 documentos). No es
@@ -219,7 +219,7 @@ JOIN   silver.sap_bsid a
 JOIN   dbo.fact_facturas f
        ON  f.documento_id = a.factura_referencia_documento
        AND f.ejercicio    = a.factura_referencia_ejercicio
-       -- SOLO facturas ABIERTAS. Sin esto entran 14 lineas mas ($1,488.12) donde la
+       -- SOLO facturas ABIERTAS. Sin esto entran 14 lineas mas (~$1K) donde la
        -- linea de pago sigue abierta pero la factura ya se liquido: eso no es un pago
        -- parcial, es dinero sin aplicar cuya factura se salda por otro lado.
        -- Atribuirsela diria que este pago la liquido, y no fue asi.
@@ -245,7 +245,7 @@ GROUP BY regla;
 -- COMO SE CONSUME EL DINERO  -  NUNCA sumando sobre el puente
 -- ========================================================================================
 -- Cobranza aplicada a facturas. Sin join, imposible que infle.
-SELECT SUM(p.monto)      -- 147,370,268.58
+SELECT SUM(p.monto)      -- ~$147.4M
 FROM   dbo.fact_pagos p
 WHERE  EXISTS (SELECT 1 FROM dbo.fact_aplicacion_pagos a
                WHERE  a.ejercicio_pago = p.ejercicio

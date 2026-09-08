@@ -41,7 +41,7 @@
 -- batches where genuinely different RFCs get mixed together (marketplace
 -- technical accounts mixing with each other, etc.). Measured 2026-08-20
 -- over the full historical GENERICO customers in channel 10/40/60: only
--- 430 payments / $315,923 (0.12% of the amount) fall into groups with 2+
+-- 430 payments / ~$316K (0.12% of the amount) fall into groups with 2+
 -- distinct RFCs - those are the only ones this filter excludes; the other
 -- 99.88% ($258M) passes through fine.
 --
@@ -99,7 +99,7 @@
 -- 1 row per (pago, factura) pair. That means monto_pago_virgen REPEATS
 -- in full on every one of those rows - summing it directly inflates
 -- the real cash figure by however many invoices share the group (measured:
--- $853.9M real vs. $97,645.0M if summed naively across all 2026 fan-out
+-- $853.9M real vs. ~$98K.0M if summed naively across all 2026 fan-out
 -- groups, a ~95x inflation - the same class of over-attribution bug that
 -- got the original fact_aplicacion_pagos deleted 2026-08-19). Power BI's
 -- own "Monto Total Recibido" measure already works around this via
@@ -116,19 +116,19 @@
 -- AMBIGUITY GATE REDEFINED 2026-08-29 (same day, later session): "don't guess"
 -- now means num_pagos_candidatos>1 AND num_facturas_candidatas>1 together (a
 -- true many-to-many group), not just num_pagos_candidatos>1 alone. Found from
--- a real SAP screenshot (customer group 1402614232): 2 payment candidates
--- (a $10,403.21 deposit + a $0.10 leftover, both self-referencing/direct,
+-- a real SAP screenshot (customer group <pago-15>): 2 payment candidates
+-- (a ~$10K deposit + a ~$0 leftover, both self-referencing/direct,
 -- neither excluded by the self-canceling-pair fix since there's no matching
--- opposite-side line) but only 1 invoice ($10,403.31 - the two payments sum
+-- opposite-side line) but only 1 invoice (~$10K - the two payments sum
 -- to it exactly). With only 1 invoice in the group there's nothing to
 -- mis-attribute: every payment candidate necessarily applies to that same
 -- invoice, whether there's 1 or 5 of them - the risk this gate protects
 -- against (2+ payments each possibly matching a DIFFERENT invoice) simply
 -- doesn't exist when there's at most 1 invoice. Validated against real July
 -- data before implementing: of the 27 groups the OLD gate still excluded
--- after the self-canceling-pair fix, 23 have exactly 1 invoice ($120,710.99
+-- after the self-canceling-pair fix, 23 have exactly 1 invoice (~$121K
 -- - the exact pattern above, now resolved) and only 4 have many invoices
--- (5/7/10/13 - genuinely ambiguous many-to-many, $166,221.23, correctly still
+-- (5/7/10/13 - genuinely ambiguous many-to-many, ~$166K, correctly still
 -- excluded). monto_pago_asignado's existing proration math already handles
 -- this correctly with no formula change: with exactly 1 invoice,
 -- suma_facturas_grupo equals that invoice's own amount, so
@@ -139,9 +139,9 @@
 -- GATE note above still left 4 real July groups excluded even after allowing
 -- single-invoice groups through - all 4 are genuine many-to-many batches
 -- (2-3 payment candidates against 5-13 invoices each, spanning several
--- months). Found from a second real SAP screenshot (customer 10002440,
--- group 8501588763: 2 deposits totaling $25,099.70 against 5 invoices
--- totaling $25,446.69, balanced by an AB adjustment line). Checked whether
+-- months). Found from a second real SAP screenshot (customer <cliente-9>,
+-- group <grupo-6>: 2 deposits totaling ~$25K against 5 invoices
+-- totaling ~$25K, balanced by an AB adjustment line). Checked whether
 -- any deposit amount subset-sums to a specific invoice or invoice subset -
 -- no clean match in any of the 4 groups, so per-invoice attribution here
 -- would be exactly the kind of guess that got the original
@@ -168,7 +168,7 @@
 -- (same CASE branch already used for the no-invoice-at-all case) - the cash
 -- now counts in any measure that sums monto_pago_asignado, without
 -- pretending to know which invoice(s) each specific deposit covered.
--- Validated before implementing: recovers $166,221.23 across the 4 groups.
+-- Validated before implementing: recovers ~$166K across the 4 groups.
 --
 -- INNER JOIN -> LEFT JOIN on gold.fact_facturas_compensadas, 2026-08-29:
 -- a payment with no matching invoice in its compensation group ("pago a
@@ -269,7 +269,7 @@ grupo_rfc_unico AS (
     -- (RFC NULL por diseno - Kushky, etc.) daba COUNT(DISTINCT rfc)=0, no 1, y la
     -- condicion HAVING =1 fallaba - excluyendo pagos reales de marketplace que se
     -- compensan solos, sin ninguna ambiguedad real. Confirmado con datos reales:
-    -- $1,338,328.31 recuperados en julio (9 pagos), $0 perdido de lo que ya estaba
+    -- ~$1.3M recuperados en julio (9 pagos), $0 perdido de lo que ya estaba
     -- bien (validado antes de implementar). El fallback por cliente_id preserva el
     -- proposito original de la regla: sigue excluyendo grupos que mezclan 2+
     -- identidades reales distintas, solo deja de tratar "un mismo cliente sin RFC"
@@ -288,7 +288,7 @@ facturas_por_grupo AS (
     GROUP BY documento_compensacion, ejercicio_compensacion
 ),
 -- CADENA DE 2 SALTOS agregada 2026-09-03 (investigacion arrancada de un ejemplo real de
--- SAP que el usuario compartio, documento 1402621305 - ver dwh-ciosa-project-status.md en
+-- SAP que el usuario compartio, documento <pago-1> - ver dwh-ciosa-project-status.md en
 -- memoria para el detalle completo): SAP a veces liquida un deposito en 2 pasos - el
 -- deposito se liquida primero contra un documento_compensacion "intermedio" (que NO es una
 -- factura, es otro documento tecnico de liquidacion), y ESE documento intermedio se liquida
@@ -296,9 +296,9 @@ facturas_por_grupo AS (
 -- otros pagos). El JOIN normal de esta vista solo busca la factura en el grupo DIRECTO del
 -- pago - si la factura esta un salto mas abajo, el pago quedaba "SIN_FACTURA_IDENTIFICADA"
 -- aunque el dinero si tenga una factura real detras. Caso real confirmado: deposito
--- 1402621305 ($2,801.85) se liquido en el grupo intermedio 1402621328, que a su vez (junto
--- con otro deposito de $540.20) liquido la factura 7404802497 ($3,342.05 exacto) en el
--- grupo final 8501578933.
+-- <pago-1> (~$3K) se liquido en el grupo intermedio <pago-2>, que a su vez (junto
+-- con otro deposito de ~$540) liquido la factura <factura-1> (el mismo monto (exacto)) en el
+-- grupo final <grupo-1>.
 --
 -- salto_h: para cada documento_id, su(s) propia(s) liquidacion(es) como linea 'H' (la
 -- liquidacion real hacia adelante, no el 'S' que es el mirror/hijo del propio grupo) hacia
@@ -331,7 +331,7 @@ grupo_final_unico AS (
 -- FINAL de la cadena de 2 saltos si el directo no tiene factura Y el salto es unico Y el
 -- grupo final si tiene factura(s). Validado 2026-09-03 con datos reales de julio antes de
 -- implementar: de los 1,430 pagos SIN_FACTURA_IDENTIFICADA de julio ($17.45M), 1,099
--- ($7,493,413.67, 43% del monto) se resuelven limpio con esta regla; el resto se queda sin
+-- (~$7.5M, 43% del monto) se resuelven limpio con esta regla; el resto se queda sin
 -- resolver a proposito (261/$4.6M ambiguos - varios grupos finales candidatos; 36/$5.1M el
 -- grupo final tampoco tiene factura directa, necesitaria un 3er salto; 34/$258K sin ningun
 -- salto encontrado, genuinamente sin factura). Ver dwh-ciosa-project-status.md en memoria.
@@ -360,15 +360,15 @@ grupo_resuelto AS (
        AND fpg_final.ejercicio_compensacion = gfu.ejercicio_grupo_final
 ),
 -- REEMBOLSO agregado 2026-09-03 (investigacion arrancada de un ejemplo real de SAP que el
--- usuario compartio, documento 1402626246, cliente 10015304): a veces un cliente deposita
+-- usuario compartio, documento <pago-3>, cliente <cliente-6>): a veces un cliente deposita
 -- 2 veces el mismo monto (duplicado/error) - un deposito se aplica a la factura real, el
 -- otro se liquida contra un asiento clase SA con texto "REEM ##.../REEMBOLSO..." (senal de
 -- que ese efectivo especifico esta destinado a devolverse al cliente, no es cobranza real
 -- retenida). Contarlo en Cobranza Total infla el monto real cobrado, porque ese efectivo no
--- se queda - sale de nuevo como reembolso. Confirmado con un caso real: deposito 1402626246
--- ($9,422.30) se liquido contra el asiento SA "REEM 01 10015304 LOPEZ CELIS GRACIELA"
--- ($9,422.30 exacto) mientras un deposito GEMELO (1402626207, mismo cliente, mismo monto,
--- misma Asignacion) si pago la factura real 7404816359 por separado.
+-- se queda - sale de nuevo como reembolso. Confirmado con un caso real: deposito <pago-3>
+-- (~$9K) se liquido contra el asiento SA "REEM ## <cliente> <nombre>"
+-- (el mismo monto (exacto)) mientras un deposito GEMELO (<pago-4>, mismo cliente, mismo monto,
+-- misma Asignacion) si pago la factura real <factura-2> por separado.
 --
 -- sa_reem_en_grupo: suma de lineas clase SA con texto que empieza "REEM" (cubre tanto "REEM
 -- ## <cliente> <nombre>" como "REEMBOLSO..."), por grupo de compensacion.
@@ -387,9 +387,9 @@ sa_reem_en_grupo AS (
 -- un ajuste SA/REEM chico y NO relacionado (ej. redondeo) - esos NO se excluyen, el pago es
 -- real. Solo cuando el pago coincide EXACTO con la linea SA (dentro de 1 centavo) Y es el
 -- unico candidato del grupo se confirma el patron limpio "deposito duplicado -> reembolso":
--- 164 grupos, $2,907,987.30 en toda la historia (2022-2026), de los cuales 3 grupos /
--- $22,984.10 son de julio 2026. Los casos donde 2-3 pagos SUMAN exacto contra la misma
--- linea SA (10 grupos/$159,848.33 y 1 grupo/$15,761.22) se dejan SIN excluir a proposito -
+-- 164 grupos, ~$2.9M en toda la historia (2022-2026), de los cuales 3 grupos /
+-- ~$23K son de julio 2026. Los casos donde 2-3 pagos SUMAN exacto contra la misma
+-- linea SA (10 grupos/~$160K y 1 grupo/~$16K) se dejan SIN excluir a proposito -
 -- no se sabe cual de esos pagos es especificamente el reembolsado. Ver
 -- dwh-ciosa-project-status.md en memoria para el detalle completo de la investigacion.
 reembolso_limpio AS (

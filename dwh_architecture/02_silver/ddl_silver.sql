@@ -286,7 +286,7 @@ CREATE TABLE silver.sap_bsad (
     clase_documento VARCHAR(2),
     codigo_impuesto VARCHAR(2), -- MWSKZ: VAT code, same as in silver.sap_bsid
     debe_haber CHAR(1), -- SHKZG
-    clave_contabilizacion VARCHAR(2), -- BSCHL: SAP posting key. Added 2026-09-03 (fact_aplicacion v2, see DESIGN.md): decides the role of an AB line (07/17 at $0.00 = clearing anchor, 17 with amount = credit re-applied, 15 = credit balance from pool account), separates the DZ virgin (11) from a referenced payment (15) and from the child mirror (08), and is the only signal of an FB08 reversal (paired keys 11<->02, 15<->05, 01<->12) since XSTOV is blank on every row. On an existing server this column is added with 02_silver/alter_bsad_bsid_clave_contabilizacion.sql (ALTER + year-chunked backfill from bronze), NOT by re-running this file.
+    clave_contabilizacion VARCHAR(2), -- BSCHL: SAP posting key. Added 2026-09-03 (fact_aplicacion v2, see DESIGN.md): decides the role of an AB line (07/17 at $0 = clearing anchor, 17 with amount = credit re-applied, 15 = credit balance from pool account), separates the DZ virgin (11) from a referenced payment (15) and from the child mirror (08), and is the only signal of an FB08 reversal (paired keys 11<->02, 15<->05, 01<->12) since XSTOV is blank on every row. On an existing server this column is added with 02_silver/alter_bsad_bsid_clave_contabilizacion.sql (ALTER + year-chunked backfill from bronze), NOT by re-running this file.
     fecha_vencimiento DATE, -- ZFBDT: kept from bsid to be able to measure late payments (fecha_compensacion - fecha_vencimiento)
     monto_moneda_local DECIMAL(15,2),
     monto_moneda_doc DECIMAL(15,2),

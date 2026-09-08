@@ -166,10 +166,10 @@ BEGIN
                 -- accounts: money lands here on the gateway's own settlement calendar and is
                 -- then moved to the real customer, so they are neither a sales channel nor a
                 -- customer with credit behaviour. Only the two that actually move money:
-                --   10012098 KUSHKY INGRESOS TRANSITORIA   (169 pagos / $33.66M in 2026)
-                --   10010943 CONEKTA OXXO INGRESOS TRANSITORIA (2 pagos / $40,588.82 in 2026)
-                -- The other three '%INGRESOS TRANSITORIA%' accounts (MERCADO LIBRE 10011518,
-                -- MERCADO PAGO 10011517, OPENPAY 10010814) carry $0 and stay MARKETPLACE by
+                --   <cliente-1> KUSHKY INGRESOS TRANSITORIA   (169 pagos / $33.66M in 2026)
+                --   <cliente-2> CONEKTA OXXO INGRESOS TRANSITORIA (2 pagos / ~$41K in 2026)
+                -- The other three '%INGRESOS TRANSITORIA%' accounts (MERCADO LIBRE <cliente-3>,
+                -- MERCADO PAGO <cliente-4>, OPENPAY <cliente-5>) carry $0 and stay MARKETPLACE by
                 -- the user's explicit decision - if any of them ever activates, this is the
                 -- branch to extend. Verified 2026-09-05: LIKE 'KUSHKY%'/'CONEKTA%' matches
                 -- exactly these two rows in silver.sap_kna1, nothing else.
@@ -664,7 +664,7 @@ BEGIN
               -- the pattern again without that confirmation.
               AND (b.sgtxt = 'Asignación Aut. Deposito' OR b.sgtxt LIKE 'BB%')
               AND b.debe_haber <> 'S' -- excludes the "child" document's mirror/offsetting line (fix 2026-08-19, see ddl_gold.sql)
-              AND b.monto_moneda_local > 0 -- excludes $0.00 technical residuals (fix 2026-08-19, see ddl_gold.sql)
+              AND b.monto_moneda_local > 0 -- excludes $0 technical residuals (fix 2026-08-19, see ddl_gold.sql)
               AND b.fecha_compensacion >= @mes_anterior_inicio
               -- Self-canceling internal pair excluded (fix 2026-08-29): a document can carry TWO of
               -- its own lines in the SAME self-referencing compensation group (documento_compensacion
@@ -674,7 +674,7 @@ BEGIN
               -- as a 2nd "candidate" alongside the real deposit (a different document) in the same
               -- compensation group, making gold.vw_pago_factura_simple's num_pagos_candidatos=1 "don't
               -- guess" rule wrongly treat the whole group as ambiguous. Confirmed against real July
-              -- data before implementing: resolves 102 of 133 previously-ambiguous groups ($192,320.13
+              -- data before implementing: resolves 102 of 133 previously-ambiguous groups (~$192K
               -- recovered); the other 27 groups (genuinely 2+ different real deposits, different
               -- amounts) correctly remain excluded - see dwh-ciosa-project-status.md in memory.
               AND NOT (
@@ -1101,7 +1101,7 @@ BEGIN
            propia version anterior.
            Probado el 2026-09-07: con el orden viejo la primera recarga despues del
            backfill murio con "Violation of PRIMARY KEY constraint 'PK_fact_facturas'...
-           (2000, 10000109, 2026, 7404851852, 1)", y habia 845 facturas en ese estado.
+           (2000, <cliente-8>, 2026, <factura-7>, 1)", y habia 845 facturas en ese estado.
            No se veia en el backfill porque ahi la tabla arrancaba vacia. */
 
         -- Compensadas: solo la ventana. SIN @fecha_hasta a proposito, ver nota arriba.

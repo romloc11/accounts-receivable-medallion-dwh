@@ -2,10 +2,10 @@
 ========================================================================================
 dbo.fact_pagos_sin_aplicacion  -  por que este dinero no liquido ninguna factura
 ========================================================================================
-CONTROL (2026-09-07): 37 lineas / $1,874,426.31
+CONTROL (2026-09-07): 37 lineas / ~$1.9M
 
-    LIQUIDA_NO_FACTURA   21 lineas | $1,596,248.66
-    SIN_APLICACION       13 lineas | $  289,351.70
+    LIQUIDA_NO_FACTURA   21 lineas | ~$1.6M
+    SIN_APLICACION       13 lineas | $  ~$289K
     LINEA_TECNICA         3 lineas | $  -11,174.05
 
 --- POR QUE UNA TABLA APARTE Y NO FILAS EN EL PUENTE ---
@@ -21,10 +21,10 @@ Grano: la linea de pago, igual que fact_pagos. Se carga DESPUES del puente.
 
 --- ESTO ES COBRANZA, NO UN HUECO (confirmado por el usuario 2026-09-07) ---
 El dinero SI entro. Simplemente liquido documentos que no son facturas de cliente.
-Los debitos de esos grupos finales son, en monto: SA $1,282,187 (ajustes y comisiones),
-AB $354,455 (documentos de compensacion), DZ $288,204, y apenas F4 $10,352.
-Caso verificable en SAP: el pago 1402614549 de KUSHKY ($354,431.39) va al hijo
-1402622128, que reparte en tres grupos finales (8501579297 / 8501579334 / 8501579296)
+Los debitos de esos grupos finales son, en monto: SA ~$1.3M (ajustes y comisiones),
+AB ~$354K (documentos de compensacion), DZ ~$288K, y apenas F4 ~$10K.
+Caso verificable en SAP: el pago <pago-14> de KUSHKY (~$354K) va al hijo
+<pago-17>, que reparte en tres grupos finales (<grupo-7> / <grupo-8> / <grupo-9>)
 y en los tres el mayor debito es clase SA. Para una pasarela eso es lo correcto: liquida
 comisiones, no facturas.
 
@@ -33,9 +33,9 @@ algo; la realidad es que no habia factura que encontrar. Son dos afirmaciones di
 y el negocio las lee distinto.
 
 --- LOS DOS TOTALES DEL REPORTE, QUE NO SE DEBEN CONFUNDIR ---
-    Cobranza total            $149,244,694.89   todo el dinero que entro
-    Cobranza aplicada         $147,370,268.58   lo que liquido facturas de cliente
-    diferencia                $  1,874,426.31   esta tabla
+    Cobranza total            ~$149.2M   todo el dinero que entro
+    Cobranza aplicada         ~$147.4M   lo que liquido facturas de cliente
+    diferencia                $  ~$1.9M   esta tabla
 La diferencia no es un error: es dinero real contra documentos que no son factura.
 ========================================================================================
 */
@@ -122,8 +122,8 @@ JOIN   dbo.fact_pagos p ON p.ejercicio = sa.ejercicio
                        AND p.documento_id = sa.documento_id
                        AND p.posicion = sa.posicion
 GROUP BY motivo ORDER BY motivo;
--- LINEA_TECNICA 3 / -11,174.05 | LIQUIDA_NO_FACTURA 21 / 1,596,248.66
--- SIN_APLICACION 13 / 289,351.70   |   REVISAR debe salir en 0
+-- LINEA_TECNICA 3 / -11,174.05 | LIQUIDA_NO_FACTURA 21 / ~$1.6M
+-- SIN_APLICACION 13 / ~$289K   |   REVISAR debe salir en 0
 
 -- Invariante: todo pago esta EN el puente O aqui, nunca en los dos ni en ninguno.
 SELECT 'pagos sin clasificar (debe ser 0)' AS chequeo, COUNT(*) AS valor

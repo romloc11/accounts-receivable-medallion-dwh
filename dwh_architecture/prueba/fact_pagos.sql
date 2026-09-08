@@ -5,11 +5,11 @@ dbo.fact_pagos  -  el dinero que ENTRO, una fila por linea de pago
 Ventana: un mes por fecha_compensacion (hoy AGOSTO 2026, ver el WHERE).
 Alcance: canal 10/40/60, sin FUERA_DE_ALCANCE.
 
-LINEA BASE VALIDADA - julio 2026: 12,053 filas / 12,050 documentos / $149,244,694.89
+LINEA BASE VALIDADA - julio 2026: 12,053 filas / 12,050 documentos / ~$149.2M
   -> ese total es EXACTAMENTE el que reporta SAP para ese mes.
   Agosto es la segunda corrida; sus cifras aun no estan contrastadas contra SAP.
-  Por clave: 11 = 10,878 ($136,228,205.77) | 15 = 1,168 ($13,098,038.94)
-             05 = 2 (-$68,705.85)          | 08 = 5 (-$12,843.97)
+  Por clave: 11 = 10,878 (~$136.2M) | 15 = 1,168 (~$13.1M)
+             05 = 2 (-~$69K)          | 08 = 5 (-~$13K)
 
 QUE CUENTA COMO PAGO AQUI (decision del usuario 2026-09-07, opcion "clave 11 + pagos
 directos"): dinero que entro, sin contar nada dos veces.
@@ -24,7 +24,7 @@ LO QUE SE EXCLUYE, Y POR QUE IMPORTA: las lineas que pertenecen a un DOCUMENTO H
 Un hijo es el destino de un deposito virgen: su clave 15 reaplica dinero que ya se
 conto en la clave 11, y su clave 08 es el espejo de esa misma reaplicacion. Ninguna
 de las dos es dinero nuevo.
-  Sin el filtro entraban 123 lineas clave 15 (+$1,807,278) y 53 clave 08 (-$831,007).
+  Sin el filtro entraban 123 lineas clave 15 (+~$1.8M) y 53 clave 08 (-~$831K).
   Esos $1.8M son el MISMO deposito contado dos veces - y es el mismo bug ya
   documentado en la gold.fact_pagos_compensados vieja (123 lineas tambien). Reaparecio
   por usar el mismo filtro de origen.
@@ -117,7 +117,7 @@ GO
 SELECT COUNT(*)                    AS filas,
        COUNT(DISTINCT documento_id) AS documentos,
        CAST(SUM(monto) AS DECIMAL(18,2)) AS monto
-       -- julio fue: 12,053 / 12,050 / 149,244,694.89
+       -- julio fue: 12,053 / 12,050 / ~$149.2M
 FROM   dbo.fact_pagos;
 
 SELECT clave_contabilizacion, COUNT(*) AS filas,

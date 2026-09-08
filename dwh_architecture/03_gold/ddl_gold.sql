@@ -505,7 +505,7 @@ GO
 -- for the same purpose.
 -- monto_moneda_local>0 FILTER added 2026-08-19 (same session), after
 -- analyzing the 29 payments that remained ambiguous: 6 of 14 sample groups
--- turned out to be the child's own "H" line but with a $0.00 amount
+-- turned out to be the child's own "H" line but with a $0 amount
 -- (technical residual, not real money) inflating the candidate count
 -- alongside the real deposit. The other 8 groups in that sample (the
 -- child's own "H" line WITH a real amount competing with an external raw
@@ -679,7 +679,7 @@ archivo. Despues, backfill_fact_aplicacion_pagos.sql para repoblar 2022->hoy.
 --- LA DECISION CENTRAL: EL PUENTE NO LLEVA MONTO ---
 fact_aplicacion_pagos esta al grano (pago x factura) y ahi NINGUN monto es aditivo -
 ni el del pago ni el de la factura: los dos vienen heredados de un grano mas grueso.
-Medido en julio 2026: SUM sobre el join da $11,427,680,334 contra los $147,293,472
+Medido en julio 2026: SUM sobre el join da ~$11.4 mil millones contra los ~$147.3M
 correctos, 83x inflado. El puente responde "que facturas toco este pago". El dinero se
 suma desde fact_pagos y fact_facturas con EXISTS.
 Consecuencia deliberada: NO existe un "monto asignado" por pareja pago-factura. En un
@@ -699,13 +699,13 @@ cobertura observada y pasa a ser exacta.
 -- ========================================================================================
 -- 1. gold.fact_pagos  -  el dinero que ENTRO. 1 fila = 1 linea de pago.
 --
--- QUE CUENTA COMO PAGO (validado contra SAP en julio 2026: $149,244,694.89 exacto):
+-- QUE CUENTA COMO PAGO (validado contra SAP en julio 2026: el mismo monto (exacto)):
 --   clave 11 = deposito virgen (el dinero llegando al banco)
 --   clave 15 en documento que NO es hijo = pago directo (dinero real sin deposito previo)
 --   claves 05/08 sueltas = reversos y traspasos, ajustes negativos de pagos que si estan
 -- Se EXCLUYEN las lineas de un DOCUMENTO HIJO: su clave 15 reaplica dinero ya contado en
 -- la clave 11 y su clave 08 es el espejo. Sin ese filtro se cuenta el mismo deposito dos
--- veces (+$1,807,278 en julio, 123 lineas) - mismo bug que ya tuvo fact_pagos_compensados.
+-- veces (+~$1.8M en julio, 123 lineas) - mismo bug que ya tuvo fact_pagos_compensados.
 -- ========================================================================================
 -- IS NULL, no IS NOT NULL: si ya existe se respeta. Ver la nota de la cabecera.
 IF OBJECT_ID('gold.fact_pagos', 'U') IS NULL
@@ -881,7 +881,7 @@ GO
 -- ESTO ES COBRANZA, NO UN HUECO. El dinero SI entro (confirmado con el usuario
 -- 2026-09-07): simplemente liquido documentos que no son factura de cliente - SA
 -- (ajustes y comisiones) y AB (documentos de compensacion), mayormente de pasarela de
--- pago. Caso verificable en SAP: el pago 1402614549 de KUSHKY ($354,431.39) reparte en
+-- pago. Caso verificable en SAP: el pago <pago-14> de KUSHKY (~$354K) reparte en
 -- tres grupos finales y en los tres el mayor debito es clase SA.
 --
 -- Por eso la etiqueta dice LIQUIDA_NO_FACTURA y NO "NO_IDENTIFICADO": la segunda
@@ -893,7 +893,7 @@ GO
 --   CADENA_AMBIGUA      el intermedio recibio dinero de VARIOS pagos y se mezclo ahi
 --                       dentro: no se puede decir cual financio que linea, y la guarda
 --                       del puente los excluye a proposito. Agregada 2026-09-07 tras el
---                       backfill de 5 anios: 62 pagos / $3,077,868.56 caian en REVISAR
+--                       backfill de 5 anios: 62 pagos / ~$3.1M caian en REVISAR
 --                       solo por no tener etiqueta. NO son un caso desconocido - sabemos
 --                       exactamente que son y decidimos no atribuirlos. En julio y agosto
 --                       eran CERO; aparecen al mirar la historia completa.

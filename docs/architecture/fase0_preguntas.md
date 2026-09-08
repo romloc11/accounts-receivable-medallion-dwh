@@ -25,12 +25,12 @@
 | Q2 | ¿Cuánto por canal, vendedor, cobrador y tipo de cliente? | mes × dimensión | `fact_pagos` + dims | ✅ hoy |
 | Q3 | ¿Qué porcentaje de la cobranza quedó ligado a una factura? | mes | `fact_aplicacion` | ⏳ requiere backfill |
 
-**Q1 — número de referencia.** Julio 2026 cerró en **$213,993,821** de cobranza total. La cifra
-que se usa hoy en el dashboard ($155,068,233) corresponde solo a DZ dentro del alcance de la
+**Q1 — número de referencia.** Julio 2026 cerró en **~$214.0M** de cobranza total. La cifra
+que se usa hoy en el dashboard (~$155.1M) corresponde solo a DZ dentro del alcance de la
 vista; no incluye CP (mostrador/contado, ~$34.6M al mes) ni otros canales.
 
 **Q3 — número de referencia.** En el alcance del dashboard, julio: **10,937 depósitos /
-$135,208,456 identificados**, 25 / $239,017 identificados a nivel lote, y **166 / $5,683,948 sin
+~$135.2M identificados**, 25 / ~$239K identificados a nivel lote, y **166 / ~$5.7M sin
 identificar**. La falta de identificación está concentrada: **9 cuentas** (Kushky, seis de Mercado
 Libre, Conekta) cargan $9.73M de los $16.3M totales, y **3,234 clientes quedan 100% identificados**.
 
@@ -58,11 +58,11 @@ Libre, Conekta) cargan $9.73M de los $16.3M totales, y **3,234 clientes quedan 1
 | 60 | −12.46 | **−6.04** | 65.2% |
 
 Nunca se promedian días: se ponderan por monto. La diferencia llega a nueve días en canal 40,
-porque el promedio simple trata una factura de $500 igual que una de $500,000.
+porque el promedio simple trata una factura de $500 igual que una de ~$500K.
 
 **Q4 tiene dos sesgos conocidos y medidos**, ambos corregibles con columnas derivadas:
 
-1. **Facturas liquidadas sin efectivo.** 5,792 facturas / $8,579,769 de julio se compensaron con
+1. **Facturas liquidadas sin efectivo.** 5,792 facturas / ~$8.6M de julio se compensaron con
    nota de crédito, devolución o ajuste — cero dinero — y hoy entran al DPP como si hubieran sido
    pagadas. Es el 4.5% del valor.
 2. **La fecha de compensación no es la fecha del pago.** SAP compensa cuando alguien ejecuta la
@@ -75,12 +75,12 @@ porque el promedio simple trata una factura de $500 igual que una de $500,000.
 
 | cubeta | facturas | monto |
 |---|---:|---:|
-| anticipado | 42,816 | $77,115,296 |
-| al vencimiento | 3,002 | $10,245,093 |
-| 1–15 días | 19,525 | $66,128,544 |
-| 16–30 días | 1,363 | $6,161,239 |
-| 31–60 días | 448 | $2,948,928 |
-| más de 60 | 142 | $1,005,620 |
+| anticipado | 42,816 | ~$77.1M |
+| al vencimiento | 3,002 | ~$10.2M |
+| 1–15 días | 19,525 | ~$66.1M |
+| 16–30 días | 1,363 | ~$6.2M |
+| 31–60 días | 448 | ~$2.9M |
+| más de 60 | 142 | ~$1.0M |
 
 > **Advertencia de diseño que hay que escribir en el reporte:** el DPP tiene **sesgo de
 > supervivencia**. Solo entra la factura que ya se cobró; el cliente que nunca paga jamás aparece.
@@ -101,10 +101,10 @@ porque el promedio simple trata una factura de $500 igual que una de $500,000.
 
 | estado | facturas | monto |
 |---|---:|---:|
-| abierta, no vencida | 59,055 | $195,643,597 |
-| abierta, vencida 1–30 | 6,951 | $23,873,627 |
-| abierta, vencida 31–90 | 837 | $4,040,253 |
-| **abierta, vencida +90** | **994** | **$17,535,647** |
+| abierta, no vencida | 59,055 | ~$195.6M |
+| abierta, vencida 1–30 | 6,951 | ~$23.9M |
+| abierta, vencida 31–90 | 837 | ~$4.0M |
+| **abierta, vencida +90** | **994** | **~$17.5M** |
 
 ---
 
@@ -136,10 +136,10 @@ con porcentajes basados en la experiencia.
 
 | componente | monto | % |
 |---|---:|---:|
-| **B. vencía en julio** — lo único que el método actual presupuesta | $104,049,003 | **48.6%** |
-| C. facturada *y* cobrada dentro del mes | $64,289,814 | 30.0% |
-| A. venía vencida de meses anteriores | $29,148,384 | 13.6% |
-| D. pago anticipado (vencía después de julio) | $16,500,620 | 7.7% |
+| **B. vencía en julio** — lo único que el método actual presupuesta | ~$104.0M | **48.6%** |
+| C. facturada *y* cobrada dentro del mes | ~$64.3M | 30.0% |
+| A. venía vencida de meses anteriores | ~$29.1M | 13.6% |
+| D. pago anticipado (vencía después de julio) | ~$16.5M | 7.7% |
 
 **El método actual presupuesta menos de la mitad del dinero.** El 51% restante lo absorben los
 porcentajes por día, que es exactamente por qué se siente impreciso. Los cuatro componentes se

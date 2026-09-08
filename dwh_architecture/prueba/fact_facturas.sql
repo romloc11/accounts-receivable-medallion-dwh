@@ -17,13 +17,13 @@ del pago parcial (R3, sin implementar), no para ligar pagos.
 SIN TECHO, y no es un olvido. Un pago compensado en el mes puede alcanzar, via el
 segundo salto (virgen -> hijo -> grupo final), una factura que se compenso DESPUES.
 Medido en julio: los grupos finales que faltaban cayeron en 2026-08 (290 facturas) y
-2026-09 (3). El techo truncaba 157 pagos / $1,655,522.
+2026-09 (3). El techo truncaba 157 pagos / ~$1.7M.
 
 CON UN MES DE MARGEN HACIA ATRAS (el piso va un mes antes que la ventana de pagos).
 OJO: una version anterior de este comentario afirmaba que "la cadena solo avanza en el
 tiempo, nunca retrocede". ESO ERA FALSO - se escribio con la evidencia de un solo mes.
 Al correr agosto aparecieron 2 grupos finales compensados en JULIO, es decir antes de
-la ventana de pagos. Son pocos (2 pagos / $40,427) pero el principio no se sostiene.
+la ventana de pagos. Son pocos (2 pagos / ~$40K) pero el principio no se sostiene.
 El margen es una cobertura EMPIRICA, no una garantia: cubre el alcance hacia atras que
 hemos observado (1 mes), no uno que hayamos demostrado imposible de superar.
 Costo del margen en agosto: 78,819 filas sin el, ~146,119 con el. Tres meses de margen
