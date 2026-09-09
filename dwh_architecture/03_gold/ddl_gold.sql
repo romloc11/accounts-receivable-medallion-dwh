@@ -6,6 +6,31 @@ GO
 PROJECT: Enterprise Data Warehouse (dwh-ciosa)
 LAYER: Gold (Presentation / Star Schema)
 ===============================================================================
+
+SEIS TABLAS gold NO ESTAN EN ESTE ARCHIVO, A PROPOSITO:
+
+    gold.fact_presupuesto_cobranza     ->  04_pronostico/ddl_presupuesto.sql
+    gold.fact_presupuesto_cartera      ->  04_pronostico/ddl_presupuesto.sql
+    gold.dim_bucket                    ->  03_gold/ddl_dim_presupuesto.sql
+    gold.dim_ejecutivo                 ->  03_gold/ddl_dim_presupuesto.sql
+    gold.dim_region                    ->  03_gold/ddl_dim_presupuesto.sql
+    gold.dim_canal                     ->  03_gold/ddl_dim_presupuesto.sql
+
+Este script hace DROP de cada tabla antes de crearla, que es lo correcto para un
+modelo que se reconstruye desde silver. Estas seis NO se reconstruyen:
+
+  - las dos de presupuesto guardan numeros ya emitidos, contra los que se esta
+    midiendo gente;
+  - las cuatro dimensiones guardan clasificacion capturada a mano (que ejecutivo
+    es gestionable, como se llama de verdad la region MXZBAJ).
+
+Nada de eso se puede regenerar desde silver. Un DROP lo borraria sin dejar rastro.
+Por eso su DDL solo crea si falta, y nunca actualiza lo que ya esta.
+
+REGLAS DE ALCANCE: la definicion canonica es gold.vw_cliente_canal_estatus, mas
+abajo en este mismo archivo. Es la unica que debe editarse si las reglas cambian -
+el presupuesto y los demas consumidores la leen, no la reimplementan.
+===============================================================================
 */
 
 -- ==========================================================
@@ -214,8 +239,8 @@ SELECT
         -- 5/6/7 (not "real customer out of scope for one report" - the
         -- distinction this project already got wrong once, for channel
         -- 10/20/40/60, and reverted 2026-08-17 - see the note that used to
-        -- be right here). Example seen during validation: 90000371 "KIPKAR
-        -- SAPI DE CV", channel 10, was landing as INACTIVO (a real-looking
+        -- be right here). Example seen during validation: a channel-10
+        -- account with a 9-prefixed id was landing as INACTIVO (a real-looking
         -- customer status) before this fix.
         WHEN v.canal_distribucion NOT IN ('10', '20', '40', '60')
              OR v.cliente_id LIKE '5%' OR v.cliente_id LIKE '6%'

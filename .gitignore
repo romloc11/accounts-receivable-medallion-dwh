@@ -3,3 +3,7 @@ powerbi/
 
 # draw.io autosave/lock files
 .$*.dtmp
+
+# drawio autosave backups
+.$*.drawio.bkp
+*.drawio.bkp
