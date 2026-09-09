@@ -1037,7 +1037,7 @@ AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;   -- ver "ATOMICIDAD" en la cabecera
-    DECLARE @t0 DATETIME = GETDATE(), @n INT, @lote INT;
+    DECLARE @t0 DATETIME = GETDATE(), @n INT, @lote INT, @recomp INT;
 
     IF @fecha_desde IS NULL
         SET @fecha_desde = DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()) - 1, 0);
@@ -1047,36 +1047,21 @@ BEGIN
             + CASE WHEN @fecha_hasta IS NULL THEN ' (sin tope)'
                    ELSE ' y < ' + CONVERT(VARCHAR(10), @fecha_hasta, 120) END;
 
-        -- Ver "ATOMICIDAD" en la cabecera. Todo lo que sigue va junto o no va.
         BEGIN TRANSACTION;
 
-        -- Borrado de la ventana, en lotes (ver cabecera).
-        SET @lote = 1;
-        WHILE @lote > 0
-        BEGIN
-            DELETE TOP (50000) FROM gold.fact_pagos
-            WHERE fecha_compensacion >= @fecha_desde
-              AND (@fecha_hasta IS NULL OR fecha_compensacion < @fecha_hasta)
-              OPTION (RECOMPILE);   -- ver "EL DEFAULT NULL" en la cabecera
-            SET @lote = @@ROWCOUNT;
-        END
-
-        INSERT INTO gold.fact_pagos (
-            sociedad, cliente_id, ejercicio, documento_id, posicion,
-            documento_compensacion, ejercicio_compensacion,
-            fecha_documento, fecha_contabilizacion, fecha_compensacion,
-            monto, texto, clave_contabilizacion,
-            cliente_comercial_sk, cliente_credito_sk
-        )
+        /* El conjunto entrante se materializa antes de borrar: se necesita para saber
+           QUE borrar (ver la nota de recompensacion abajo) y para insertar. */
+        IF OBJECT_ID('tempdb..#pag') IS NOT NULL DROP TABLE #pag;
         SELECT
             b.sociedad, b.cliente_id, b.ejercicio, b.documento_id, b.posicion,
             b.documento_compensacion, b.ejercicio_compensacion,
             b.fecha_documento, b.fecha_contabilizacion, b.fecha_compensacion,
             -- silver.sap_bsad NUNCA trae el monto firmado: siempre positivo.
             CASE WHEN b.debe_haber = 'H' THEN b.monto_moneda_local
-                 ELSE -1 * b.monto_moneda_local END,
-            b.sgtxt, b.clave_contabilizacion,
-            dcc.id_surrogate, dck.id_surrogate
+                 ELSE -1 * b.monto_moneda_local END AS monto,
+            b.sgtxt AS texto, b.clave_contabilizacion,
+            dcc.id_surrogate AS cliente_comercial_sk, dck.id_surrogate AS cliente_credito_sk
+        INTO #pag
         FROM silver.sap_bsad b
         LEFT JOIN gold.dim_cliente_comercial dcc
                ON dcc.cliente_id = b.cliente_id
@@ -1088,6 +1073,12 @@ BEGIN
               AND (dck.fecha_fin_vigencia IS NULL OR b.fecha_contabilizacion <= dck.fecha_fin_vigencia)
         WHERE b.mandante = '400'
           AND b.clase_documento = 'DZ'
+          /* SIN prefijo N, y no es cosmetico. sgtxt es VARCHAR con collation
+             SQL_Latin1_General_CP850_BIN2; compararlo contra un literal Unicode fuerza
+             una conversion implicita de la COLUMNA y cambia la estimacion del plan.
+             Medido el 2026-09-09 sobre esta misma consulta: 2.4 s sin N, 149.6 s con N,
+             identicas 14,061 filas. Sin los LEFT JOIN a las dimensiones la diferencia no
+             aparece -por eso una prueba simplificada la deja pasar-. */
           AND b.sgtxt = 'Asignación Aut. Deposito'
           AND b.fecha_compensacion >= @fecha_desde
           AND (@fecha_hasta IS NULL OR b.fecha_compensacion < @fecha_hasta)
@@ -1104,12 +1095,54 @@ BEGIN
                 WHERE h.mandante = '400' AND h.clase_documento = 'DZ'
                   AND h.clave_contabilizacion = '11'
                   AND h.documento_compensacion = b.documento_id)
-                  OPTION (RECOMPILE);   -- ver "EL DEFAULT NULL" en la cabecera
+        OPTION (RECOMPILE);   -- ver "EL DEFAULT NULL" en la cabecera
+        CREATE UNIQUE CLUSTERED INDEX ix_pag ON #pag(sociedad, cliente_id, ejercicio, documento_id, posicion);
+
+        -- 1. Borrado de la ventana, en lotes (ver cabecera).
+        SET @lote = 1;
+        WHILE @lote > 0
+        BEGIN
+            DELETE TOP (50000) FROM gold.fact_pagos
+            WHERE fecha_compensacion >= @fecha_desde
+              AND (@fecha_hasta IS NULL OR fecha_compensacion < @fecha_hasta)
+              OPTION (RECOMPILE);
+            SET @lote = @@ROWCOUNT;
+        END
+
+        /* 2. RECOMPENSACIONES. El borrado de arriba se guia por la fecha GUARDADA, y esa
+           fecha SE MUEVE: si a un pago se le deshace la compensacion y se le rehace
+           despues, en gold sigue con la fecha vieja -fuera de la ventana, asi que
+           sobrevive- y el INSERT lo trae con la nueva. Misma PK, dos filas, proc muerto.
+           Le paso a gold.fact_facturas el 2026-09-09 y tumbo la carga entera con UN solo
+           caso; aqui daba 0 ese dia, pero es el mismo hueco. Borrar por LLAVE contra lo
+           que va a entrar es lo unico que lo cierra: ampliar la ventana no basta, la
+           fecha nueva puede venir de cualquier momento. */
+        DELETE g
+        FROM   gold.fact_pagos g
+        JOIN   #pag c ON c.sociedad = g.sociedad AND c.cliente_id = g.cliente_id
+                     AND c.ejercicio = g.ejercicio AND c.documento_id = g.documento_id
+                     AND c.posicion = g.posicion
+        OPTION (RECOMPILE);
+        SET @recomp = @@ROWCOUNT;
+
+        INSERT INTO gold.fact_pagos (
+            sociedad, cliente_id, ejercicio, documento_id, posicion,
+            documento_compensacion, ejercicio_compensacion,
+            fecha_documento, fecha_contabilizacion, fecha_compensacion,
+            monto, texto, clave_contabilizacion,
+            cliente_comercial_sk, cliente_credito_sk)
+        SELECT sociedad, cliente_id, ejercicio, documento_id, posicion,
+               documento_compensacion, ejercicio_compensacion,
+               fecha_documento, fecha_contabilizacion, fecha_compensacion,
+               monto, texto, clave_contabilizacion,
+               cliente_comercial_sk, cliente_credito_sk
+        FROM #pag;
         SET @n = @@ROWCOUNT;
 
         COMMIT TRANSACTION;
 
         PRINT '   Filas: ' + CAST(@n AS VARCHAR(12))
+            + ' | Recompensados rescatados: ' + CAST(@recomp AS VARCHAR(12))
             + ' | Duracion: ' + CAST(DATEDIFF(SECOND, @t0, GETDATE()) AS VARCHAR(10)) + ' s';
     END TRY
     BEGIN CATCH
@@ -1121,6 +1154,7 @@ BEGIN
     END CATCH;
 END;
 GO
+
 PRINT 'Procedure gold.load_fact_pagos created successfully.';
 GO
 
@@ -1338,6 +1372,22 @@ BEGIN
               OPTION (RECOMPILE);   -- ver "EL DEFAULT NULL" en la cabecera
             SET @lote = @@ROWCOUNT;
         END
+
+        /* RECOMPENSACIONES. El borrado de arriba usa la fecha GUARDADA en esta tabla, y
+           esa fecha se hereda del pago - que SE MUEVE si se le deshace y rehace la
+           compensacion. La fila vieja queda fuera de la ventana, sobrevive, y el INSERT
+           la vuelve a crear con la fecha nueva: misma PK, dos filas. Le paso a
+           gold.fact_facturas el 2026-09-09 y tumbo la carga entera con UN caso.
+           Se borra por LLAVE DEL PAGO: todo lo que este proc va a reconstruir, se va
+           primero, sin importar con que fecha estaba guardado. */
+        DELETE a
+        FROM   gold.fact_aplicacion_pagos a
+        JOIN   gold.fact_pagos p
+               ON  p.sociedad = a.sociedad AND p.ejercicio = a.ejercicio_pago
+               AND p.documento_id = a.pago_id AND p.posicion = a.posicion_pago
+        WHERE  p.fecha_compensacion >= @fecha_desde
+          AND (@fecha_hasta IS NULL OR p.fecha_compensacion < @fecha_hasta)
+        OPTION (RECOMPILE);
 
         -------------------------------------------------------- REGLA 1: GRUPO
         INSERT INTO gold.fact_aplicacion_pagos (
@@ -1623,6 +1673,22 @@ BEGIN
               OPTION (RECOMPILE);   -- ver "EL DEFAULT NULL" en la cabecera
             SET @lote = @@ROWCOUNT;
         END
+
+        /* RECOMPENSACIONES. El borrado de arriba usa la fecha GUARDADA en esta tabla, y
+           esa fecha se hereda del pago - que SE MUEVE si se le deshace y rehace la
+           compensacion. La fila vieja queda fuera de la ventana, sobrevive, y el INSERT
+           la vuelve a crear con la fecha nueva: misma PK, dos filas. Le paso a
+           gold.fact_facturas el 2026-09-09 y tumbo la carga entera con UN caso.
+           Se borra por LLAVE DEL PAGO: todo lo que este proc va a reconstruir, se va
+           primero, sin importar con que fecha estaba guardado. */
+        DELETE a
+        FROM   gold.fact_pagos_sin_aplicacion a
+        JOIN   gold.fact_pagos p
+               ON  p.sociedad = a.sociedad AND p.ejercicio = a.ejercicio
+               AND p.documento_id = a.documento_id AND p.posicion = a.posicion
+        WHERE  p.fecha_compensacion >= @fecha_desde
+          AND (@fecha_hasta IS NULL OR p.fecha_compensacion < @fecha_hasta)
+        OPTION (RECOMPILE);
 
         IF OBJECT_ID('tempdb..#salto2') IS NOT NULL DROP TABLE #salto2;
         SELECT DISTINCT h.documento_id AS hijo, h.documento_compensacion AS grupo_final,
