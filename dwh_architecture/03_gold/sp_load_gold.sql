@@ -1138,51 +1138,102 @@ CREATE PROCEDURE gold.load_fact_facturas
 AS
 BEGIN
     SET NOCOUNT ON;
-    SET XACT_ABORT ON;   -- ver "ATOMICIDAD" en la cabecera
-    DECLARE @t0 DATETIME = GETDATE(), @n_comp INT, @n_abie INT, @lote INT;
+    SET XACT_ABORT ON;
+    DECLARE @t0 DATETIME = GETDATE(), @n_comp INT, @n_abie INT, @lote INT, @recomp INT;
 
     IF @fecha_desde IS NULL
         SET @fecha_desde = DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()) - 1, 0);
+
     /* @fecha_hasta SE IGNORA EN EL LADO COMPENSADO, Y ES DELIBERADO.
        Un pago compensado en el mes puede alcanzar, via el segundo salto
        (virgen -> hijo -> grupo final), una factura que se compenso DESPUES. Poner techo
        trunca esas cadenas: probado el 2026-09-07, cargar agosto con @fecha_hasta
        '2026-09-01' dejo fuera 181 lineas de factura cuyo grupo final cae en septiembre,
-       y el puente perdio exactamente esas 181 filas de SEGUNDO_SALTO (1,650 en vez de
-       1,831). El parametro se acepta por consistencia de firma, pero aqui no aplica.
-       Consecuencia: este proc siempre recarga de @fecha_desde en adelante. Para la carga
-       diaria eso son ~2 meses; para el backfill se corre UNA sola vez desde 2022. */
-
+       y el puente perdio exactamente esas 181 filas de SEGUNDO_SALTO. El parametro se
+       acepta por consistencia de firma, pero aqui no aplica. */
     BEGIN TRY
         PRINT '>> gold.load_fact_facturas | compensadas desde la fecha (SIN techo) + abiertas recarga completa';
 
-        -- Ver "ATOMICIDAD" en la cabecera. Todo lo que sigue va junto o no va.
         BEGIN TRANSACTION;
-        /* LOS DOS DELETE VAN ANTES DE LOS DOS INSERT, Y NO ES ESTILO.
+
+        /* LAS COMPENSADAS SE MATERIALIZAN ANTES DE BORRAR NADA.
+           Se necesitan DOS veces -para saber que borrar y para insertar- y es la consulta
+           cara del proc. Calcularla una vez y reusarla evita recorrer bsad dos veces. */
+        IF OBJECT_ID('tempdb..#comp') IS NOT NULL DROP TABLE #comp;
+        SELECT b.sociedad, b.cliente_id, b.ejercicio, b.documento_id, b.posicion,
+               b.documento_compensacion, b.ejercicio_compensacion, b.clase_documento,
+               b.fecha_documento, b.fecha_vencimiento, b.fecha_contabilizacion, b.fecha_compensacion,
+               b.monto_moneda_local AS monto, b.clave_contabilizacion,
+               dcc.id_surrogate AS cliente_comercial_sk, dck.id_surrogate AS cliente_credito_sk
+        INTO   #comp
+        FROM   silver.sap_bsad b
+        LEFT JOIN gold.dim_cliente_comercial dcc
+               ON dcc.cliente_id = b.cliente_id
+              AND b.fecha_contabilizacion >= dcc.fecha_inicio_vigencia
+              AND (dcc.fecha_fin_vigencia IS NULL OR b.fecha_contabilizacion <= dcc.fecha_fin_vigencia)
+        LEFT JOIN gold.dim_cliente_credito dck
+               ON dck.cliente_id = b.cliente_id
+              AND b.fecha_contabilizacion >= dck.fecha_inicio_vigencia
+              AND (dck.fecha_fin_vigencia IS NULL OR b.fecha_contabilizacion <= dck.fecha_fin_vigencia)
+        WHERE  b.mandante = '400'
+          AND  b.debe_haber = 'S'
+          AND (b.clase_documento LIKE 'F%' OR b.clase_documento = 'D1')
+          AND  b.fecha_compensacion >= @fecha_desde
+          -- SIN tope superior, aunque venga @fecha_hasta. Ver la nota de arriba.
+          AND  b.cliente_id IN (
+                SELECT c1.cliente_id FROM gold.dim_cliente_comercial c1
+                WHERE c1.estatus_comercial <> 'FUERA_DE_ALCANCE'
+                  AND c1.canal_distribucion IN (10, 40, 60))
+          -- Reset de compensacion (FBRA): la linea sigue en bsad como compensada pero
+          -- volvio a bsid porque se deshizo la compensacion. GANA BSID, que es el estado
+          -- de hoy. Sin esto la PK revienta, y peor: el modelo diria que una factura esta
+          -- pagada cuando sigue abierta.
+          AND  NOT EXISTS (
+                SELECT 1 FROM silver.sap_bsid i
+                WHERE i.mandante = b.mandante AND i.sociedad = b.sociedad
+                  AND i.cliente_id = b.cliente_id AND i.ejercicio = b.ejercicio
+                  AND i.documento_id = b.documento_id AND i.posicion = b.posicion)
+        OPTION (RECOMPILE);
+        CREATE UNIQUE CLUSTERED INDEX ix_comp ON #comp(sociedad, cliente_id, ejercicio, documento_id, posicion);
+
+        ------------------------------------------------------- BORRADO (LAS TRES)
+        /* LOS BORRADOS VAN ANTES DE LOS INSERT, Y NO ES ESTILO.
            La PK es (sociedad, cliente_id, ejercicio, documento_id, posicion): NO lleva
            flag_compensada. Una factura que estaba abierta y ya se compenso ocupa esa PK
            dos veces - la fila vieja con flag 0 y la nueva con flag 1 - asi que si el
            INSERT de compensadas corre antes de borrar las abiertas, choca contra su
-           propia version anterior.
-           Probado el 2026-09-07: con el orden viejo la primera recarga despues del
-           backfill murio con "Violation of PRIMARY KEY constraint 'PK_fact_facturas'...
-           (2000, <cliente-8>, 2026, <factura-7>, 1)", y habia 845 facturas en ese estado.
-           No se veia en el backfill porque ahi la tabla arrancaba vacia. */
+           propia version anterior. Probado el 2026-09-07: 845 facturas en ese estado. */
 
-        ------------------------------------------------------- BORRADO (LAS DOS)
-
-        -- Compensadas: solo la ventana. SIN @fecha_hasta a proposito, ver nota arriba.
+        -- 1. Compensadas de la ventana: las que ya no deban existir se van.
         SET @lote = 1;
         WHILE @lote > 0
         BEGIN
             DELETE TOP (50000) FROM gold.fact_facturas
             WHERE flag_compensada = 1
               AND fecha_compensacion >= @fecha_desde
-              OPTION (RECOMPILE);   -- ver "EL DEFAULT NULL" en la cabecera
+              OPTION (RECOMPILE);
             SET @lote = @@ROWCOUNT;
         END
 
-        -- Abiertas: TODAS, sin ventana. Ver cabecera: es una foto del presente.
+        /* 2. RECOMPENSACIONES - la tercera forma de romper esta PK, y la mas sutil.
+           El borrado de arriba se guia por la fecha GUARDADA, y esa fecha SE MUEVE: si a
+           una factura se le deshace la compensacion y se le rehace contra otro grupo, en
+           gold sigue con la fecha vieja -fuera de la ventana, asi que sobrevive- y el
+           INSERT la trae con la fecha nueva. Misma PK, dos filas, y el proc muere.
+           Paso el 2026-09-09: una factura guardada como compensada el 23-jul aparecio en
+           bsad compensada el 4-sep contra otro grupo. UN SOLO caso tumbo la carga entera.
+           No basta ampliar la ventana hacia atras - la fecha nueva puede venir de
+           cualquier momento. Hay que borrar por LLAVE contra lo que va a entrar. */
+        DELETE g
+        FROM   gold.fact_facturas g
+        JOIN   #comp c ON c.sociedad = g.sociedad AND c.cliente_id = g.cliente_id
+                      AND c.ejercicio = g.ejercicio AND c.documento_id = g.documento_id
+                      AND c.posicion = g.posicion
+        WHERE  g.flag_compensada = 1
+        OPTION (RECOMPILE);
+        SET @recomp = @@ROWCOUNT;
+
+        -- 3. Abiertas: TODAS, sin ventana. Ver cabecera: es una foto del presente.
         SET @lote = 1;
         WHILE @lote > 0
         BEGIN
@@ -1196,41 +1247,13 @@ BEGIN
             documento_compensacion, ejercicio_compensacion, clase_documento,
             fecha_documento, fecha_vencimiento, fecha_contabilizacion, fecha_compensacion,
             monto, clave_contabilizacion, flag_compensada,
-            cliente_comercial_sk, cliente_credito_sk
-        )
-        SELECT b.sociedad, b.cliente_id, b.ejercicio, b.documento_id, b.posicion,
-               b.documento_compensacion, b.ejercicio_compensacion, b.clase_documento,
-               b.fecha_documento, b.fecha_vencimiento, b.fecha_contabilizacion, b.fecha_compensacion,
-               b.monto_moneda_local, b.clave_contabilizacion, 1,
-               dcc.id_surrogate, dck.id_surrogate
-        FROM silver.sap_bsad b
-        LEFT JOIN gold.dim_cliente_comercial dcc
-               ON dcc.cliente_id = b.cliente_id
-              AND b.fecha_contabilizacion >= dcc.fecha_inicio_vigencia
-              AND (dcc.fecha_fin_vigencia IS NULL OR b.fecha_contabilizacion <= dcc.fecha_fin_vigencia)
-        LEFT JOIN gold.dim_cliente_credito dck
-               ON dck.cliente_id = b.cliente_id
-              AND b.fecha_contabilizacion >= dck.fecha_inicio_vigencia
-              AND (dck.fecha_fin_vigencia IS NULL OR b.fecha_contabilizacion <= dck.fecha_fin_vigencia)
-        WHERE b.mandante = '400'
-          AND b.debe_haber = 'S'
-          AND (b.clase_documento LIKE 'F%' OR b.clase_documento = 'D1')
-          AND b.fecha_compensacion >= @fecha_desde
-          -- SIN tope superior, aunque venga @fecha_hasta. Ver la nota del proc.
-          AND b.cliente_id IN (
-                SELECT c1.cliente_id FROM gold.dim_cliente_comercial c1
-                WHERE c1.estatus_comercial <> 'FUERA_DE_ALCANCE'
-                  AND c1.canal_distribucion IN (10, 40, 60))
-          -- Reset de compensacion (FBRA): la linea sigue en bsad como compensada pero
-          -- volvio a bsid porque se deshizo la compensacion. GANA BSID, que es el estado
-          -- de hoy. Sin esto la PK revienta, y peor: el modelo diria que una factura esta
-          -- pagada cuando sigue abierta.
-          AND NOT EXISTS (
-                SELECT 1 FROM silver.sap_bsid i
-                WHERE i.mandante = b.mandante AND i.sociedad = b.sociedad
-                  AND i.cliente_id = b.cliente_id AND i.ejercicio = b.ejercicio
-                  AND i.documento_id = b.documento_id AND i.posicion = b.posicion)
-                  OPTION (RECOMPILE);   -- ver "EL DEFAULT NULL" en la cabecera
+            cliente_comercial_sk, cliente_credito_sk)
+        SELECT sociedad, cliente_id, ejercicio, documento_id, posicion,
+               documento_compensacion, ejercicio_compensacion, clase_documento,
+               fecha_documento, fecha_vencimiento, fecha_contabilizacion, fecha_compensacion,
+               monto, clave_contabilizacion, 1,
+               cliente_comercial_sk, cliente_credito_sk
+        FROM   #comp;
         SET @n_comp = @@ROWCOUNT;
 
         ---------------------------------------------------------------- ABIERTAS
@@ -1239,14 +1262,13 @@ BEGIN
             documento_compensacion, ejercicio_compensacion, clase_documento,
             fecha_documento, fecha_vencimiento, fecha_contabilizacion, fecha_compensacion,
             monto, clave_contabilizacion, flag_compensada,
-            cliente_comercial_sk, cliente_credito_sk
-        )
+            cliente_comercial_sk, cliente_credito_sk)
         SELECT b.sociedad, b.cliente_id, b.ejercicio, b.documento_id, b.posicion,
                NULL, NULL, b.clase_documento,
                b.fecha_documento, b.fecha_vencimiento, b.fecha_contabilizacion, NULL,
                b.monto_moneda_local, b.clave_contabilizacion, 0,
                dcc.id_surrogate, dck.id_surrogate
-        FROM silver.sap_bsid b
+        FROM   silver.sap_bsid b
         LEFT JOIN gold.dim_cliente_comercial dcc
                ON dcc.cliente_id = b.cliente_id
               AND b.fecha_contabilizacion >= dcc.fecha_inicio_vigencia
@@ -1255,10 +1277,9 @@ BEGIN
                ON dck.cliente_id = b.cliente_id
               AND b.fecha_contabilizacion >= dck.fecha_inicio_vigencia
               AND (dck.fecha_fin_vigencia IS NULL OR b.fecha_contabilizacion <= dck.fecha_fin_vigencia)
-        WHERE b.mandante = '400'
-          AND b.debe_haber = 'S'
+        WHERE  b.mandante = '400' AND b.debe_haber = 'S'
           AND (b.clase_documento LIKE 'F%' OR b.clase_documento = 'D1')
-          AND b.cliente_id IN (
+          AND  b.cliente_id IN (
                 SELECT c1.cliente_id FROM gold.dim_cliente_comercial c1
                 WHERE c1.estatus_comercial <> 'FUERA_DE_ALCANCE'
                   AND c1.canal_distribucion IN (10, 40, 60));
@@ -1268,17 +1289,17 @@ BEGIN
 
         PRINT '   Compensadas: ' + CAST(@n_comp AS VARCHAR(12))
             + ' | Abiertas: ' + CAST(@n_abie AS VARCHAR(12))
+            + ' | Recompensadas rescatadas: ' + CAST(@recomp AS VARCHAR(12))
             + ' | Duracion: ' + CAST(DATEDIFF(SECOND, @t0, GETDATE()) AS VARCHAR(10)) + ' s';
     END TRY
     BEGIN CATCH
-        -- Sin esto la ventana queda con el hueco del DELETE y el proc muere
-        -- "limpio": el reporte del dia sale con menos dinero y nada avisa.
         IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
         PRINT 'ERROR en gold.load_fact_facturas: ' + ERROR_MESSAGE();
         THROW;
     END CATCH;
 END;
 GO
+
 PRINT 'Procedure gold.load_fact_facturas created successfully.';
 GO
 
