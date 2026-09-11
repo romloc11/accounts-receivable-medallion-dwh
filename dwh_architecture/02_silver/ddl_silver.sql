@@ -430,3 +430,65 @@ CREATE TABLE silver.sap_pa0001 (
     CONSTRAINT PK_silver_sap_pa0001 PRIMARY KEY (mandante, id_empleado)
 );
 GO
+
+-- ==========================================================
+-- 11. ACCOUNTING DOCUMENT HEADER (silver.sap_bkpf)
+-- Added 2026-09-11. BSAD/BSID carry the payment LINES; this is the DOCUMENT.
+--
+-- WHY IT EXISTS: without the header there is no way to know which document
+-- reverses which. Reversals had to be matched by guessing on customer+amount+
+-- assignment: 73 of 188 clave-05 reversals came out ambiguous and 46 had no
+-- match at all. documento_reversa (STBLG) makes the link exact.
+--
+-- It also settles what the posting keys mean, with evidence instead of
+-- inference: crossing transaccion (TCODE) against the line's posting key on
+-- August 2026 showed all 10,553 key-11 lines come from OS_APPLICATION (the
+-- automatic deposit program), while key 15 comes from FBZ1/FB05 (manual entry
+-- / entry with clearing) and every reversal from FB08.
+--
+-- Only a curated subset of BKPF's 111 columns is kept - silver is cleaned, not
+-- a raw copy. Measured population over the 1,259,262 loaded rows:
+--     usuario 100%   transaccion 99.4%   texto_cabecera 50.6%   referencia 50%
+--     documento_reversa 0.66% (8,261)    motivo_reversa 4,120   XSTOV 0
+-- XSTOV is blank on every row (same as in BSAD - see clave_contabilizacion's
+-- note above), but XREVERSAL is filled on exactly the same 8,261 rows that
+-- carry STBLG, so indicador_reversa tells which SIDE of the pair a document is
+-- on without having to follow the link.
+--
+-- SCOPE: bronze.sap_bkpf only holds BLART = 'DZ' (see its note in
+-- ddl_bronze.sql), so this table inherits that scope.
+-- ==========================================================
+IF OBJECT_ID('silver.sap_bkpf', 'U') IS NOT NULL
+    DROP TABLE silver.sap_bkpf;
+GO
+
+CREATE TABLE silver.sap_bkpf (
+    mandante                VARCHAR(3)  NOT NULL,
+    sociedad                VARCHAR(4)  NOT NULL,
+    ejercicio               INT         NOT NULL,
+    documento_id            VARCHAR(10) NOT NULL,
+    clase_documento         VARCHAR(2),   -- BLART
+    fecha_documento         DATE,         -- BLDAT
+    fecha_contabilizacion   DATE,         -- BUDAT
+    fecha_registro_sistema  DATE,         -- CPUDT
+    mes                     VARCHAR(2),   -- MONAT
+    usuario                 VARCHAR(12),  -- USNAM: who posted it
+    transaccion             VARCHAR(20),  -- TCODE: FBZ1 incoming payment, FB05 post with clearing,
+                                          --        FB08 reverse, FBZ2 outgoing payment,
+                                          --        OS_APPLICATION automatic deposit assignment
+    referencia              VARCHAR(16),  -- XBLNR
+    texto_cabecera          VARCHAR(25),  -- BKTXT: header text. Half the documents have it; worth
+                                          --        checking as a replacement for the line-level
+                                          --        sgtxt filter, which loses deposits with empty text.
+    documento_reversa       VARCHAR(10),  -- STBLG: THE point of this table
+    ejercicio_reversa       INT,          -- STJAH
+    motivo_reversa          VARCHAR(2),   -- STGRD: filled on only half the reversals
+    indicador_reversa       VARCHAR(1),   -- XREVERSAL: which side of the pair this document is
+    moneda                  VARCHAR(5),   -- WAERS
+
+    fecha_carga             DATETIME DEFAULT GETDATE(),
+    CONSTRAINT PK_silver_sap_bkpf PRIMARY KEY (mandante, sociedad, ejercicio, documento_id)
+);
+GO
+PRINT 'Table silver.sap_bkpf created successfully.';
+GO

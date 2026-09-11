@@ -494,6 +494,87 @@ BEGIN
         THROW;
     END CATCH;
 
+-- ==========================================
+    -- 6b. CLEANING: BKPF (Accounting Document Header)
+    -- Added 2026-09-11. Same 2-month window and same MERGE shape as BSAD above,
+    -- and it reuses @mes_anterior_inicio_str declared there.
+    --
+    -- WINDOWED BY BUDAT, NOT BY A CHANGE DATE: AEDAT comes as '00000000' on
+    -- effectively every row (measured: 23,518 of 23,518 for August 2026), so
+    -- there is no reliable "changed since" field. That matters because a
+    -- reversal REWRITES documento_reversa on the ORIGINAL document, months
+    -- after it was posted - which is why the window reaches back a month and
+    -- why documento_reversa is in the UPDATE list.
+    -- LIMITATION: a document reversed more than ~1 month after posting falls
+    -- outside the window and keeps a stale documento_reversa here. Measured on
+    -- 2026, 215 of 1,219 reversals (18%) hit a document from a DIFFERENT month,
+    -- so this is not hypothetical - widen the window if that share grows.
+    -- ==========================================
+    BEGIN TRY
+        SET @start_time = GETDATE();
+        PRINT '>> Loading and cleaning silver.sap_bkpf (Incremental Merge)...';
+
+        MERGE silver.sap_bkpf AS tgt
+        USING (
+            SELECT
+                LTRIM(RTRIM(MANDT)) AS mandante,
+                LTRIM(RTRIM(BUKRS)) AS sociedad,
+                GJAHR AS ejercicio,
+                LTRIM(RTRIM(BELNR)) AS documento_id,
+                NULLIF(LTRIM(RTRIM(BLART)), '') AS clase_documento,
+                TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(BLDAT)), '00000000'), 112) AS fecha_documento,
+                TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(BUDAT)), '00000000'), 112) AS fecha_contabilizacion,
+                TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(CPUDT)), '00000000'), 112) AS fecha_registro_sistema,
+                NULLIF(LTRIM(RTRIM(MONAT)), '') AS mes,
+                NULLIF(LTRIM(RTRIM(USNAM)), '') AS usuario,
+                NULLIF(LTRIM(RTRIM(TCODE)), '') AS transaccion,
+                NULLIF(LTRIM(RTRIM(XBLNR)), '') AS referencia,
+                NULLIF(LTRIM(RTRIM(BKTXT)), '') AS texto_cabecera,
+                NULLIF(LTRIM(RTRIM(STBLG)), '') AS documento_reversa,
+                TRY_CAST(NULLIF(LTRIM(RTRIM(STJAH)), '') AS INT) AS ejercicio_reversa,
+                NULLIF(LTRIM(RTRIM(STGRD)), '') AS motivo_reversa,
+                NULLIF(LTRIM(RTRIM(XREVERSAL)), '') AS indicador_reversa,
+                NULLIF(LTRIM(RTRIM(WAERS)), '') AS moneda
+            FROM bronze.sap_bkpf WITH (NOLOCK)
+            WHERE MANDT = '400'
+              AND BUDAT >= @mes_anterior_inicio_str
+        ) AS src
+        ON  tgt.mandante = src.mandante
+        AND tgt.sociedad = src.sociedad
+        AND tgt.ejercicio = src.ejercicio
+        AND tgt.documento_id = src.documento_id
+
+        WHEN MATCHED THEN UPDATE SET
+            tgt.documento_reversa = src.documento_reversa,
+            tgt.ejercicio_reversa = src.ejercicio_reversa,
+            tgt.motivo_reversa    = src.motivo_reversa,
+            tgt.indicador_reversa = src.indicador_reversa,
+            tgt.texto_cabecera    = src.texto_cabecera,
+            tgt.fecha_carga       = GETDATE()
+
+        WHEN NOT MATCHED THEN
+        INSERT (
+            mandante, sociedad, ejercicio, documento_id, clase_documento,
+            fecha_documento, fecha_contabilizacion, fecha_registro_sistema, mes,
+            usuario, transaccion, referencia, texto_cabecera,
+            documento_reversa, ejercicio_reversa, motivo_reversa, indicador_reversa, moneda
+        )
+        VALUES (
+            src.mandante, src.sociedad, src.ejercicio, src.documento_id, src.clase_documento,
+            src.fecha_documento, src.fecha_contabilizacion, src.fecha_registro_sistema, src.mes,
+            src.usuario, src.transaccion, src.referencia, src.texto_cabecera,
+            src.documento_reversa, src.ejercicio_reversa, src.motivo_reversa, src.indicador_reversa, src.moneda
+        );
+        SET @rows_count = @@ROWCOUNT;
+
+        SET @end_time = GETDATE();
+        PRINT 'Rows: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
+    END TRY
+    BEGIN CATCH
+        PRINT 'ERROR in silver.sap_bkpf: ' + ERROR_MESSAGE();
+        THROW;
+    END CATCH;
+
     -- ==========================================
     -- 7. CLEANING: KNB1 (Customer Company Code Data)
     -- ==========================================
