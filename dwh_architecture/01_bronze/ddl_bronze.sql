@@ -901,7 +901,27 @@ GO
 -- ============================================================================
 
 -- ============================================================================
--- NOTE: bronze.sap_bkpf / bronze.sap_vbrk / bronze.sap_vbrp ARE NOT IMPLEMENTED.
+-- NOTE: bronze.sap_bkpf IS NOW IMPLEMENTED (see table 11 at the end of this file).
+-- It was brought back 2026-09-11 with a concrete use case: BSAD/BSID carry the
+-- payment LINES but not the document header, so there is no way to know which
+-- document reverses which (STBLG/STJAH/STGRD) or which transaction created a
+-- document (TCODE/USNAM). Without that, reversals had to be matched by guessing
+-- on customer+amount+assignment: 73 of 188 clave-05 reversals came out ambiguous
+-- and 46 had no match at all, which left one month $4.16M off.
+-- TCODE also settles, with evidence instead of inference, why some payment lines
+-- carry posting key 11 and others 15: in August 2026 all 10,553 key-11 lines were
+-- created by OS_APPLICATION (the automatic deposit program) and the key-15 ones by
+-- FBZ1/FB05 (manual posting / posting with clearing).
+--
+-- SCOPE: only BLART = 'DZ' is loaded. Full BKPF is the accounting journal for the
+-- WHOLE company: 35.6M rows x 111 columns, against ~1.25M for DZ alone. Copying all
+-- of it to answer a payments question would be expensive on an instance that already
+-- has transaction-log limits. Widening the scope is a one-line change in the WHERE of
+-- bronze.load_bronze and bronze.backfill_bkpf - but do it only when something
+-- concrete consumes it, which is exactly the reason this table was dropped the
+-- first time around.
+--
+-- NOTE: bronze.sap_vbrk / bronze.sap_vbrp ARE STILL NOT IMPLEMENTED.
 -- They were designed, verified column by column against P01, and left ready
 -- to go (including a yearly historical backfill procedure), but were
 -- dropped from scope because no silver/gold table consumes them: the
@@ -1126,4 +1146,130 @@ CREATE TABLE bronze.sap_pa0001 (
     CONSTRAINT PK_sap_pa0001 PRIMARY KEY CLUSTERED (MANDT, PERNR, SUBTY, OBJPS, ENDDA, BEGDA, SEQNR)
 );
 PRINT 'Table bronze.sap_pa0001 created successfully using exact SAP lengths.';
+GO
+
+-- ============================================================================
+-- 11. TABLE: bronze.sap_bkpf (Accounting Document Header - COMPLETE)
+-- ============================================================================
+IF OBJECT_ID('bronze.sap_bkpf', 'U') IS NOT NULL DROP TABLE bronze.sap_bkpf;
+GO
+
+-- Column list and order taken directly from P01.p01.BKPF: bronze.backfill_bkpf
+-- does a positional INSERT ... SELECT * (same reason as BSAD - see that backfill),
+-- so the order here is not cosmetic, it's load-critical.
+CREATE TABLE bronze.sap_bkpf (
+    MANDT            NVARCHAR(3) NOT NULL,
+    BUKRS            NVARCHAR(4) NOT NULL,
+    BELNR            NVARCHAR(10) NOT NULL,
+    GJAHR            NVARCHAR(4) NOT NULL,
+    BLART            NVARCHAR(2),
+    BLDAT            NVARCHAR(8),
+    BUDAT            NVARCHAR(8),
+    MONAT            NVARCHAR(2),
+    CPUDT            NVARCHAR(8),
+    CPUTM            NVARCHAR(6),
+    AEDAT            NVARCHAR(8),
+    UPDDT            NVARCHAR(8),
+    WWERT            NVARCHAR(8),
+    USNAM            NVARCHAR(12),
+    TCODE            NVARCHAR(20),
+    BVORG            NVARCHAR(16),
+    XBLNR            NVARCHAR(16),
+    DBBLG            NVARCHAR(10),
+    STBLG            NVARCHAR(10),
+    STJAH            NVARCHAR(4),
+    BKTXT            NVARCHAR(25),
+    WAERS            NVARCHAR(5),
+    KURSF            DECIMAL(9,5),
+    KZWRS            NVARCHAR(5),
+    KZKRS            DECIMAL(9,5),
+    BSTAT            NVARCHAR(1),
+    XNETB            NVARCHAR(1),
+    FRATH            DECIMAL(13,2),
+    XRUEB            NVARCHAR(1),
+    GLVOR            NVARCHAR(4),
+    GRPID            NVARCHAR(12),
+    DOKID            NVARCHAR(40),
+    ARCID            NVARCHAR(10),
+    IBLAR            NVARCHAR(2),
+    AWTYP            NVARCHAR(5),
+    AWKEY            NVARCHAR(20),
+    FIKRS            NVARCHAR(4),
+    HWAER            NVARCHAR(5),
+    HWAE2            NVARCHAR(5),
+    HWAE3            NVARCHAR(5),
+    KURS2            DECIMAL(9,5),
+    KURS3            DECIMAL(9,5),
+    BASW2            NVARCHAR(1),
+    BASW3            NVARCHAR(1),
+    UMRD2            NVARCHAR(1),
+    UMRD3            NVARCHAR(1),
+    XSTOV            NVARCHAR(1),
+    STODT            NVARCHAR(8),
+    XMWST            NVARCHAR(1),
+    CURT2            NVARCHAR(2),
+    CURT3            NVARCHAR(2),
+    KUTY2            NVARCHAR(4),
+    KUTY3            NVARCHAR(4),
+    XSNET            NVARCHAR(1),
+    AUSBK            NVARCHAR(4),
+    XUSVR            NVARCHAR(1),
+    DUEFL            NVARCHAR(1),
+    AWSYS            NVARCHAR(10),
+    TXKRS            DECIMAL(9,5),
+    LOTKZ            NVARCHAR(10),
+    XWVOF            NVARCHAR(1),
+    STGRD            NVARCHAR(2),
+    PPNAM            NVARCHAR(12),
+    BRNCH            NVARCHAR(4),
+    NUMPG            NVARCHAR(3),
+    ADISC            NVARCHAR(1),
+    XREF1_HD         NVARCHAR(20),
+    XREF2_HD         NVARCHAR(20),
+    XREVERSAL        NVARCHAR(1),
+    REINDAT          NVARCHAR(8),
+    RLDNR            NVARCHAR(2),
+    LDGRP            NVARCHAR(4),
+    PROPMANO         NVARCHAR(13),
+    XBLNR_ALT        NVARCHAR(26),
+    VATDATE          NVARCHAR(8),
+    DOCCAT           NVARCHAR(6),
+    XSPLIT           NVARCHAR(1),
+    CASH_ALLOC       NVARCHAR(1),
+    FOLLOW_ON        NVARCHAR(1),
+    XREORG           NVARCHAR(1),
+    SUBSET           NVARCHAR(4),
+    KURST            NVARCHAR(4),
+    KURSX            DECIMAL(28,14),
+    KUR2X            DECIMAL(28,14),
+    KUR3X            DECIMAL(28,14),
+    XMCA             NVARCHAR(1),
+    [/SAPF15/STATUS]   NVARCHAR(1),
+    PSOTY            NVARCHAR(2),
+    PSOAK            NVARCHAR(10),
+    PSOKS            NVARCHAR(10),
+    PSOSG            NVARCHAR(1),
+    PSOFN            NVARCHAR(30),
+    INTFORM          NVARCHAR(4),
+    INTDATE          NVARCHAR(8),
+    PSOBT            NVARCHAR(8),
+    PSOZL            NVARCHAR(1),
+    PSODT            NVARCHAR(8),
+    PSOTM            NVARCHAR(6),
+    FM_UMART         NVARCHAR(1),
+    CCINS            NVARCHAR(4),
+    CCNUM            NVARCHAR(25),
+    SSBLK            NVARCHAR(1),
+    BATCH            NVARCHAR(10),
+    SNAME            NVARCHAR(12),
+    SAMPLED          NVARCHAR(1),
+    EXCLUDE_FLAG     NVARCHAR(1),
+    BLIND            NVARCHAR(1),
+    OFFSET_STATUS    NVARCHAR(2),
+    OFFSET_REFER_DAT NVARCHAR(8),
+    PENRC            NVARCHAR(2),
+    KNUMV            NVARCHAR(10),
+    CONSTRAINT PK_sap_bkpf PRIMARY KEY CLUSTERED (MANDT, BUKRS, BELNR, GJAHR)
+);
+PRINT 'Table bronze.sap_bkpf created successfully.';
 GO

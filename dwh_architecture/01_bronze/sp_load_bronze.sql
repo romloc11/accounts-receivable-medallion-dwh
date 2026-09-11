@@ -37,6 +37,11 @@ the Bronze staging area of ANALISIS_DATOS, in one sequential run:
 - sap_kna1, sap_knvp, sap_knkk, sap_knvv, sap_bsid, sap_knb1, sap_knb5,
   sap_tvv1t, sap_pa0001: Full Truncate & Load (current SAP snapshot fully
   replaces what's in bronze each run).
+- sap_bkpf: Incremental MERGE by primary key (MANDT, BUKRS, BELNR, GJAHR), filtered
+  to BLART = 'DZ' and to the current + previous month via BUDAT. Gives the document
+  header that BSAD/BSID lack: STBLG/STJAH (which document reverses which), STGRD
+  (why) and TCODE/USNAM (which transaction and user created it). History loaded once
+  via sp_backfill_bkpf.sql.
 - sap_bsad: Incremental MERGE by primary key (MANDT, BUKRS, KUNNR, GJAHR, BELNR,
   BUZEI), filtered to the current + previous month via AUGDT. The full multi-year
   history was loaded once via a separate one-time backfill (see sp_backfill_bsad.sql);
@@ -47,8 +52,9 @@ the Bronze staging area of ANALISIS_DATOS, in one sequential run:
   sap_pa0001 resolves PERNR to the employee's real name (ENAME) for the
   vendedor/ejecutivo de credito/gerente/cobrador partner-function roles.
 
-NOTE ON sap_ausp / sap_bseg / sap_bkpf / sap_vbrk / sap_vbrp: intentionally not
-implemented. See ddl_bronze.sql for the full notes on each.
+NOTE ON sap_ausp / sap_bseg / sap_vbrk / sap_vbrp: intentionally not implemented.
+See ddl_bronze.sql for the full notes on each. sap_bkpf WAS in that list and came
+back 2026-09-11 with a concrete consumer - see its note in ddl_bronze.sql.
 ========================================================================================
 */
 
@@ -265,8 +271,94 @@ BEGIN
         PRINT 'Duration: ' + CAST(DATEDIFF(second,@start_time,@end_time) AS NVARCHAR) + ' seconds'
 
 
+
         /* ==========================================================
-           7. CUSTOMER COMPANY CODE DATA (KNB1) - Full Truncate & Load
+           7. ACCOUNTING DOCUMENT HEADER (BKPF) - Incremental Merge
+           Only BLART = 'DZ'. See the scope note in ddl_bronze.sql.
+           Windowed by BUDAT, not by a change date: SAP leaves AEDAT at
+           '00000000' on virtually every row here (measured on August 2026:
+           23,518 of 23,518), so there is no reliable "changed since" field.
+           A reversal rewrites STBLG on the ORIGINAL document, which is why
+           the window has to reach back a month instead of only loading what
+           is new - and why STBLG is in the UPDATE list below.
+           LIMITATION: a document reversed more than ~1 month after it was
+           posted falls outside the window and keeps a stale STBLG here.
+           Measured over 2026, every reversal landed in the same month as its
+           original, so the window holds today; widen it if that changes.
+        ========================================================== */
+        SET @current_table = 'bronze.sap_bkpf'
+        SET @start_time = GETDATE()
+        PRINT '>> Loading bronze.sap_bkpf (Incremental Merge)...'
+
+        MERGE bronze.sap_bkpf AS tgt
+        USING (
+            SELECT
+                MANDT, BUKRS, BELNR, GJAHR, BLART, BLDAT, BUDAT, MONAT, CPUDT, CPUTM, AEDAT, UPDDT,
+                WWERT, USNAM, TCODE, BVORG, XBLNR, DBBLG, STBLG, STJAH, BKTXT, WAERS, KURSF, KZWRS,
+                KZKRS, BSTAT, XNETB, FRATH, XRUEB, GLVOR, GRPID, DOKID, ARCID, IBLAR, AWTYP, AWKEY,
+                FIKRS, HWAER, HWAE2, HWAE3, KURS2, KURS3, BASW2, BASW3, UMRD2, UMRD3, XSTOV, STODT,
+                XMWST, CURT2, CURT3, KUTY2, KUTY3, XSNET, AUSBK, XUSVR, DUEFL, AWSYS, TXKRS, LOTKZ,
+                XWVOF, STGRD, PPNAM, BRNCH, NUMPG, ADISC, XREF1_HD, XREF2_HD, XREVERSAL, REINDAT,
+                RLDNR, LDGRP, PROPMANO, XBLNR_ALT, VATDATE, DOCCAT, XSPLIT, CASH_ALLOC, FOLLOW_ON,
+                XREORG, SUBSET, KURST, KURSX, KUR2X, KUR3X, XMCA, [/SAPF15/STATUS], PSOTY, PSOAK,
+                PSOKS, PSOSG, PSOFN, INTFORM, INTDATE, PSOBT, PSOZL, PSODT, PSOTM, FM_UMART, CCINS,
+                CCNUM, SSBLK, BATCH, SNAME, SAMPLED, EXCLUDE_FLAG, BLIND, OFFSET_STATUS,
+                OFFSET_REFER_DAT, PENRC, KNUMV
+            FROM P01.p01.BKPF WITH (NOLOCK)
+            WHERE BLART = 'DZ'
+              AND BUDAT >= @mes_anterior_inicio
+        ) AS src
+        ON  tgt.MANDT = src.MANDT
+        AND tgt.BUKRS = src.BUKRS
+        AND tgt.BELNR = src.BELNR
+        AND tgt.GJAHR = src.GJAHR
+
+        WHEN MATCHED THEN UPDATE SET
+            tgt.STBLG = src.STBLG,
+            tgt.STJAH = src.STJAH,
+            tgt.STGRD = src.STGRD,
+            tgt.AEDAT = src.AEDAT,
+            tgt.UPDDT = src.UPDDT,
+            tgt.XREVERSAL = src.XREVERSAL
+
+        WHEN NOT MATCHED THEN
+        INSERT (
+            MANDT, BUKRS, BELNR, GJAHR, BLART, BLDAT, BUDAT, MONAT, CPUDT, CPUTM, AEDAT, UPDDT,
+            WWERT, USNAM, TCODE, BVORG, XBLNR, DBBLG, STBLG, STJAH, BKTXT, WAERS, KURSF, KZWRS,
+            KZKRS, BSTAT, XNETB, FRATH, XRUEB, GLVOR, GRPID, DOKID, ARCID, IBLAR, AWTYP, AWKEY,
+            FIKRS, HWAER, HWAE2, HWAE3, KURS2, KURS3, BASW2, BASW3, UMRD2, UMRD3, XSTOV, STODT,
+            XMWST, CURT2, CURT3, KUTY2, KUTY3, XSNET, AUSBK, XUSVR, DUEFL, AWSYS, TXKRS, LOTKZ,
+            XWVOF, STGRD, PPNAM, BRNCH, NUMPG, ADISC, XREF1_HD, XREF2_HD, XREVERSAL, REINDAT, RLDNR,
+            LDGRP, PROPMANO, XBLNR_ALT, VATDATE, DOCCAT, XSPLIT, CASH_ALLOC, FOLLOW_ON, XREORG,
+            SUBSET, KURST, KURSX, KUR2X, KUR3X, XMCA, [/SAPF15/STATUS], PSOTY, PSOAK, PSOKS, PSOSG,
+            PSOFN, INTFORM, INTDATE, PSOBT, PSOZL, PSODT, PSOTM, FM_UMART, CCINS, CCNUM, SSBLK,
+            BATCH, SNAME, SAMPLED, EXCLUDE_FLAG, BLIND, OFFSET_STATUS, OFFSET_REFER_DAT, PENRC,
+            KNUMV
+        )
+        VALUES (
+            src.MANDT, src.BUKRS, src.BELNR, src.GJAHR, src.BLART, src.BLDAT, src.BUDAT, src.MONAT,
+            src.CPUDT, src.CPUTM, src.AEDAT, src.UPDDT, src.WWERT, src.USNAM, src.TCODE, src.BVORG,
+            src.XBLNR, src.DBBLG, src.STBLG, src.STJAH, src.BKTXT, src.WAERS, src.KURSF, src.KZWRS,
+            src.KZKRS, src.BSTAT, src.XNETB, src.FRATH, src.XRUEB, src.GLVOR, src.GRPID, src.DOKID,
+            src.ARCID, src.IBLAR, src.AWTYP, src.AWKEY, src.FIKRS, src.HWAER, src.HWAE2, src.HWAE3,
+            src.KURS2, src.KURS3, src.BASW2, src.BASW3, src.UMRD2, src.UMRD3, src.XSTOV, src.STODT,
+            src.XMWST, src.CURT2, src.CURT3, src.KUTY2, src.KUTY3, src.XSNET, src.AUSBK, src.XUSVR,
+            src.DUEFL, src.AWSYS, src.TXKRS, src.LOTKZ, src.XWVOF, src.STGRD, src.PPNAM, src.BRNCH,
+            src.NUMPG, src.ADISC, src.XREF1_HD, src.XREF2_HD, src.XREVERSAL, src.REINDAT, src.RLDNR,
+            src.LDGRP, src.PROPMANO, src.XBLNR_ALT, src.VATDATE, src.DOCCAT, src.XSPLIT,
+            src.CASH_ALLOC, src.FOLLOW_ON, src.XREORG, src.SUBSET, src.KURST, src.KURSX, src.KUR2X,
+            src.KUR3X, src.XMCA, src.[/SAPF15/STATUS], src.PSOTY, src.PSOAK, src.PSOKS, src.PSOSG,
+            src.PSOFN, src.INTFORM, src.INTDATE, src.PSOBT, src.PSOZL, src.PSODT, src.PSOTM,
+            src.FM_UMART, src.CCINS, src.CCNUM, src.SSBLK, src.BATCH, src.SNAME, src.SAMPLED,
+            src.EXCLUDE_FLAG, src.BLIND, src.OFFSET_STATUS, src.OFFSET_REFER_DAT, src.PENRC,
+            src.KNUMV
+        );
+
+        SET @end_time = GETDATE()
+        PRINT 'Duration: ' + CAST(DATEDIFF(second,@start_time,@end_time) AS NVARCHAR) + ' seconds'
+
+        /* ==========================================================
+           8. CUSTOMER COMPANY CODE DATA (KNB1) - Full Truncate & Load
         ========================================================== */
         SET @current_table = 'bronze.sap_knb1'
         SET @start_time = GETDATE()
