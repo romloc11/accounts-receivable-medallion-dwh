@@ -228,8 +228,8 @@ SELECT
         -- apply to that particular report. The "wholesale only" filter
         -- lives exclusively in the report, never here.
         -- Channel '50' investigated 2026-08-17: confirmed it's NOT a real
-        -- customer channel - the largest account there (90000002, $171.5M)
-        -- belongs to the company's OWNER (Jorge Armando Huguenin Bolaños).
+        -- customer channel - the largest account there (<cliente-10>, $171.5M)
+        -- belongs to a company OWNER (name withheld: public repo).
         -- No channel-50 account has a ruta_nombre. Likely a related/
         -- shareholder account, correctly falls into FUERA_DE_ALCANCE under
         -- the rule below (it's not in 10/20/40/60).
