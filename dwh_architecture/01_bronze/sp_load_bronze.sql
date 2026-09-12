@@ -46,6 +46,14 @@ the Bronze staging area of ANALISIS_DATOS, in one sequential run:
   BUZEI), filtered to the current + previous month via AUGDT. The full multi-year
   history was loaded once via a separate one-time backfill (see sp_backfill_bsad.sql);
   this keeps only the recent window in sync going forward.
+- sap_bsas: Incremental MERGE by primary key (MANDT, BUKRS, HKONT, GJAHR, BELNR, BUZEI),
+  filtered to cash accounts (HKONT 111xxx/113xxx) and to the current + previous month via
+  BUDAT. The BANK side of a payment, which BSAD cannot show: BSAD's HKONT is the customer
+  reconciliation account, never the bank. This is what the company's own monthly cash
+  report is built on. History loaded once via sp_backfill_bsas.sql.
+- sap_bsis: Full reload in year chunks, same cash-account scope. NOT a merge: an open
+  item disappears from BSIS the day it is cleared, and a line of any age can disappear,
+  so no date window would ever notice. Same reasoning as sap_bsid.
 - sap_tvv1t / sap_pa0001: added to support the customer active/legal/inactive
   classification logic (see ciosa.py business rules, being ported to silver).
   sap_tvv1t resolves KVGR1 "ruta" codes to their readable BEZEI name;
@@ -53,6 +61,9 @@ the Bronze staging area of ANALISIS_DATOS, in one sequential run:
   vendedor/ejecutivo de credito/gerente/cobrador partner-function roles.
 
 NOTE ON sap_ausp / sap_bseg / sap_vbrk / sap_vbrp: intentionally not implemented.
+sap_bseg additionally CANNOT be implemented - it is an SAP cluster table and does not
+exist in P01 (verified 2026-09-11). bronze.sap_bsas/sap_bsis are the readable secondary
+indexes that replace it for G/L line items.
 See ddl_bronze.sql for the full notes on each. sap_bkpf WAS in that list and came
 back 2026-09-11 with a concrete consumer - see its note in ddl_bronze.sql.
 ========================================================================================
@@ -79,6 +90,7 @@ BEGIN
             @batch_start_time DATETIME,
             @batch_end_time DATETIME,
             @mes_anterior_inicio NVARCHAR(8),
+            @bsis_yr INT,
             @current_table NVARCHAR(128)
 
     BEGIN TRY
@@ -418,6 +430,134 @@ BEGIN
 
         INSERT INTO bronze.sap_pa0001
         SELECT * FROM P01.p01.PA0001 WITH (NOLOCK)
+
+        SET @end_time = GETDATE()
+        PRINT 'Duration: ' + CAST(DATEDIFF(second,@start_time,@end_time) AS NVARCHAR) + ' seconds'
+
+
+        /* ==========================================================
+           11. G/L CLEARED LINE ITEMS - CASH ACCOUNTS (BSAS) - Incremental Merge
+
+           The bank side of a payment. BSAD only carries the CUSTOMER line, whose
+           HKONT is the reconciliation account (121001), so the bank account the
+           money actually landed in was invisible until this table. This is what
+           the company's own monthly cash report is built on - reproduced exactly
+           for July 2026, document by document.
+
+           SCOPE: HKONT 111xxx (cash on hand + payment-gateway transit accounts)
+           and 113xxx (banks). See the long note in ddl_bronze.sql for why the
+           111xxx half is not optional.
+
+           WINDOW: BUDAT, current + previous month, same as BSAD and BKPF. A line
+           that gets cleared later has its AUGDT rewritten but keeps its BUDAT, so
+           following the posting date is what catches the update.
+        ========================================================== */
+        SET @current_table = 'bronze.sap_bsas'
+        SET @start_time = GETDATE()
+        PRINT '>> Loading bronze.sap_bsas (Incremental Merge)...'
+
+        MERGE bronze.sap_bsas AS tgt
+        USING (
+            SELECT
+                MANDT, BUKRS, HKONT, AUGDT, AUGBL, ZUONR, GJAHR, BELNR, BUZEI, BUDAT, BLDAT,
+                WAERS, XBLNR, BLART, MONAT, BSCHL, SHKZG, GSBER, MWSKZ, FKONT, DMBTR, WRBTR,
+                MWSTS, WMWST, SGTXT, PROJN, AUFNR, WERKS, KOSTL, ZFBDT, XOPVW, VALUT, BSTAT,
+                BDIFF, BDIF2, VBUND, PSWSL, WVERW, DMBE2, DMBE3, MWST2, MWST3, BDIF3, RDIF3,
+                XRAGL, PROJK, PRCTR, XSTOV, XARCH, PSWBT, XNEGP, RFZEI, CCBTC, XREF3, BUPLA,
+                PPDIFF, PPDIF2, PPDIF3, BEWAR, IMKEY, DABRZ, INTRENO, GRANT_NBR, FKBER, FIPOS,
+                FISTL, GEBER, PPRCT, BUZID, AUGGJ, UZAWE, SEGMENT, PSEGMENT, PGEBER,
+                PGRANT_NBR, MEASURE, BUDGET_PD, PBUDGET_PD, FIPEX, PRODPER, QSSKZ, PROPMANO
+            FROM P01.p01.BSAS WITH (NOLOCK)
+            WHERE BUDAT >= @mes_anterior_inicio
+              AND (HKONT LIKE '0000111%' OR HKONT LIKE '0000113%')
+        ) AS src
+        ON  tgt.MANDT = src.MANDT
+        AND tgt.BUKRS = src.BUKRS
+        AND tgt.HKONT = src.HKONT
+        AND tgt.GJAHR = src.GJAHR
+        AND tgt.BELNR = src.BELNR
+        AND tgt.BUZEI = src.BUZEI
+
+        -- Only what can change after the line is first posted: the clearing link
+        -- (a line can be cleared, un-cleared and re-cleared) and the reversal and
+        -- archive flags. The amount and the account never move.
+        WHEN MATCHED THEN UPDATE SET
+            tgt.AUGDT = src.AUGDT,
+            tgt.AUGBL = src.AUGBL,
+            tgt.AUGGJ = src.AUGGJ,
+            tgt.XSTOV = src.XSTOV,
+            tgt.XARCH = src.XARCH,
+            tgt.SGTXT = src.SGTXT
+
+        WHEN NOT MATCHED THEN
+        INSERT (
+            MANDT, BUKRS, HKONT, AUGDT, AUGBL, ZUONR, GJAHR, BELNR, BUZEI, BUDAT, BLDAT, WAERS,
+            XBLNR, BLART, MONAT, BSCHL, SHKZG, GSBER, MWSKZ, FKONT, DMBTR, WRBTR, MWSTS, WMWST,
+            SGTXT, PROJN, AUFNR, WERKS, KOSTL, ZFBDT, XOPVW, VALUT, BSTAT, BDIFF, BDIF2, VBUND,
+            PSWSL, WVERW, DMBE2, DMBE3, MWST2, MWST3, BDIF3, RDIF3, XRAGL, PROJK, PRCTR, XSTOV,
+            XARCH, PSWBT, XNEGP, RFZEI, CCBTC, XREF3, BUPLA, PPDIFF, PPDIF2, PPDIF3, BEWAR,
+            IMKEY, DABRZ, INTRENO, GRANT_NBR, FKBER, FIPOS, FISTL, GEBER, PPRCT, BUZID, AUGGJ,
+            UZAWE, SEGMENT, PSEGMENT, PGEBER, PGRANT_NBR, MEASURE, BUDGET_PD, PBUDGET_PD,
+            FIPEX, PRODPER, QSSKZ, PROPMANO
+        )
+        VALUES (
+            src.MANDT, src.BUKRS, src.HKONT, src.AUGDT, src.AUGBL, src.ZUONR, src.GJAHR,
+            src.BELNR, src.BUZEI, src.BUDAT, src.BLDAT, src.WAERS, src.XBLNR, src.BLART,
+            src.MONAT, src.BSCHL, src.SHKZG, src.GSBER, src.MWSKZ, src.FKONT, src.DMBTR,
+            src.WRBTR, src.MWSTS, src.WMWST, src.SGTXT, src.PROJN, src.AUFNR, src.WERKS,
+            src.KOSTL, src.ZFBDT, src.XOPVW, src.VALUT, src.BSTAT, src.BDIFF, src.BDIF2,
+            src.VBUND, src.PSWSL, src.WVERW, src.DMBE2, src.DMBE3, src.MWST2, src.MWST3,
+            src.BDIF3, src.RDIF3, src.XRAGL, src.PROJK, src.PRCTR, src.XSTOV, src.XARCH,
+            src.PSWBT, src.XNEGP, src.RFZEI, src.CCBTC, src.XREF3, src.BUPLA, src.PPDIFF,
+            src.PPDIF2, src.PPDIF3, src.BEWAR, src.IMKEY, src.DABRZ, src.INTRENO,
+            src.GRANT_NBR, src.FKBER, src.FIPOS, src.FISTL, src.GEBER, src.PPRCT, src.BUZID,
+            src.AUGGJ, src.UZAWE, src.SEGMENT, src.PSEGMENT, src.PGEBER, src.PGRANT_NBR,
+            src.MEASURE, src.BUDGET_PD, src.PBUDGET_PD, src.FIPEX, src.PRODPER, src.QSSKZ,
+            src.PROPMANO
+        );
+
+        SET @end_time = GETDATE()
+        PRINT 'Duration: ' + CAST(DATEDIFF(second,@start_time,@end_time) AS NVARCHAR) + ' seconds'
+
+
+        /* ==========================================================
+           12. G/L OPEN LINE ITEMS - CASH ACCOUNTS (BSIS) - Truncate & Load by year
+
+           WHY THIS ONE IS NOT A MERGE, UNLIKE BSAS:
+           BSIS holds items that are still OPEN. The day a line gets cleared it
+           LEAVES BSIS and shows up in BSAS. A merge on a date window would never
+           notice the disappearance and bronze would keep the line forever - and
+           a line of ANY age can disappear, so no window fixes it. Same reasoning
+           as bronze.sap_bsid, which is also a full reload.
+
+           WHY IN YEAR CHUNKS:
+           ~2.9M rows in scope. One INSERT that size is a single transaction
+           against a 2GB log ceiling this instance has hit before. Year chunks
+           keep each transaction bounded; the loop is the whole fix.
+
+           The table is empty between the TRUNCATE and the end of the loop -
+           acceptable in bronze, same as every other full-load table here.
+        ========================================================== */
+        SET @current_table = 'bronze.sap_bsis'
+        SET @start_time = GETDATE()
+        PRINT '>> Loading bronze.sap_bsis (Full Load by year)...'
+
+        TRUNCATE TABLE bronze.sap_bsis
+
+        SET @bsis_yr = 2022
+
+        WHILE @bsis_yr <= YEAR(GETDATE())
+        BEGIN
+            INSERT INTO bronze.sap_bsis
+            SELECT *
+            FROM P01.p01.BSIS WITH (NOLOCK)
+            WHERE BUDAT BETWEEN CAST(@bsis_yr AS NVARCHAR(4)) + '0101'
+                            AND CAST(@bsis_yr AS NVARCHAR(4)) + '1231'
+              AND (HKONT LIKE '0000111%' OR HKONT LIKE '0000113%')
+
+            PRINT '   [' + CAST(@bsis_yr AS NVARCHAR) + '] ' + CAST(@@ROWCOUNT AS NVARCHAR) + ' rows'
+            SET @bsis_yr = @bsis_yr + 1
+        END
 
         SET @end_time = GETDATE()
         PRINT 'Duration: ' + CAST(DATEDIFF(second,@start_time,@end_time) AS NVARCHAR) + ' seconds'

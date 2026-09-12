@@ -1273,3 +1273,258 @@ CREATE TABLE bronze.sap_bkpf (
 );
 PRINT 'Table bronze.sap_bkpf created successfully.';
 GO
+
+-- ============================================================================
+-- 12/13. TABLES: bronze.sap_bsas / bronze.sap_bsis
+--        (G/L line items - CASH ACCOUNTS ONLY: cleared and open)
+-- ============================================================================
+--
+-- WHY THESE TABLES EXIST
+-- ----------------------
+-- The report the company uses to state how much money came in each month turned
+-- out to be built on BANK lines, not on customer lines. Reproduced exactly for
+-- July 2026: $149,182,258.79 = $149,182,258.79, document by document, with two
+-- of the four bank accounts matching to the cent.
+--
+-- That was impossible to see from BSAD, because BSAD only holds the CUSTOMER
+-- side of a document - its HKONT is the reconciliation account (121001), never
+-- the bank. The bank side lives here.
+--
+-- WHY NOT BSEG
+-- ------------
+-- BSEG is an SAP cluster table and does not exist in P01 (verified 2026-09-11:
+-- sys.objects has BSAS/BSIS/BSIK/BSAK but no BSEG). BSAS/BSIS are the secondary
+-- indexes that make G/L line items readable, and they are what this needs.
+--
+-- BSAS = cleared items. BSIS = still open. Verified against the P01 catalog
+-- 2026-09-11: both have the SAME 82 columns, same types, same order - so the two
+-- CREATE TABLEs below are deliberately identical. They are still two tables
+-- because they LOAD differently (see sp_load_bronze.sql): a cleared item is
+-- permanent, an open item DISAPPEARS from BSIS the day it gets cleared, so BSIS
+-- has to be reloaded whole while BSAS can be merged on a window.
+--
+-- SCOPE - ONLY HKONT 111xxx AND 113xxx
+-- ------------------------------------
+-- 113xxx are the banks (five accounts per bank: base / DP / CH / NC / ND) and
+-- 111xxx are cash on hand (one account per branch) and the payment-gateway
+-- transit accounts. Full BSAS is ~16M rows; this scope is 1,933,853 rows from
+-- 2022 on for BSAS and 2,929,713 for BSIS.
+--
+-- The 111xxx half is NOT optional, even though the report never reads it. It is
+-- the explanation for the whole gap: fact_pagos runs $1.3M-$2.8M above the bank
+-- report every single month of 2026, and 94% of that is money sitting in 111992
+-- (Transitoria de Kushki) and 111997 (Transitoria Conekta) - online payments that
+-- settle the customer's debt without ever touching those four bank accounts.
+-- Loading only the banks would reproduce the number and explain nothing.
+--
+-- Widening the scope is a one-line change in the WHERE of bronze.load_bronze and
+-- bronze.backfill_bsas - do it when something concrete needs it.
+--
+-- THE KEY
+-- -------
+-- MANDT + BUKRS + HKONT + GJAHR + BELNR + BUZEI is SAP's own key for these
+-- tables. VERIFY IT ONCE before the backfill (query at the end of this section):
+-- the MERGE in bronze.load_bronze depends on it being unique.
+--
+-- THE COLUMN LIST IS LOAD-CRITICAL
+-- --------------------------------
+-- Generated from P01's catalog with 01_bronze/generar_ddl_desde_p01.sql, never by
+-- hand: bronze.backfill_bsas does a positional INSERT ... SELECT * with no column
+-- list, so a missing or reordered column writes every value into the wrong place
+-- and reports no error. Writing it by hand is exactly how this went wrong the
+-- first time - nine columns at the tail (PGEBER through PROPMANO) were dropped
+-- because a terminal truncated the catalog output at 80 lines. Re-generate it,
+-- do not edit it.
+-- ============================================================================
+IF OBJECT_ID('bronze.sap_bsas', 'U') IS NOT NULL DROP TABLE bronze.sap_bsas;
+GO
+
+CREATE TABLE bronze.sap_bsas (
+    MANDT       NVARCHAR(3) NOT NULL,
+    BUKRS       NVARCHAR(4) NOT NULL,
+    HKONT       NVARCHAR(10) NOT NULL,
+    AUGDT       NVARCHAR(8),
+    AUGBL       NVARCHAR(10),
+    ZUONR       NVARCHAR(18),
+    GJAHR       NVARCHAR(4) NOT NULL,
+    BELNR       NVARCHAR(10) NOT NULL,
+    BUZEI       NVARCHAR(3) NOT NULL,
+    BUDAT       NVARCHAR(8),
+    BLDAT       NVARCHAR(8),
+    WAERS       NVARCHAR(5),
+    XBLNR       NVARCHAR(16),
+    BLART       NVARCHAR(2),
+    MONAT       NVARCHAR(2),
+    BSCHL       NVARCHAR(2),
+    SHKZG       NVARCHAR(1),
+    GSBER       NVARCHAR(4),
+    MWSKZ       NVARCHAR(2),
+    FKONT       NVARCHAR(3),
+    DMBTR       DECIMAL(13,2),
+    WRBTR       DECIMAL(13,2),
+    MWSTS       DECIMAL(13,2),
+    WMWST       DECIMAL(13,2),
+    SGTXT       NVARCHAR(50),
+    PROJN       NVARCHAR(16),
+    AUFNR       NVARCHAR(12),
+    WERKS       NVARCHAR(4),
+    KOSTL       NVARCHAR(10),
+    ZFBDT       NVARCHAR(8),
+    XOPVW       NVARCHAR(1),
+    VALUT       NVARCHAR(8),
+    BSTAT       NVARCHAR(1),
+    BDIFF       DECIMAL(13,2),
+    BDIF2       DECIMAL(13,2),
+    VBUND       NVARCHAR(6),
+    PSWSL       NVARCHAR(5),
+    WVERW       NVARCHAR(1),
+    DMBE2       DECIMAL(13,2),
+    DMBE3       DECIMAL(13,2),
+    MWST2       DECIMAL(13,2),
+    MWST3       DECIMAL(13,2),
+    BDIF3       DECIMAL(13,2),
+    RDIF3       DECIMAL(13,2),
+    XRAGL       NVARCHAR(1),
+    PROJK       NVARCHAR(8),
+    PRCTR       NVARCHAR(10),
+    XSTOV       NVARCHAR(1),
+    XARCH       NVARCHAR(1),
+    PSWBT       DECIMAL(13,2),
+    XNEGP       NVARCHAR(1),
+    RFZEI       NVARCHAR(3),
+    CCBTC       NVARCHAR(10),
+    XREF3       NVARCHAR(20),
+    BUPLA       NVARCHAR(4),
+    PPDIFF      DECIMAL(13,2),
+    PPDIF2      DECIMAL(13,2),
+    PPDIF3      DECIMAL(13,2),
+    BEWAR       NVARCHAR(3),
+    IMKEY       NVARCHAR(8),
+    DABRZ       NVARCHAR(8),
+    INTRENO     NVARCHAR(13),
+    GRANT_NBR   NVARCHAR(20),
+    FKBER       NVARCHAR(16),
+    FIPOS       NVARCHAR(14),
+    FISTL       NVARCHAR(16),
+    GEBER       NVARCHAR(10),
+    PPRCT       NVARCHAR(10),
+    BUZID       NVARCHAR(1),
+    AUGGJ       NVARCHAR(4),
+    UZAWE       NVARCHAR(2),
+    SEGMENT     NVARCHAR(10),
+    PSEGMENT    NVARCHAR(10),
+    PGEBER      NVARCHAR(10),
+    PGRANT_NBR  NVARCHAR(20),
+    MEASURE     NVARCHAR(24),
+    BUDGET_PD   NVARCHAR(10),
+    PBUDGET_PD  NVARCHAR(10),
+    FIPEX       NVARCHAR(24),
+    PRODPER     NVARCHAR(6),
+    QSSKZ       NVARCHAR(2),
+    PROPMANO    NVARCHAR(13),
+    CONSTRAINT PK_sap_bsas PRIMARY KEY CLUSTERED (MANDT, BUKRS, HKONT, GJAHR, BELNR, BUZEI)
+);
+PRINT 'Table bronze.sap_bsas created successfully.';
+GO
+
+IF OBJECT_ID('bronze.sap_bsis', 'U') IS NOT NULL DROP TABLE bronze.sap_bsis;
+GO
+
+CREATE TABLE bronze.sap_bsis (
+    MANDT       NVARCHAR(3) NOT NULL,
+    BUKRS       NVARCHAR(4) NOT NULL,
+    HKONT       NVARCHAR(10) NOT NULL,
+    AUGDT       NVARCHAR(8),
+    AUGBL       NVARCHAR(10),
+    ZUONR       NVARCHAR(18),
+    GJAHR       NVARCHAR(4) NOT NULL,
+    BELNR       NVARCHAR(10) NOT NULL,
+    BUZEI       NVARCHAR(3) NOT NULL,
+    BUDAT       NVARCHAR(8),
+    BLDAT       NVARCHAR(8),
+    WAERS       NVARCHAR(5),
+    XBLNR       NVARCHAR(16),
+    BLART       NVARCHAR(2),
+    MONAT       NVARCHAR(2),
+    BSCHL       NVARCHAR(2),
+    SHKZG       NVARCHAR(1),
+    GSBER       NVARCHAR(4),
+    MWSKZ       NVARCHAR(2),
+    FKONT       NVARCHAR(3),
+    DMBTR       DECIMAL(13,2),
+    WRBTR       DECIMAL(13,2),
+    MWSTS       DECIMAL(13,2),
+    WMWST       DECIMAL(13,2),
+    SGTXT       NVARCHAR(50),
+    PROJN       NVARCHAR(16),
+    AUFNR       NVARCHAR(12),
+    WERKS       NVARCHAR(4),
+    KOSTL       NVARCHAR(10),
+    ZFBDT       NVARCHAR(8),
+    XOPVW       NVARCHAR(1),
+    VALUT       NVARCHAR(8),
+    BSTAT       NVARCHAR(1),
+    BDIFF       DECIMAL(13,2),
+    BDIF2       DECIMAL(13,2),
+    VBUND       NVARCHAR(6),
+    PSWSL       NVARCHAR(5),
+    WVERW       NVARCHAR(1),
+    DMBE2       DECIMAL(13,2),
+    DMBE3       DECIMAL(13,2),
+    MWST2       DECIMAL(13,2),
+    MWST3       DECIMAL(13,2),
+    BDIF3       DECIMAL(13,2),
+    RDIF3       DECIMAL(13,2),
+    XRAGL       NVARCHAR(1),
+    PROJK       NVARCHAR(8),
+    PRCTR       NVARCHAR(10),
+    XSTOV       NVARCHAR(1),
+    XARCH       NVARCHAR(1),
+    PSWBT       DECIMAL(13,2),
+    XNEGP       NVARCHAR(1),
+    RFZEI       NVARCHAR(3),
+    CCBTC       NVARCHAR(10),
+    XREF3       NVARCHAR(20),
+    BUPLA       NVARCHAR(4),
+    PPDIFF      DECIMAL(13,2),
+    PPDIF2      DECIMAL(13,2),
+    PPDIF3      DECIMAL(13,2),
+    BEWAR       NVARCHAR(3),
+    IMKEY       NVARCHAR(8),
+    DABRZ       NVARCHAR(8),
+    INTRENO     NVARCHAR(13),
+    GRANT_NBR   NVARCHAR(20),
+    FKBER       NVARCHAR(16),
+    FIPOS       NVARCHAR(14),
+    FISTL       NVARCHAR(16),
+    GEBER       NVARCHAR(10),
+    PPRCT       NVARCHAR(10),
+    BUZID       NVARCHAR(1),
+    AUGGJ       NVARCHAR(4),
+    UZAWE       NVARCHAR(2),
+    SEGMENT     NVARCHAR(10),
+    PSEGMENT    NVARCHAR(10),
+    PGEBER      NVARCHAR(10),
+    PGRANT_NBR  NVARCHAR(20),
+    MEASURE     NVARCHAR(24),
+    BUDGET_PD   NVARCHAR(10),
+    PBUDGET_PD  NVARCHAR(10),
+    FIPEX       NVARCHAR(24),
+    PRODPER     NVARCHAR(6),
+    QSSKZ       NVARCHAR(2),
+    PROPMANO    NVARCHAR(13),
+    CONSTRAINT PK_sap_bsis PRIMARY KEY CLUSTERED (MANDT, BUKRS, HKONT, GJAHR, BELNR, BUZEI)
+);
+PRINT 'Table bronze.sap_bsis created successfully.';
+GO
+
+-- Run ONCE against P01 before the first load. Both numbers must be equal.
+-- One month is enough to catch a wrong key and it keeps the cost on production low.
+--
+--   SELECT COUNT(*) AS filas,
+--          COUNT(DISTINCT CAST(MANDT AS VARCHAR(3)) + '|' + CAST(BUKRS AS VARCHAR(4)) + '|'
+--              + CAST(HKONT AS VARCHAR(10)) + '|' + CAST(GJAHR AS VARCHAR(4)) + '|'
+--              + CAST(BELNR AS VARCHAR(10)) + '|' + CAST(BUZEI AS VARCHAR(3))) AS llaves
+--   FROM   P01.p01.BSAS WITH (NOLOCK)
+--   WHERE  MANDT = '400' AND BUDAT BETWEEN '20260701' AND '20260731'
+--   AND    (HKONT LIKE '0000111%' OR HKONT LIKE '0000113%');
