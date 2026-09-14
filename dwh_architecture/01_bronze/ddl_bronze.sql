@@ -1300,8 +1300,9 @@ GO
 -- 2026-09-11: both have the SAME 82 columns, same types, same order - so the two
 -- CREATE TABLEs below are deliberately identical. They are still two tables
 -- because they LOAD differently (see sp_load_bronze.sql): a cleared item is
--- permanent, an open item DISAPPEARS from BSIS the day it gets cleared, so BSIS
--- has to be reloaded whole while BSAS can be merged on a window.
+-- permanent, an open item DISAPPEARS from BSIS the day it gets cleared. BSAS is
+-- merged on a window; BSIS in two steps, reloading whole only the accounts that
+-- can clear (see section 12 of sp_load_bronze.sql).
 --
 -- SCOPE - ONLY HKONT 111xxx AND 113xxx
 -- ------------------------------------
