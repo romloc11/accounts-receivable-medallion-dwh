@@ -492,3 +492,136 @@ CREATE TABLE silver.sap_bkpf (
 GO
 PRINT 'Table silver.sap_bkpf created successfully.';
 GO
+
+-- ==========================================================
+-- 12. G/L LINE ITEMS, CASH ACCOUNTS - CLEARED (silver.sap_bsas)
+-- 13. G/L LINE ITEMS, CASH ACCOUNTS - OPEN    (silver.sap_bsis)
+-- Added 2026-09-14. sap_bsad/sap_bsid carry the CUSTOMER side of a payment; these
+-- carry the BANK side: which account the money actually landed in.
+--
+-- WHY THEY EXIST: the report the company uses to state monthly cash collections is
+-- built on these lines, not on customer lines - reproduced from bronze to the cent for
+-- July 2026. They also explain why gold.fact_pagos runs above that report every month:
+-- online payments settle the customer debt but sit in the payment-gateway transit
+-- accounts, which the report never reads.
+--
+-- SCOPE: inherited from bronze (cash accounts, HKONT 111xxx/113xxx). The MANDT = '400'
+-- filter lives here, as everywhere in silver.
+--
+-- CURATED, NOT COPIED: 23 of the 82 bronze columns. Measured over 2026 (305,181 BSAS
+-- and 489,691 BSIS rows):
+--   - 58 columns carry nothing: empty, all zeros, or one value everywhere (cost
+--     objects, tax, funds management, segment, baseline date...).
+--   - BSCHL is left out ON PURPOSE. On G/L lines it only takes 40/50, and 40 = S and
+--     50 = H on every row of both tables: a copy of debe_haber. Not so in sap_bsad,
+--     where the posting key means much more and is kept.
+--   - DMBE2/DMBE3/PSWBT are the same amount in other currencies/ledgers; PSWSL is a
+--     constant.
+--
+-- SAME COLUMNS IN BOTH TABLES, deliberately, as with sap_bsid/sap_bsad: gold can UNION
+-- them into "every cash line, open or cleared" with no special cases. The clearing
+-- columns are simply always NULL in sap_bsis.
+--
+-- cuenta_mayor KEEPS its leading zeros, unlike cliente_id. It is the same kind of value
+-- as sap_knb1.cuenta_mayor, which keeps them, and one column name should mean one format
+-- across the layer. Stripping for display belongs in gold.
+--
+-- AMOUNTS ARE NEVER SIGNED, the same trap as bsad/bsid: apply debe_haber. On a cash
+-- account S (debit) is money coming IN.
+--
+-- indicador_partidas_abiertas (XOPVW) decides how sap_bsis is loaded - see section 6d
+-- of sp_load_silver.sql. It is an attribute of the ACCOUNT, verified: no account has
+-- mixed values. Only the NC/ND/CH clearing sub-accounts of the banks carry it, and only
+-- their lines ever get cleared: no other cash account appears in BSAS at all.
+--
+-- indicador_compensacion_revertida (XRAGL): the line had its clearing reset at some
+-- point. 57,003 BSAS lines carry it. Re-clearing is routine here, which is why the
+-- clearing fields cannot be part of the key (see THE KEY in ddl_bronze.sql).
+-- ==========================================================
+IF OBJECT_ID('silver.sap_bsas', 'U') IS NOT NULL
+    DROP TABLE silver.sap_bsas;
+GO
+
+CREATE TABLE silver.sap_bsas (
+    mandante                          VARCHAR(3)  NOT NULL,
+    sociedad                          VARCHAR(4)  NOT NULL,
+    cuenta_mayor                      VARCHAR(10) NOT NULL, -- HKONT: leading zeros KEPT, same as sap_knb1.cuenta_mayor
+    ejercicio                         INT         NOT NULL, -- GJAHR
+    documento_id                      VARCHAR(10) NOT NULL, -- BELNR
+    posicion                          INT         NOT NULL, -- BUZEI
+    mes                               VARCHAR(2),           -- MONAT
+    clase_documento                   VARCHAR(2),           -- BLART
+    fecha_contabilizacion             DATE,                 -- BUDAT: the date the company cash report buckets by
+    fecha_documento                   DATE,                 -- BLDAT
+    fecha_valor                       DATE,                 -- VALUT: value date - when the bank actually moves the money
+    debe_haber                        CHAR(1),              -- SHKZG: on a cash account S (debit) = money IN
+    monto_moneda_local                DECIMAL(15,2),        -- DMBTR: NEVER signed, same trap as bsad - apply debe_haber
+    monto_moneda_doc                  DECIMAL(15,2),        -- WRBTR: differs from DMBTR only on USD/EUR lines
+    moneda                            VARCHAR(5),           -- WAERS
+    asignacion                        VARCHAR(18),          -- ZUONR: editable afterwards in FB02
+    referencia                        VARCHAR(16),          -- XBLNR
+    sgtxt                             VARCHAR(50),          -- SGTXT: same name as in sap_bsad; editable in FB02
+    fecha_compensacion                DATE,                 -- AUGDT: always NULL in sap_bsis
+    documento_compensacion            VARCHAR(10),          -- AUGBL: always NULL in sap_bsis
+    ejercicio_compensacion            INT,                  -- AUGGJ: BSIS stores '0000' -> NULL here
+    indicador_partidas_abiertas       VARCHAR(1),           -- XOPVW: 'X' = account whose lines get cleared
+    indicador_compensacion_revertida  VARCHAR(1),           -- XRAGL: 'X' = this line had its clearing reset once
+
+    fecha_carga                       DATETIME DEFAULT GETDATE(),
+    CONSTRAINT PK_silver_sap_bsas PRIMARY KEY (mandante, sociedad, cuenta_mayor, ejercicio, documento_id, posicion)
+);
+GO
+
+-- gold joins these to sap_bsad/sap_bkpf by document; the PK leads with the account and
+-- cannot serve that. A missing index of exactly this kind on sap_bsad is what once made
+-- the gold procs crawl.
+CREATE NONCLUSTERED INDEX IX_silver_sap_bsas_documento ON silver.sap_bsas (documento_id, ejercicio);
+CREATE NONCLUSTERED INDEX IX_silver_sap_bsas_fecha ON silver.sap_bsas (fecha_contabilizacion)
+    INCLUDE (cuenta_mayor, clase_documento, debe_haber, monto_moneda_local);
+GO
+PRINT 'Table silver.sap_bsas created successfully.';
+GO
+
+IF OBJECT_ID('silver.sap_bsis', 'U') IS NOT NULL
+    DROP TABLE silver.sap_bsis;
+GO
+
+CREATE TABLE silver.sap_bsis (
+    mandante                          VARCHAR(3)  NOT NULL,
+    sociedad                          VARCHAR(4)  NOT NULL,
+    cuenta_mayor                      VARCHAR(10) NOT NULL, -- HKONT: leading zeros KEPT, same as sap_knb1.cuenta_mayor
+    ejercicio                         INT         NOT NULL, -- GJAHR
+    documento_id                      VARCHAR(10) NOT NULL, -- BELNR
+    posicion                          INT         NOT NULL, -- BUZEI
+    mes                               VARCHAR(2),           -- MONAT
+    clase_documento                   VARCHAR(2),           -- BLART
+    fecha_contabilizacion             DATE,                 -- BUDAT: the date the company cash report buckets by
+    fecha_documento                   DATE,                 -- BLDAT
+    fecha_valor                       DATE,                 -- VALUT: value date - when the bank actually moves the money
+    debe_haber                        CHAR(1),              -- SHKZG: on a cash account S (debit) = money IN
+    monto_moneda_local                DECIMAL(15,2),        -- DMBTR: NEVER signed, same trap as bsad - apply debe_haber
+    monto_moneda_doc                  DECIMAL(15,2),        -- WRBTR: differs from DMBTR only on USD/EUR lines
+    moneda                            VARCHAR(5),           -- WAERS
+    asignacion                        VARCHAR(18),          -- ZUONR: editable afterwards in FB02
+    referencia                        VARCHAR(16),          -- XBLNR
+    sgtxt                             VARCHAR(50),          -- SGTXT: same name as in sap_bsad; editable in FB02
+    fecha_compensacion                DATE,                 -- AUGDT: always NULL in sap_bsis
+    documento_compensacion            VARCHAR(10),          -- AUGBL: always NULL in sap_bsis
+    ejercicio_compensacion            INT,                  -- AUGGJ: BSIS stores '0000' -> NULL here
+    indicador_partidas_abiertas       VARCHAR(1),           -- XOPVW: 'X' = account whose lines get cleared
+    indicador_compensacion_revertida  VARCHAR(1),           -- XRAGL: 'X' = this line had its clearing reset once
+
+    fecha_carga                       DATETIME DEFAULT GETDATE(),
+    CONSTRAINT PK_silver_sap_bsis PRIMARY KEY (mandante, sociedad, cuenta_mayor, ejercicio, documento_id, posicion)
+);
+GO
+
+-- gold joins these to sap_bsad/sap_bkpf by document; the PK leads with the account and
+-- cannot serve that. A missing index of exactly this kind on sap_bsad is what once made
+-- the gold procs crawl.
+CREATE NONCLUSTERED INDEX IX_silver_sap_bsis_documento ON silver.sap_bsis (documento_id, ejercicio);
+CREATE NONCLUSTERED INDEX IX_silver_sap_bsis_fecha ON silver.sap_bsis (fecha_contabilizacion)
+    INCLUDE (cuenta_mayor, clase_documento, debe_haber, monto_moneda_local);
+GO
+PRINT 'Table silver.sap_bsis created successfully.';
+GO

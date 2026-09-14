@@ -576,6 +576,281 @@ BEGIN
     END CATCH;
 
     -- ==========================================
+    -- 6c. CLEANING: BSAS (G/L cleared line items - cash accounts)
+    -- Added 2026-09-14. Incremental MERGE, same shape as BSAD above, and it reuses
+    -- @mes_anterior_inicio_str declared there.
+    --
+    -- WINDOWED BY AUGDT, NOT BUDAT: a line enters BSAS the day it is cleared and keeps
+    -- its original posting date, which can be months old. A BUDAT window would never
+    -- see it. Same reasoning as bronze.load_bronze, where exactly that bug was caught
+    -- before it shipped (97 lines / $424,511.58 of July 2026 would have been lost).
+    --
+    -- The six key columns are CAST to their silver type in the source. bronze is
+    -- NVARCHAR and silver VARCHAR; left implicit, the ON clause converts the TARGET key
+    -- column instead - the same class of problem that once cost 145 s in this project.
+    --
+    -- The window reads bronze with a scan (AUGDT is not indexed there); ~1.9M rows
+    -- locally, a few seconds. Index bronze.sap_bsas(AUGDT) if that ever grows.
+    -- ==========================================
+    BEGIN TRY
+        SET @start_time = GETDATE();
+        PRINT '>> Loading and cleaning silver.sap_bsas (Incremental Merge)...';
+
+        MERGE silver.sap_bsas AS tgt
+        USING (
+            SELECT
+                CAST(LTRIM(RTRIM(MANDT)) AS VARCHAR(3))                          AS mandante,
+                CAST(LTRIM(RTRIM(BUKRS)) AS VARCHAR(4))                          AS sociedad,
+                CAST(LTRIM(RTRIM(HKONT)) AS VARCHAR(10))                         AS cuenta_mayor,
+                CAST(GJAHR AS INT)                                               AS ejercicio,
+                CAST(LTRIM(RTRIM(BELNR)) AS VARCHAR(10))                         AS documento_id,
+                CAST(BUZEI AS INT)                                               AS posicion,
+                NULLIF(LTRIM(RTRIM(MONAT)), '')                                  AS mes,
+                NULLIF(LTRIM(RTRIM(BLART)), '')                                  AS clase_documento,
+                TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(BUDAT)), '00000000'), 112)  AS fecha_contabilizacion,
+                TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(BLDAT)), '00000000'), 112)  AS fecha_documento,
+                TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(VALUT)), '00000000'), 112)  AS fecha_valor,
+                NULLIF(LTRIM(RTRIM(SHKZG)), '')                                  AS debe_haber,
+                ISNULL(DMBTR, 0)                                                 AS monto_moneda_local,
+                ISNULL(WRBTR, 0)                                                 AS monto_moneda_doc,
+                NULLIF(LTRIM(RTRIM(WAERS)), '')                                  AS moneda,
+                NULLIF(LTRIM(RTRIM(ZUONR)), '')                                  AS asignacion,
+                NULLIF(LTRIM(RTRIM(XBLNR)), '')                                  AS referencia,
+                NULLIF(LTRIM(RTRIM(SGTXT)), '')                                  AS sgtxt,
+                TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(AUGDT)), '00000000'), 112)  AS fecha_compensacion,
+                NULLIF(LTRIM(RTRIM(AUGBL)), '')                                  AS documento_compensacion,
+                TRY_CAST(NULLIF(NULLIF(LTRIM(RTRIM(AUGGJ)), ''), '0000') AS INT) AS ejercicio_compensacion,
+                NULLIF(LTRIM(RTRIM(XOPVW)), '')                                  AS indicador_partidas_abiertas,
+                NULLIF(LTRIM(RTRIM(XRAGL)), '')                                  AS indicador_compensacion_revertida
+            FROM bronze.sap_bsas WITH (NOLOCK)
+            WHERE MANDT = '400'
+              AND AUGDT >= @mes_anterior_inicio_str
+        ) AS src
+        ON  tgt.mandante = src.mandante
+        AND tgt.sociedad = src.sociedad
+        AND tgt.cuenta_mayor = src.cuenta_mayor
+        AND tgt.ejercicio = src.ejercicio
+        AND tgt.documento_id = src.documento_id
+        AND tgt.posicion = src.posicion
+
+        WHEN MATCHED THEN UPDATE SET
+            tgt.fecha_compensacion = src.fecha_compensacion,
+            tgt.documento_compensacion = src.documento_compensacion,
+            tgt.ejercicio_compensacion = src.ejercicio_compensacion,
+            tgt.asignacion = src.asignacion,
+            tgt.sgtxt = src.sgtxt,
+            tgt.indicador_compensacion_revertida = src.indicador_compensacion_revertida,
+            tgt.fecha_carga = GETDATE()
+
+        WHEN NOT MATCHED THEN
+        INSERT (
+            mandante, sociedad, cuenta_mayor, ejercicio, documento_id, posicion, mes,
+            clase_documento, fecha_contabilizacion, fecha_documento, fecha_valor,
+            debe_haber, monto_moneda_local, monto_moneda_doc, moneda, asignacion,
+            referencia, sgtxt, fecha_compensacion, documento_compensacion,
+            ejercicio_compensacion, indicador_partidas_abiertas,
+            indicador_compensacion_revertida
+        )
+        VALUES (
+            src.mandante, src.sociedad, src.cuenta_mayor, src.ejercicio, src.documento_id,
+            src.posicion, src.mes, src.clase_documento, src.fecha_contabilizacion,
+            src.fecha_documento, src.fecha_valor, src.debe_haber, src.monto_moneda_local,
+            src.monto_moneda_doc, src.moneda, src.asignacion, src.referencia, src.sgtxt,
+            src.fecha_compensacion, src.documento_compensacion, src.ejercicio_compensacion,
+            src.indicador_partidas_abiertas, src.indicador_compensacion_revertida
+        );
+        SET @rows_count = @@ROWCOUNT;
+
+        SET @end_time = GETDATE();
+        PRINT 'Rows: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
+    END TRY
+    BEGIN CATCH
+        PRINT 'ERROR in silver.sap_bsas: ' + ERROR_MESSAGE();
+        THROW;
+    END CATCH;
+
+    -- ==========================================
+    -- 6d. CLEANING: BSIS (G/L open line items - cash accounts)
+    -- Added 2026-09-14. TWO steps, because the table holds two kinds of line that behave
+    -- differently - and splitting them is what keeps this both correct and cheap.
+    --
+    --   a) Accounts WITHOUT open-item management (indicador_partidas_abiertas NULL):
+    --      cash on hand, the payment-gateway transit accounts, the base bank accounts.
+    --      Their lines can NEVER be cleared, so they never leave BSIS - this part only
+    --      grows. Measured: 99.76% of the table (2,923,834 of 2,930,779 rows). An
+    --      incremental MERGE on BUDAT is correct by construction here.
+    --      LIMITATION: a line posted into a period older than the previous month (only
+    --      possible while that period is still open) waits for the next backfill.
+    --
+    --   b) Accounts WITH it ('X'): the NC/ND/CH clearing sub-accounts. A line there
+    --      DISAPPEARS the day it gets cleared, at any age, so no window can follow it.
+    --      Reloaded whole - but that is ~7,000 rows (0.24%), not 2.9M.
+    --
+    -- Step b runs in a transaction. Between its DELETE and its INSERT those accounts
+    -- have no open items at all, and a failure there would leave a table that looks
+    -- complete while being short.
+    -- ==========================================
+    BEGIN TRY
+        SET @start_time = GETDATE();
+        PRINT '>> Loading and cleaning silver.sap_bsis (a: accounts that never clear - Incremental Merge)...';
+
+        MERGE silver.sap_bsis AS tgt
+        USING (
+            SELECT
+                CAST(LTRIM(RTRIM(MANDT)) AS VARCHAR(3))                          AS mandante,
+                CAST(LTRIM(RTRIM(BUKRS)) AS VARCHAR(4))                          AS sociedad,
+                CAST(LTRIM(RTRIM(HKONT)) AS VARCHAR(10))                         AS cuenta_mayor,
+                CAST(GJAHR AS INT)                                               AS ejercicio,
+                CAST(LTRIM(RTRIM(BELNR)) AS VARCHAR(10))                         AS documento_id,
+                CAST(BUZEI AS INT)                                               AS posicion,
+                NULLIF(LTRIM(RTRIM(MONAT)), '')                                  AS mes,
+                NULLIF(LTRIM(RTRIM(BLART)), '')                                  AS clase_documento,
+                TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(BUDAT)), '00000000'), 112)  AS fecha_contabilizacion,
+                TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(BLDAT)), '00000000'), 112)  AS fecha_documento,
+                TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(VALUT)), '00000000'), 112)  AS fecha_valor,
+                NULLIF(LTRIM(RTRIM(SHKZG)), '')                                  AS debe_haber,
+                ISNULL(DMBTR, 0)                                                 AS monto_moneda_local,
+                ISNULL(WRBTR, 0)                                                 AS monto_moneda_doc,
+                NULLIF(LTRIM(RTRIM(WAERS)), '')                                  AS moneda,
+                NULLIF(LTRIM(RTRIM(ZUONR)), '')                                  AS asignacion,
+                NULLIF(LTRIM(RTRIM(XBLNR)), '')                                  AS referencia,
+                NULLIF(LTRIM(RTRIM(SGTXT)), '')                                  AS sgtxt,
+                TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(AUGDT)), '00000000'), 112)  AS fecha_compensacion,
+                NULLIF(LTRIM(RTRIM(AUGBL)), '')                                  AS documento_compensacion,
+                TRY_CAST(NULLIF(NULLIF(LTRIM(RTRIM(AUGGJ)), ''), '0000') AS INT) AS ejercicio_compensacion,
+                NULLIF(LTRIM(RTRIM(XOPVW)), '')                                  AS indicador_partidas_abiertas,
+                NULLIF(LTRIM(RTRIM(XRAGL)), '')                                  AS indicador_compensacion_revertida
+            FROM bronze.sap_bsis WITH (NOLOCK)
+            WHERE MANDT = '400'
+              AND BUDAT >= @mes_anterior_inicio_str
+              AND ISNULL(XOPVW, '') <> 'X'
+        ) AS src
+        ON  tgt.mandante = src.mandante
+        AND tgt.sociedad = src.sociedad
+        AND tgt.cuenta_mayor = src.cuenta_mayor
+        AND tgt.ejercicio = src.ejercicio
+        AND tgt.documento_id = src.documento_id
+        AND tgt.posicion = src.posicion
+
+        WHEN MATCHED THEN UPDATE SET
+            tgt.asignacion = src.asignacion,
+            tgt.referencia = src.referencia,
+            tgt.sgtxt = src.sgtxt,
+            tgt.fecha_carga = GETDATE()
+
+        WHEN NOT MATCHED THEN
+        INSERT (
+            mandante, sociedad, cuenta_mayor, ejercicio, documento_id, posicion, mes,
+            clase_documento, fecha_contabilizacion, fecha_documento, fecha_valor,
+            debe_haber, monto_moneda_local, monto_moneda_doc, moneda, asignacion,
+            referencia, sgtxt, fecha_compensacion, documento_compensacion,
+            ejercicio_compensacion, indicador_partidas_abiertas,
+            indicador_compensacion_revertida
+        )
+        VALUES (
+            src.mandante, src.sociedad, src.cuenta_mayor, src.ejercicio, src.documento_id,
+            src.posicion, src.mes, src.clase_documento, src.fecha_contabilizacion,
+            src.fecha_documento, src.fecha_valor, src.debe_haber, src.monto_moneda_local,
+            src.monto_moneda_doc, src.moneda, src.asignacion, src.referencia, src.sgtxt,
+            src.fecha_compensacion, src.documento_compensacion, src.ejercicio_compensacion,
+            src.indicador_partidas_abiertas, src.indicador_compensacion_revertida
+        );
+        SET @rows_count = @@ROWCOUNT;
+
+        SET @end_time = GETDATE();
+        PRINT 'Rows: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
+
+        SET @start_time = GETDATE();
+        PRINT '>> Loading and cleaning silver.sap_bsis (b: accounts that clear - Full Reload)...';
+
+        BEGIN TRANSACTION;
+
+        DELETE FROM silver.sap_bsis WHERE indicador_partidas_abiertas = 'X';
+
+        INSERT INTO silver.sap_bsis (
+            mandante, sociedad, cuenta_mayor, ejercicio, documento_id, posicion, mes,
+            clase_documento, fecha_contabilizacion, fecha_documento, fecha_valor,
+            debe_haber, monto_moneda_local, monto_moneda_doc, moneda, asignacion,
+            referencia, sgtxt, fecha_compensacion, documento_compensacion,
+            ejercicio_compensacion, indicador_partidas_abiertas,
+            indicador_compensacion_revertida
+        )
+        SELECT
+            CAST(LTRIM(RTRIM(MANDT)) AS VARCHAR(3))                          AS mandante,
+            CAST(LTRIM(RTRIM(BUKRS)) AS VARCHAR(4))                          AS sociedad,
+            CAST(LTRIM(RTRIM(HKONT)) AS VARCHAR(10))                         AS cuenta_mayor,
+            CAST(GJAHR AS INT)                                               AS ejercicio,
+            CAST(LTRIM(RTRIM(BELNR)) AS VARCHAR(10))                         AS documento_id,
+            CAST(BUZEI AS INT)                                               AS posicion,
+            NULLIF(LTRIM(RTRIM(MONAT)), '')                                  AS mes,
+            NULLIF(LTRIM(RTRIM(BLART)), '')                                  AS clase_documento,
+            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(BUDAT)), '00000000'), 112)  AS fecha_contabilizacion,
+            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(BLDAT)), '00000000'), 112)  AS fecha_documento,
+            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(VALUT)), '00000000'), 112)  AS fecha_valor,
+            NULLIF(LTRIM(RTRIM(SHKZG)), '')                                  AS debe_haber,
+            ISNULL(DMBTR, 0)                                                 AS monto_moneda_local,
+            ISNULL(WRBTR, 0)                                                 AS monto_moneda_doc,
+            NULLIF(LTRIM(RTRIM(WAERS)), '')                                  AS moneda,
+            NULLIF(LTRIM(RTRIM(ZUONR)), '')                                  AS asignacion,
+            NULLIF(LTRIM(RTRIM(XBLNR)), '')                                  AS referencia,
+            NULLIF(LTRIM(RTRIM(SGTXT)), '')                                  AS sgtxt,
+            TRY_CONVERT(DATE, NULLIF(LTRIM(RTRIM(AUGDT)), '00000000'), 112)  AS fecha_compensacion,
+            NULLIF(LTRIM(RTRIM(AUGBL)), '')                                  AS documento_compensacion,
+            TRY_CAST(NULLIF(NULLIF(LTRIM(RTRIM(AUGGJ)), ''), '0000') AS INT) AS ejercicio_compensacion,
+            NULLIF(LTRIM(RTRIM(XOPVW)), '')                                  AS indicador_partidas_abiertas,
+            NULLIF(LTRIM(RTRIM(XRAGL)), '')                                  AS indicador_compensacion_revertida
+        FROM bronze.sap_bsis WITH (NOLOCK)
+        WHERE MANDT = '400'
+          AND XOPVW = 'X';
+        SET @rows_count = @@ROWCOUNT;
+
+        COMMIT TRANSACTION;
+
+        SET @end_time = GETDATE();
+        PRINT 'Rows: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+        PRINT 'ERROR in silver.sap_bsis: ' + ERROR_MESSAGE();
+        THROW;
+    END CATCH;
+
+    -- ==========================================
+    -- 6e. BSAS vs BSIS: an open line is not a cleared line
+    -- Added 2026-09-14. When a clearing is reset (FBRA) the line goes back from BSAS to
+    -- BSIS. The MERGE in 6c cannot notice a line LEAVING BSAS, so silver would keep the
+    -- stale cleared copy next to the open one. Step 6d-b reloads BSIS in full for every
+    -- account that can clear, so BSIS is the current truth there: a line present in both
+    -- is OPEN, and its BSAS copy goes. Same rule as bsid over bsad.
+    -- Measured in bronze right after its backfill: 0 lines in both. This keeps it at 0 by
+    -- construction instead of by luck.
+    -- ==========================================
+    BEGIN TRY
+        SET @start_time = GETDATE();
+        PRINT '>> Removing from silver.sap_bsas the lines that are open again...';
+
+        DELETE a
+        FROM silver.sap_bsas a
+        WHERE EXISTS (
+            SELECT 1 FROM silver.sap_bsis i
+            WHERE i.mandante = a.mandante
+              AND i.sociedad = a.sociedad
+              AND i.cuenta_mayor = a.cuenta_mayor
+              AND i.ejercicio = a.ejercicio
+              AND i.documento_id = a.documento_id
+              AND i.posicion = a.posicion
+        );
+        SET @rows_count = @@ROWCOUNT;
+
+        SET @end_time = GETDATE();
+        PRINT 'Rows: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
+    END TRY
+    BEGIN CATCH
+        PRINT 'ERROR removing stale lines from silver.sap_bsas: ' + ERROR_MESSAGE();
+        THROW;
+    END CATCH;
+
+    -- ==========================================
     -- 7. CLEANING: KNB1 (Customer Company Code Data)
     -- ==========================================
     BEGIN TRY
