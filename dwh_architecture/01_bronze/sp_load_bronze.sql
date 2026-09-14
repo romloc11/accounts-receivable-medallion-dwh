@@ -48,7 +48,8 @@ the Bronze staging area of ANALISIS_DATOS, in one sequential run:
   this keeps only the recent window in sync going forward.
 - sap_bsas: Incremental MERGE by primary key (MANDT, BUKRS, HKONT, GJAHR, BELNR, BUZEI),
   filtered to cash accounts (HKONT 111xxx/113xxx) and to the current + previous month via
-  BUDAT. The BANK side of a payment, which BSAD cannot show: BSAD's HKONT is the customer
+  AUGDT - the clearing date, because a line enters BSAS when it is cleared and keeps an
+  old BUDAT (see the section note). The BANK side of a payment, which BSAD cannot show: BSAD's HKONT is the customer
   reconciliation account, never the bank. This is what the company's own monthly cash
   report is built on. History loaded once via sp_backfill_bsas.sql.
 - sap_bsis: Full reload in year chunks, same cash-account scope. NOT a merge: an open
@@ -448,9 +449,21 @@ BEGIN
            and 113xxx (banks). See the long note in ddl_bronze.sql for why the
            111xxx half is not optional.
 
-           WINDOW: BUDAT, current + previous month, same as BSAD and BKPF. A line
-           that gets cleared later has its AUGDT rewritten but keeps its BUDAT, so
-           following the posting date is what catches the update.
+           WINDOW: AUGDT (clearing date), current + previous month - same as BSAD,
+           and NOT BUDAT like BKPF. A line ENTERS BSAS the day it is cleared, and it
+           keeps its original BUDAT, which can be months old: a bank line posted in
+           March and cleared in September arrives with BUDAT = March. A BUDAT window
+           has already moved past it and never loads it - every line that takes more
+           than a month to clear would be lost after the backfill, with no error.
+           The first version of this section had exactly that bug. Measured before
+           it shipped: of the lines cleared in July 2026, 97 ($424,511.58) had a
+           BUDAT before June - small in one month, but lost for good every month.
+
+           The MERGE matches on 6 columns, not on the 9 of P01's own key (BSAS~0:
+           MANDT, BUKRS, HKONT, AUGDT, AUGBL, ZUONR, GJAHR, BELNR, BUZEI). With the
+           9, a line that is un-cleared and re-cleared carries a new AUGDT/AUGBL,
+           matches nothing, and gets inserted as a SECOND row next to the stale one.
+           See THE KEY in ddl_bronze.sql.
         ========================================================== */
         SET @current_table = 'bronze.sap_bsas'
         SET @start_time = GETDATE()
@@ -468,7 +481,7 @@ BEGIN
                 FISTL, GEBER, PPRCT, BUZID, AUGGJ, UZAWE, SEGMENT, PSEGMENT, PGEBER,
                 PGRANT_NBR, MEASURE, BUDGET_PD, PBUDGET_PD, FIPEX, PRODPER, QSSKZ, PROPMANO
             FROM P01.p01.BSAS WITH (NOLOCK)
-            WHERE BUDAT >= @mes_anterior_inicio
+            WHERE AUGDT >= @mes_anterior_inicio
               AND (HKONT LIKE '0000111%' OR HKONT LIKE '0000113%')
         ) AS src
         ON  tgt.MANDT = src.MANDT
@@ -479,12 +492,14 @@ BEGIN
         AND tgt.BUZEI = src.BUZEI
 
         -- Only what can change after the line is first posted: the clearing link
-        -- (a line can be cleared, un-cleared and re-cleared) and the reversal and
-        -- archive flags. The amount and the account never move.
+        -- (a line can be cleared, un-cleared and re-cleared), the assignment and
+        -- text (both editable afterwards in FB02) and the reversal and archive
+        -- flags. The amount and the account never move.
         WHEN MATCHED THEN UPDATE SET
             tgt.AUGDT = src.AUGDT,
             tgt.AUGBL = src.AUGBL,
             tgt.AUGGJ = src.AUGGJ,
+            tgt.ZUONR = src.ZUONR,
             tgt.XSTOV = src.XSTOV,
             tgt.XARCH = src.XARCH,
             tgt.SGTXT = src.SGTXT

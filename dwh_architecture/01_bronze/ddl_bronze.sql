@@ -1322,9 +1322,23 @@ GO
 --
 -- THE KEY
 -- -------
--- MANDT + BUKRS + HKONT + GJAHR + BELNR + BUZEI is SAP's own key for these
--- tables. VERIFY IT ONCE before the backfill (query at the end of this section):
--- the MERGE in bronze.load_bronze depends on it being unique.
+-- The PK here is MANDT + BUKRS + HKONT + GJAHR + BELNR + BUZEI - and that is NOT
+-- SAP's key. P01 declares BSAS~0 with NINE columns: MANDT, BUKRS, HKONT, AUGDT,
+-- AUGBL, ZUONR, GJAHR, BELNR, BUZEI (read from P01.sys.indexes 2026-09-14). A
+-- first version of this comment claimed the 6 were SAP's own key; it was wrong.
+--
+-- Dropping AUGDT, AUGBL and ZUONR is deliberate:
+--   - they are in SAP's key for access order, not identity. A G/L line item is
+--     identified by company + year + document + line; the clearing fields and the
+--     assignment are attributes of it.
+--   - all three can CHANGE on an existing line (un-clear and re-clear; assignment
+--     edited in FB02). In the key, a changed line matches nothing in the MERGE and
+--     is inserted as a second row next to the stale one - the same failure
+--     silver.sap_bsad had with document 7404597470, re-cleared in a later month.
+--
+-- Verified on data, not assumed (2026-09-14), July 2026, HKONT 111xxx/113xxx:
+--   BSAS: 43,114 rows = 43,114 distinct 6-column keys
+--   BSIS: 62,653 rows = 62,653 distinct 6-column keys
 --
 -- THE COLUMN LIST IS LOAD-CRITICAL
 -- --------------------------------
