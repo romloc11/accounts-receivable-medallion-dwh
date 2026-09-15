@@ -52,6 +52,19 @@ One bronze table → one silver table; no cross-entity joins. Silver is where sc
 
 ---
 
+## BI layer (`bi` schema)
+
+One view per Power BI table, already shaped as a star: six dimensions (`dim_fecha`, `dim_cliente`, `dim_canal`, `dim_region`, `dim_ejecutivo`, `dim_bucket`) and five facts (`fact_cobranza`, `fact_facturas`, `fact_aplicacion`, `fact_presupuesto_segmento`, `fact_presupuesto_dia`). The Power BI model does no transformation: each query only selects columns.
+
+- **No SCD2 tables in the report.** Gold keeps two customer mini-dimensions; exposed as-is, a user sees three customer tables and does not know where "Canal" lives. Each fact carries `canal_key`, `region_key` and `ejecutivo_key` resolved from the SCD2 version stored on the row, so one Canal, one Región and one Ejecutivo filter cobranza, invoices and the budget alike — that is what makes "budget vs actual by ejecutivo" possible.
+- **Unknown members** (`SIN CANAL`, `SIN REGION`, `(SIN ASIGNAR)`) exist in every dimension, so no fact key is orphaned. Defaults use `COALESCE`, never `ISNULL`: `ISNULL` takes the length of its first argument and truncated `'(SIN REGION)'` to `'(SIN R'`.
+- **Official dates:** cobranza by `fecha_documento` (the date the budget is calibrated on; `fecha_contabilizacion` stays available), invoices by `fecha_pago_efectiva`, the budget by its day or month.
+- **History:** facts cover the last 36 months (open items always), filtered inside the views; gold keeps everything.
+- **The bridge relates to `fact_facturas` only.** Related to both facts, the model would have two filter paths from every shared dimension and Power BI refuses to open it.
+- **`dim_fecha.periodo`** names the current month `Mes actual`, so a report page can default to it without going stale; `tiene_presupuesto` lets the period selector list only budgeted months.
+
+---
+
 ## Dimensions
 
 ### `gold.dim_fecha` — no SCD, growing range

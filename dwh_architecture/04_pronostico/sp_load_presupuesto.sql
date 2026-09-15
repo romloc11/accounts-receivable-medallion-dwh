@@ -269,7 +269,7 @@ BEGIN
         FROM (
             SELECT f.monto,
                    e.ejecutivo_key, e.tipo_gestion,
-                   UPPER(ISNULL(NULLIF(LTRIM(RTRIM(d.region)),''),'(SIN REGION)')) AS region_key,
+                   COALESCE(UPPER(NULLIF(LTRIM(RTRIM(d.region)),'')),'SIN REGION')   AS region_key,
                    LTRIM(RTRIM(d.canal_distribucion))                              AS canal_key,
                    d.estatus_comercial,
                    CASE

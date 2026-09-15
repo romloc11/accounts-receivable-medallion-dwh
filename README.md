@@ -77,12 +77,14 @@ dwh_architecture/
 │   ├── ddl_dq.sql                          data-quality flag tables
 │   ├── sp_load_dq.sql                      data-quality monitor load
 │   └── validate_clasificacion_cobranza.sql  ad-hoc query re-validating vw_pago_factura_simple's month-cohort classification on demand
-└── 04_pronostico/
-    ├── ddl_presupuesto.sql        collections budget tables
-    ├── modelo_presupuesto.sql     the budget model and its out-of-sample validation
-    ├── sp_load_presupuesto.sql    monthly budget load (run once a month, not daily)
-    ├── desglose_cobranza_mes.sql  what a month's collections are made of
-    └── demostrar_desglose.sql     one query per objection to that breakdown
+├── 04_pronostico/
+│   ├── ddl_presupuesto.sql        collections budget tables
+│   ├── modelo_presupuesto.sql     the budget model and its out-of-sample validation
+│   ├── sp_load_presupuesto.sql    monthly budget load (run once a month, not daily)
+│   ├── desglose_cobranza_mes.sql  what a month's collections are made of
+│   └── demostrar_desglose.sql     one query per objection to that breakdown
+└── 05_bi/
+    └── ddl_bi.sql                 one view per Power BI table: star schema with conformed keys
 ```
 
 One-time migrations (ALTER, rename, drop) are removed once their change is folded into the `ddl_*.sql` files; they stay in git history.
