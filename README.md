@@ -37,29 +37,53 @@ This warehouse is being rolled out in phases:
 
 ```
 docs/
-└── architecture/
-    ├── architecture_dwh.svg      rendered architecture diagram (used in this README)
-    └── architecture_dwh.drawio   editable source (diagrams.net / draw.io)
+├── architecture/
+│   ├── architecture_dwh.svg          rendered architecture diagram (used in this README)
+│   ├── architecture_dwh.drawio       editable source (diagrams.net / draw.io)
+│   ├── physical_data_model.drawio    physical data model
+│   └── fase0_preguntas.md            business questions the model has to answer
+└── archive/
+    └── fact_aplicacion_v2_retirado.md  record of a retired design and the evidence behind it
 dwh_architecture/
 ├── init_database.sql        schema creation (bronze/silver/gold/control/dq)
+├── inventario_objetos.sql   catalog query to compare the server against the repo
 ├── 01_bronze/
-│   ├── ddl_bronze.sql        raw tables, 1:1 mirror of SAP source fields
-│   ├── sp_load_bronze.sql    daily load (truncate+insert, incremental merge for high-volume tables)
-│   └── sp_backfill_bsad.sql  one-time historical backfill
+│   ├── ddl_bronze.sql             raw tables, 1:1 mirror of SAP source fields
+│   ├── sp_load_bronze.sql         daily load (truncate+insert, incremental merge for high-volume tables)
+│   ├── sp_backfill_bsad.sql       historical backfill, year by year (empty server / recovery)
+│   ├── sp_backfill_bkpf.sql       historical backfill of document headers (DZ)
+│   ├── sp_backfill_bsas.sql       historical backfill of cleared bank lines
+│   ├── sp_recargar_bsis.sql       full reload of open bank lines (recovery, not daily)
+│   └── generar_ddl_desde_p01.sql  builds a bronze CREATE TABLE from the source catalog
 ├── 02_silver/
-│   ├── ddl_silver.sql         cleaned/standardized tables
-│   ├── sp_load_silver.sql     daily load (type casting, null handling, scope filters)
-│   └── backfill_bsad_historico.sql  one-time historical backfill
+│   ├── ddl_silver.sql                   cleaned/standardized tables
+│   ├── sp_load_silver.sql               daily load (type casting, null handling, scope filters)
+│   ├── backfill_bsad_historico.sql      historical backfill, year by year
+│   ├── backfill_bkpf_historico.sql      historical backfill of document headers
+│   └── backfill_bsas_bsis_historico.sql historical backfill of bank lines
 ├── 03_gold/
-│   ├── ddl_gold.sql                  star schema: dimensions + facts
-│   ├── sp_load_gold.sql              load procedures (SCD1/SCD2, incremental MERGE) + orchestrator
-│   ├── vw_pago_factura_simple.sql    payment-to-invoice reconciliation view
-│   └── backfill_fact_pagos_facturas_compensados.sql  one-time historical backfill
-└── 04_dq/
-    ├── ddl_dq.sql                          data-quality flag tables
-    ├── sp_load_dq.sql                      data-quality monitor load
-    └── validate_clasificacion_cobranza.sql  ad-hoc query re-validating vw_pago_factura_simple's month-cohort classification on demand
+│   ├── ddl_gold.sql                     star schema: dimensions + facts
+│   ├── dim_festivo.sql                  hand-maintained holiday calendar (run before the first gold load)
+│   ├── ddl_dim_presupuesto.sql          conformed dimensions for the collections budget
+│   ├── sp_load_gold.sql                 load procedures (SCD1/SCD2, incremental) + orchestrator
+│   ├── vw_pago_factura_simple.sql       payment-to-invoice reconciliation view (legacy report)
+│   ├── vw_cartera_abierta.sql           open invoices, line by line
+│   ├── vw_cobranza_diaria.sql           actual collections per day
+│   ├── backfill_fact_aplicacion_pagos.sql            historical backfill of the payment-application model
+│   └── backfill_fact_pagos_facturas_compensados.sql  historical backfill of the legacy settled facts
+├── 04_dq/
+│   ├── ddl_dq.sql                          data-quality flag tables
+│   ├── sp_load_dq.sql                      data-quality monitor load
+│   └── validate_clasificacion_cobranza.sql  ad-hoc query re-validating vw_pago_factura_simple's month-cohort classification on demand
+└── 04_pronostico/
+    ├── ddl_presupuesto.sql        collections budget tables
+    ├── modelo_presupuesto.sql     the budget model and its out-of-sample validation
+    ├── sp_load_presupuesto.sql    monthly budget load (run once a month, not daily)
+    ├── desglose_cobranza_mes.sql  what a month's collections are made of
+    └── demostrar_desglose.sql     one query per objection to that breakdown
 ```
+
+One-time migrations (ALTER, rename, drop) are removed once their change is folded into the `ddl_*.sql` files; they stay in git history.
 
 ## Data model
 

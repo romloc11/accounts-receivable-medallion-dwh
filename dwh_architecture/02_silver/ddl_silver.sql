@@ -237,7 +237,7 @@ CREATE TABLE silver.sap_bsid (
     -- instead of being silently discarded.
     --
     -- POSITION: bsad keeps these at ordinals 14-16; here they are last, because the live
-    -- server got them via ALTER TABLE ADD (02_silver/alter_bsid_columnas_compensacion.sql)
+    -- server got them via ALTER TABLE ADD (one-time script, retired 2026-09-14 - in git history)
     -- and this file must describe the server as it actually is. Same column SET, different
     -- ORDER - so any UNION between bsid and bsad MUST list columns explicitly. A
     -- 'SELECT * FROM bsid UNION ALL SELECT * FROM bsad' compiles and silently pairs the
@@ -286,7 +286,7 @@ CREATE TABLE silver.sap_bsad (
     clase_documento VARCHAR(2),
     codigo_impuesto VARCHAR(2), -- MWSKZ: VAT code, same as in silver.sap_bsid
     debe_haber CHAR(1), -- SHKZG
-    clave_contabilizacion VARCHAR(2), -- BSCHL: SAP posting key. Added 2026-09-03 (fact_aplicacion v2, see DESIGN.md): decides the role of an AB line (07/17 at $0 = clearing anchor, 17 with amount = credit re-applied, 15 = credit balance from pool account), separates the DZ virgin (11) from a referenced payment (15) and from the child mirror (08), and is the only signal of an FB08 reversal (paired keys 11<->02, 15<->05, 01<->12) since XSTOV is blank on every row. On an existing server this column is added with 02_silver/alter_bsad_bsid_clave_contabilizacion.sql (ALTER + year-chunked backfill from bronze), NOT by re-running this file.
+    clave_contabilizacion VARCHAR(2), -- BSCHL: SAP posting key. Added 2026-09-03 (fact_aplicacion v2, see DESIGN.md): decides the role of an AB line (07/17 at $0 = clearing anchor, 17 with amount = credit re-applied, 15 = credit balance from pool account), separates the DZ virgin (11) from a referenced payment (15) and from the child mirror (08), and is the only signal of an FB08 reversal (paired keys 11<->02, 15<->05, 01<->12) since XSTOV is blank on every row. It reached the live server through a one-time ALTER + year-chunked backfill from bronze (script retired 2026-09-14, kept in git history) - re-running this file would DROP the table.
     fecha_vencimiento DATE, -- ZFBDT: kept from bsid to be able to measure late payments (fecha_compensacion - fecha_vencimiento)
     monto_moneda_local DECIMAL(15,2),
     monto_moneda_doc DECIMAL(15,2),
@@ -308,6 +308,16 @@ CREATE TABLE silver.sap_bsad (
     fecha_carga DATETIME DEFAULT GETDATE(),
     CONSTRAINT PK_silver_sap_bsad PRIMARY KEY (mandante, sociedad, cliente_id, ejercicio, documento_id, posicion)
 );
+
+-- Added 2026-09-07. gold's child-document rule and second-hop chains correlate against bsad
+-- BY documento_compensacion, which the PK does not cover. Without this index the plan was
+-- not stable: gold.load_fact_pagos ran in 6 s one morning and >7 min that afternoon with
+-- the same query. FILTERED because the predicate always carries DZ and a non-null clearing
+-- document (14% of the table). A filtered index is only used with ANSI_NULLS and
+-- QUOTED_IDENTIFIER ON (the SSMS default); a tool that turns them off silently ignores it.
+CREATE NONCLUSTERED INDEX IX_sap_bsad_dz_compensacion
+    ON silver.sap_bsad (documento_compensacion, clave_contabilizacion)
+    WHERE clase_documento = 'DZ' AND documento_compensacion IS NOT NULL;
 
 -- ==========================================================
 -- 7. CUSTOMER COMPANY CODE DATA (silver.sap_knb1)

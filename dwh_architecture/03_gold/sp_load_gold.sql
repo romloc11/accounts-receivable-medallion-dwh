@@ -1077,7 +1077,7 @@ BEGIN
         FROM silver.sap_bsad b
         /* CUENTA MAYOR (agregado 2026-09-14): la cuenta de efectivo donde cayo el dinero
            -banco, caja o transitoria de pasarela-, tomada de la linea de banco del MISMO
-           documento. Sirve para filtrar por banco; ver alter_fact_pagos_cuenta_mayor.sql.
+           documento. Sirve para filtrar por banco.
            Una sola cuenta por documento, medido: ningun documento de 2026 cae en dos
            cuentas de efectivo, asi que MIN() no elige, solo desempaca la unica que hay.
            NULL = sin linea en una cuenta de efectivo (110 documentos en 2026). */
@@ -1146,8 +1146,9 @@ BEGIN
         CREATE UNIQUE CLUSTERED INDEX ix_pag ON #pag(sociedad, cliente_id, ejercicio, documento_id, posicion);
 
         /* REVERSAS (agregado 2026-09-14, decision del usuario). Una reversa FB08 de un pago
-           contado se RESTA, linea por linea. Es la regla de cobranza_regla_reversas.sql:
-           se resta una reversa solo si lo que anula fue contado.
+           contado se RESTA, linea por linea. Es la regla medida el 2026-09-11 (analisis
+           cobranza_regla_reversas.sql, retirado, en el historial de git): se resta una
+           reversa solo si lo que anula fue contado.
            Por que hacia falta: FB08 compensa el documento original contra la reversa, asi que
            la reversa de un deposito "compensa una clave 11" y la condicion de documento hijo
            de arriba la tiraba; ademas trae clave 02 y casi siempre texto vacio. Resultado:

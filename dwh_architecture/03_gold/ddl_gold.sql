@@ -72,6 +72,20 @@ CREATE TABLE gold.dim_fecha (
     anio_mes_num  AS (anio * 100 + mes) PERSISTED NOT NULL,               -- e.g. 202608, for chronological sorting
     anio_mes_texto AS (LEFT(nombre_mes, 3) + ' ' + CAST(anio AS VARCHAR(4))) PERSISTED NOT NULL, -- e.g. 'Ago 2026'
 
+    -- Business days, added 2026-09-08 for the collections budget, which spreads money by
+    -- day. Measured 2023-2026 (collections per day): business day $7.57M on average,
+    -- Saturday 0.9%, holiday 0.5%, Sunday 0.2% - so a holiday is deader than a Saturday.
+    -- gold.load_dim_fecha RECALCULATES these on every run, for every row: dia_habil_del_mes
+    -- and dias_habiles_mes depend on the whole month, and all of them depend on
+    -- gold.dim_festivo (hand-maintained list, dim_festivo.sql), which can grow later.
+    -- On an empty server run dim_festivo.sql BEFORE the first gold.load_dim_fecha.
+    es_festivo           BIT NOT NULL DEFAULT 0,
+    nombre_festivo       VARCHAR(40),
+    es_dia_habil         BIT NOT NULL DEFAULT 0,   -- neither weekend nor holiday
+    dia_habil_del_mes    INT,                      -- 1..N counting business days only; NULL if not a business day
+    dias_habiles_mes     INT,                      -- business days in the month, on every row of the month
+    siguiente_dia_habil  DATE,                     -- same day if it is a business day, else the next one
+
     CONSTRAINT PK_dim_fecha PRIMARY KEY CLUSTERED (fecha)
 );
 GO
@@ -670,7 +684,7 @@ GO
 MODELO DE APLICACION DE PAGOS  -  4 tablas nuevas en gold
 ========================================================================================
 Promocion a gold del modelo construido y validado en dwh_architecture/prueba/ durante
-2026-09-06/07. Sustituye conceptualmente a vw_pago_factura_simple +
+2026-09-06/07 (esa carpeta salio del repo el 2026-09-14; sigue en el historial de git). Sustituye conceptualmente a vw_pago_factura_simple +
 fact_pagos_compensados + fact_facturas_compensadas, pero NO los elimina: esos objetos
 se quedan vivos hasta que el modelo nuevo este completo y tenga su propio reporte
 (decision del usuario 2026-09-07). Conviven sin conflicto - nombres distintos, cargas
@@ -767,13 +781,21 @@ CREATE TABLE gold.fact_pagos (
     monto                   DECIMAL(15,2) NOT NULL,  -- YA FIRMADO: 'H' positivo, 'S' negativo
     texto                   VARCHAR(50),
     clave_contabilizacion   VARCHAR(2),
-    cuenta_mayor            VARCHAR(10),    -- cuenta de efectivo del documento (2026-09-14): en un
-                                            -- servidor existente la agrega alter_fact_pagos_cuenta_mayor.sql
 
     cliente_comercial_sk    INT,    -- version SCD2 vigente el dia de fecha_contabilizacion
     cliente_credito_sk      INT,
 
     fecha_carga             DATETIME DEFAULT GETDATE(),
+
+    -- Las dos de abajo llegaron despues por ALTER y por eso van al final: este archivo
+    -- describe la tabla en el ORDEN del servidor. Los procs y Power BI las piden por nombre.
+    -- pago_key (2026-09-08): llave para el TREATAS de Power BI contra sin_aplicacion. Se
+    -- calcula aqui y no en M (rompe el query folding) ni en DAX (no existe fuera de Power BI).
+    pago_key AS (CAST(sociedad AS VARCHAR(4)) + '|' + CAST(ejercicio AS VARCHAR(4)) + '|'
+                 + documento_id + '|' + CAST(posicion AS VARCHAR(6))) PERSISTED,
+    cuenta_mayor            VARCHAR(10),    -- cuenta de efectivo del documento (2026-09-14): banco,
+                                            -- caja o transitoria; NULL = sin linea de efectivo
+
     CONSTRAINT PK_fact_pagos PRIMARY KEY CLUSTERED
         (sociedad, cliente_id, ejercicio, documento_id, posicion)
 );
@@ -835,6 +857,20 @@ CREATE TABLE gold.fact_facturas (
     cliente_credito_sk      INT,
 
     fecha_carga             DATETIME DEFAULT GETDATE(),
+
+    -- Agregadas despues por ALTER (2026-09-08), al final por el orden del servidor.
+    -- Las llena gold.load_fact_facturas_pago_efectivo, que corre DESPUES del puente: salen de
+    -- gold.fact_aplicacion_pagos, que cuando corre load_fact_facturas trae la ventana anterior.
+    -- Viven en la FACTURA y no en el puente por el grano: una factura con 3 pagos tendria 3
+    -- dias_pago, y un DPP ponderado multiplicaria montos entre granos.
+    -- MAX(fecha del pago): el 97.7% del dinero se liquida con un solo pago; en el resto la
+    -- fecha es la del ultimo abono (el detalle sigue en el puente unido a fact_pagos).
+    fecha_pago_efectiva     DATE,          -- fecha_documento del ULTIMO pago que la liquido; NULL = ningun deposito la liquido
+    dias_pago               INT,           -- vencimiento -> fecha_pago_efectiva; negativo = pago antes de vencer
+    clasificacion_cobranza  VARCHAR(20),   -- PAGO_A_VENCIMIENTO (ya vencida antes del mes del pago) / PAGO_A_MES / PAGO_ANTICIPADO
+    factura_key AS (CAST(sociedad AS VARCHAR(4)) + '|' + CAST(ejercicio AS VARCHAR(4)) + '|'
+                    + documento_id + '|' + CAST(posicion AS VARCHAR(6))) PERSISTED,   -- llave para Power BI (2026-09-08)
+
     CONSTRAINT PK_fact_facturas PRIMARY KEY CLUSTERED
         (sociedad, cliente_id, ejercicio, documento_id, posicion)
 );
@@ -897,6 +933,13 @@ CREATE TABLE gold.fact_aplicacion_pagos (
     regla                   VARCHAR(20) NOT NULL,
 
     fecha_carga             DATETIME DEFAULT GETDATE(),
+
+    -- Llave de la relacion puente -> fact_facturas en Power BI (2026-09-08, por ALTER). Sin
+    -- pago_key A PROPOSITO: una segunda relacion hacia fact_pagos crea dos caminos desde
+    -- dim_cliente hasta el puente y Power BI se niega a abrir el archivo.
+    factura_key AS (CAST(sociedad AS VARCHAR(4)) + '|' + CAST(ejercicio_factura AS VARCHAR(4)) + '|'
+                    + factura_id + '|' + CAST(posicion_factura AS VARCHAR(6))) PERSISTED,
+
     CONSTRAINT PK_fact_aplicacion_pagos PRIMARY KEY CLUSTERED (
         sociedad, ejercicio_pago, pago_id, posicion_pago,
         ejercicio_factura, factura_id, posicion_factura
@@ -971,6 +1014,12 @@ CREATE TABLE gold.fact_pagos_sin_aplicacion (
     motivo                  VARCHAR(24) NOT NULL,
 
     fecha_carga             DATETIME DEFAULT GETDATE(),
+
+    -- El otro lado del TREATAS de Power BI (2026-09-08, por ALTER): misma expresion que
+    -- gold.fact_pagos.pago_key, para que las dos mitades de la relacion no se separen.
+    pago_key AS (CAST(sociedad AS VARCHAR(4)) + '|' + CAST(ejercicio AS VARCHAR(4)) + '|'
+                 + documento_id + '|' + CAST(posicion AS VARCHAR(6))) PERSISTED,
+
     CONSTRAINT PK_fact_pagos_sin_aplicacion PRIMARY KEY CLUSTERED
         (sociedad, cliente_id, ejercicio, documento_id, posicion)
 );
