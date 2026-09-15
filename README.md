@@ -8,10 +8,10 @@ Enterprise Data Warehouse built on SQL Server (T-SQL) using a **Medallion Archit
 SAP ECC (linked server)
     │  raw mirror, no transformations
     ▼
-BRONZE  ── 10 tables, customer master + AR line items
+BRONZE  ── 13 tables, customer master + AR and bank line items
     │  cleansing, standardization, business-scope filters
     ▼
-SILVER  ── 8 tables, one bronze table → one silver table
+SILVER  ── 12 tables, one bronze table → one silver table
     │  integration, star schema, business logic
     ▼
 GOLD    ── dimensions (SCD1/SCD2) + facts + reporting views
@@ -20,7 +20,7 @@ GOLD    ── dimensions (SCD1/SCD2) + facts + reporting views
     └──► Power BI
 ```
 
-Each layer is loaded by its own stored procedure (`bronze.load_bronze`, `silver.load_silver`, `gold.load_gold`, `dq.load_clientes_ambiguos`), run in that order. `gold.load_gold` is a thin orchestrator that chains the individual gold load procedures — each of those still runs standalone for isolated testing.
+Each layer is loaded by its own stored procedure (`bronze.load_bronze`, `silver.load_silver`, `gold.load_gold`, `dq.load_clientes_ambiguos`), run in that order. `gold.load_gold` is a thin orchestrator that chains the individual gold load procedures — each of those still runs standalone for isolated testing. Every step of every load is timed and recorded in `control.load_log`.
 
 ![Data Warehouse Architecture](docs/architecture/architecture_dwh.svg)
 
@@ -37,41 +37,68 @@ This warehouse is being rolled out in phases:
 
 ```
 docs/
-└── architecture/
-    ├── architecture_dwh.svg      rendered architecture diagram (used in this README)
-    └── architecture_dwh.drawio   editable source (diagrams.net / draw.io)
+├── architecture/
+│   ├── architecture_dwh.svg          rendered architecture diagram (used in this README)
+│   ├── architecture_dwh.drawio       editable source (diagrams.net / draw.io)
+│   ├── physical_data_model.drawio    physical data model
+│   └── fase0_preguntas.md            business questions the model has to answer
+└── archive/
+    └── fact_aplicacion_v2_retirado.md  record of a retired design and the evidence behind it
 dwh_architecture/
 ├── init_database.sql        schema creation (bronze/silver/gold/control/dq)
+├── inventario_objetos.sql   catalog query to compare the server against the repo
+├── 00_control/
+│   └── ddl_control.sql            load log table + control.log_step (run before any load)
 ├── 01_bronze/
-│   ├── ddl_bronze.sql        raw tables, 1:1 mirror of SAP source fields
-│   ├── sp_load_bronze.sql    daily load (truncate+insert, incremental merge for high-volume tables)
-│   └── sp_backfill_bsad.sql  one-time historical backfill
+│   ├── ddl_bronze.sql             raw tables, 1:1 mirror of SAP source fields
+│   ├── sp_load_bronze.sql         daily load (truncate+insert, incremental merge for high-volume tables)
+│   ├── sp_backfill_bsad.sql       historical backfill, year by year (empty server / recovery)
+│   ├── sp_backfill_bkpf.sql       historical backfill of document headers (DZ)
+│   ├── sp_backfill_bsas.sql       historical backfill of cleared bank lines
+│   ├── sp_recargar_bsis.sql       full reload of open bank lines (recovery, not daily)
+│   └── generar_ddl_desde_p01.sql  builds a bronze CREATE TABLE from the source catalog
 ├── 02_silver/
-│   ├── ddl_silver.sql         cleaned/standardized tables
-│   ├── sp_load_silver.sql     daily load (type casting, null handling, scope filters)
-│   └── backfill_bsad_historico.sql  one-time historical backfill
+│   ├── ddl_silver.sql                   cleaned/standardized tables
+│   ├── sp_load_silver.sql               daily load (type casting, null handling, scope filters)
+│   ├── backfill_bsad_historico.sql      historical backfill, year by year
+│   ├── backfill_bkpf_historico.sql      historical backfill of document headers
+│   └── backfill_bsas_bsis_historico.sql historical backfill of bank lines
 ├── 03_gold/
-│   ├── ddl_gold.sql                  star schema: dimensions + facts
-│   ├── sp_load_gold.sql              load procedures (SCD1/SCD2, incremental MERGE) + orchestrator
-│   ├── vw_pago_factura_simple.sql    payment-to-invoice reconciliation view
-│   └── backfill_fact_pagos_facturas_compensados.sql  one-time historical backfill
-└── 04_dq/
-    ├── ddl_dq.sql                          data-quality flag tables
-    ├── sp_load_dq.sql                      data-quality monitor load
-    └── validate_clasificacion_cobranza.sql  ad-hoc query re-validating vw_pago_factura_simple's month-cohort classification on demand
+│   ├── ddl_gold.sql                     star schema: dimensions + facts
+│   ├── dim_festivo.sql                  hand-maintained holiday calendar (run before the first gold load)
+│   ├── ddl_dim_presupuesto.sql          conformed dimensions for the collections budget
+│   ├── sp_load_gold.sql                 load procedures (SCD1/SCD2, incremental) + orchestrator
+│   ├── vw_pago_factura_simple.sql       payment-to-invoice reconciliation view (legacy report)
+│   ├── vw_cartera_abierta.sql           open invoices, line by line
+│   ├── vw_cobranza_diaria.sql           actual collections per day
+│   ├── backfill_fact_aplicacion_pagos.sql            historical backfill of the payment-application model
+│   └── backfill_fact_pagos_facturas_compensados.sql  historical backfill of the legacy settled facts
+├── 04_dq/
+│   ├── ddl_dq.sql                          data-quality flag tables
+│   ├── sp_load_dq.sql                      data-quality monitor load
+│   └── validate_clasificacion_cobranza.sql  ad-hoc query re-validating vw_pago_factura_simple's month-cohort classification on demand
+└── 04_pronostico/
+    ├── ddl_presupuesto.sql        collections budget tables
+    ├── modelo_presupuesto.sql     the budget model and its out-of-sample validation
+    ├── sp_load_presupuesto.sql    monthly budget load (run once a month, not daily)
+    ├── desglose_cobranza_mes.sql  what a month's collections are made of
+    └── demostrar_desglose.sql     one query per objection to that breakdown
 ```
+
+One-time migrations (ALTER, rename, drop) are removed once their change is folded into the `ddl_*.sql` files; they stay in git history.
 
 ## Data model
 
-**Bronze** — raw mirror of 10 SAP tables (customer master, sales/credit views, open and cleared AR line items, plus lookup tables for route names and employee names).
+**Bronze** — raw mirror of 13 SAP tables (customer master, sales/credit views, open and cleared AR line items, payment document headers, open and cleared bank G/L lines, plus lookup tables for route names and employee names).
 
-**Silver** — 8 cleansed tables. `mandante`/organization-code scoping, null normalization, and leading-zero stripping happen here; cross-entity joins are deliberately kept out (silver stays one-bronze-table-to-one-silver-table).
+**Silver** — 12 cleansed tables. `mandante`/organization-code scoping, null normalization, and leading-zero stripping happen here; cross-entity joins are deliberately kept out (silver stays one-bronze-table-to-one-silver-table).
 
 **Gold** — star schema:
 - `dim_fecha` — calendar dimension, self-extending (lower bound fixed at 2022-01-01, upper bound rolls forward to today+1 year on every load).
 - `dim_cliente` — customer identity, **SCD Type 1**.
 - `dim_cliente_comercial` / `dim_cliente_credito` — commercial and credit attributes, **SCD Type 2** (hash-based change detection, temporal joins from facts).
 - `fact_pagos_compensados` / `fact_facturas_compensadas` — incrementally-merged mirrors of customer payments and invoices.
+- `fact_pagos` / `fact_facturas` / `fact_aplicacion_pagos` / `fact_pagos_sin_aplicacion` — payment application model: every in-scope payment (cleared and open, reversals netted), every invoice, the payment↔invoice bridge built by three rules, and the reason for each payment the bridge cannot link.
 - `fact_saldo_cartera` — daily periodic-snapshot fact of open AR balance and aging, plus rolling payment-behavior metrics (days-to-pay, % on-time).
 - `vw_cliente_canal_estatus` / `vw_pago_factura_simple` — business-rule views: customer commercial status classification, and payment-to-invoice reconciliation (SAP settles payments and invoices as compensation groups, not a native 1:1 relationship — this view reconstructs that relationship for groups that can be resolved unambiguously). The reconciliation view also classifies each settled invoice as overdue, due-this-month, or paid-early (`clasificacion_cobranza`), the basis for the customer payment-behavior reporting built on this model.
 
@@ -84,7 +111,8 @@ See [DESIGN.md](DESIGN.md) for the full reasoning behind every table/view — wh
 - **Incremental loads**: high-volume tables (`sap_bsad`, `fact_pagos_compensados`, `fact_facturas_compensadas`) use `MERGE` scoped to a rolling current+previous-month window, with one-time backfill scripts kept separate from the daily incremental procedures.
 - **SCD Type 2** implemented as explicit sequential steps (stage → close changed versions → insert new versions) rather than a single `MERGE`, for straightforward debugging on the target SQL Server version.
 - **Data-quality safeguards baked into the model**: ambiguous-customer detection, and a same-RFC safeguard that prevents a payment from being attributed to another company's invoices when SAP batches unrelated settlements into the same compensation group.
-- Built and tested against **SQL Server 2012 SP1**, which constrains several patterns (no `CREATE OR ALTER`, limited transaction log headroom on large loads, etc.) — load procedures are written accordingly.
+- **One format for every load**: each procedure logs each step (rows and seconds) through `control.log_step`, which prints progress while it runs and stores it in `control.load_log`; a single `CATCH` logs the failing step and line, rolls back, and re-throws.
+- Built and tested against **SQL Server 2014 SP3**, which constrains several patterns (no `CREATE OR ALTER`, limited transaction log headroom on large loads, etc.) — load procedures are written accordingly.
 
 ## Known limitations
 

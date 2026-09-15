@@ -1,53 +1,25 @@
+/* ============================================================================
+   Gold tables
+   Purpose : Star schema for accounts receivable: dimensions, facts and the
+             customer status view.
+   Run     : on an empty server. The first eight tables are dropped and rebuilt
+             (gold.load_gold refills them in minutes). The four tables of the
+             payment application model are only created if missing: they hold
+             the 2022-> backfill.
+   Notes   : Not here, on purpose, because they keep data that cannot be rebuilt
+             from silver: dim_bucket, dim_ejecutivo, dim_region, dim_canal
+             (ddl_dim_presupuesto.sql) and the budget facts
+             (04_pronostico/ddl_presupuesto.sql).
+             The scope rules are defined only in gold.vw_cliente_canal_estatus.
+   ============================================================================ */
 USE ANALISIS_DATOS;
 GO
 
-/*
-===============================================================================
-PROJECT: Enterprise Data Warehouse (dwh-ciosa)
-LAYER: Gold (Presentation / Star Schema)
-===============================================================================
-
-SEIS TABLAS gold NO ESTAN EN ESTE ARCHIVO, A PROPOSITO:
-
-    gold.fact_presupuesto_cobranza     ->  04_pronostico/ddl_presupuesto.sql
-    gold.fact_presupuesto_cartera      ->  04_pronostico/ddl_presupuesto.sql
-    gold.dim_bucket                    ->  03_gold/ddl_dim_presupuesto.sql
-    gold.dim_ejecutivo                 ->  03_gold/ddl_dim_presupuesto.sql
-    gold.dim_region                    ->  03_gold/ddl_dim_presupuesto.sql
-    gold.dim_canal                     ->  03_gold/ddl_dim_presupuesto.sql
-
-Este script hace DROP de cada tabla antes de crearla, que es lo correcto para un
-modelo que se reconstruye desde silver. Estas seis NO se reconstruyen:
-
-  - las dos de presupuesto guardan numeros ya emitidos, contra los que se esta
-    midiendo gente;
-  - las cuatro dimensiones guardan clasificacion capturada a mano (que ejecutivo
-    es gestionable, como se llama de verdad la region MXZBAJ).
-
-Nada de eso se puede regenerar desde silver. Un DROP lo borraria sin dejar rastro.
-Por eso su DDL solo crea si falta, y nunca actualiza lo que ya esta.
-
-REGLAS DE ALCANCE: la definicion canonica es gold.vw_cliente_canal_estatus, mas
-abajo en este mismo archivo. Es la unica que debe editarse si las reglas cambian -
-el presupuesto y los demas consumidores la leen, no la reimplementan.
-===============================================================================
-*/
-
--- ==========================================================
--- 1. DIMENSION: gold.dim_fecha (Calendar)
--- NO SCD. GROWING range (not static): fixed lower bound at 2022-01-01
--- (bronze.sap_bsad's real start date) and upper bound = today + 1 year,
--- automatically extended by gold.load_dim_fecha on every gold.load_gold run
--- (see sp_load_gold.sql) - the 1-year cushion ahead covers future due dates
--- (NET-90-style payment terms) without needing a fixed range out to 2035.
--- REDESIGNED 2026-08-20: it used to be static 2020-01-01/2035-12-31,
--- populated once via populate_dim_fecha.sql (retired, its bootstrap logic
--- now lives inside gold.load_dim_fecha) - the user preferred the calendar
--- to reflect the real data period instead of showing years with no real
--- transactions (this was noticeable, for example, in the Power BI report's
--- Year filter, which offered the full 2020-2035 regardless of real data
--- only existing since 2022).
--- ==========================================================
+-- ----------------------------------------------------------------------------
+-- gold.dim_fecha: calendar from 2022-01-01 to today + 1 year, extended by
+-- gold.load_dim_fecha. Business-day columns are recalculated on every load
+-- from gold.dim_festivo (run dim_festivo.sql first).
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('gold.dim_fecha', 'U') IS NOT NULL
     DROP TABLE gold.dim_fecha;
 GO
@@ -59,44 +31,27 @@ CREATE TABLE gold.dim_fecha (
     nombre_mes           VARCHAR(15) NOT NULL,
     trimestre            INT NOT NULL,
     dia                  INT NOT NULL,
-    dia_semana           INT NOT NULL,          -- 1=Sunday ... 7=Saturday (explicitly set via SET DATEFIRST 7 when populating)
+    dia_semana           INT NOT NULL,          -- 1 = Sunday (DATEFIRST 7)
     nombre_dia_semana    VARCHAR(15) NOT NULL,
     es_fin_de_semana     BIT NOT NULL,
-    semana_anio          INT NOT NULL,           -- ISO week of the year
-
-    -- Added 2026-08-20 for the "real calendar month" axis in the Power BI
-    -- report (Total Amount Received Trend) - without this, grouping by
-    -- nombre_mes lumps Aug-2025 together with Aug-2026 in a single bar.
-    -- CALCULATED columns (AS ... PERSISTED): auto-populate from
-    -- anio/mes/nombre_mes, need no extra logic in gold.load_dim_fecha.
-    anio_mes_num  AS (anio * 100 + mes) PERSISTED NOT NULL,               -- e.g. 202608, for chronological sorting
-    anio_mes_texto AS (LEFT(nombre_mes, 3) + ' ' + CAST(anio AS VARCHAR(4))) PERSISTED NOT NULL, -- e.g. 'Ago 2026'
-
+    semana_anio          INT NOT NULL,           -- ISO week
+    anio_mes_num  AS (anio * 100 + mes) PERSISTED NOT NULL,               -- 202608, for sorting
+    anio_mes_texto AS (LEFT(nombre_mes, 3) + ' ' + CAST(anio AS VARCHAR(4))) PERSISTED NOT NULL, -- 'Ago 2026'
+    es_festivo           BIT NOT NULL DEFAULT 0,
+    nombre_festivo       VARCHAR(40),
+    es_dia_habil         BIT NOT NULL DEFAULT 0,   -- neither weekend nor holiday
+    dia_habil_del_mes    INT,                      -- 1..N business days only; NULL if not a business day
+    dias_habiles_mes     INT,                      -- business days in the month
+    siguiente_dia_habil  DATE,                     -- same day if business day, else the next one
     CONSTRAINT PK_dim_fecha PRIMARY KEY CLUSTERED (fecha)
 );
 GO
 
-PRINT 'Table gold.dim_fecha created successfully.';
-GO
-
--- ==========================================================
--- 2. DIMENSION: gold.dim_cliente (SCD Type 1 - Customer Identity)
--- Source: silver.sap_kna1 LEFT JOIN silver.sap_knkk (by cliente_id; knkk is
--- already filtered to KKBER='2000' in silver, so the join is 1:1 or 1:0,
--- with no need to repeat the filter here).
--- SCD1: fully overwritten on every load (TRUNCATE+INSERT), with NO version
--- history - unlike dim_cliente_credito/comercial (SCD2, below), these
--- attributes almost never change.
--- Key: cliente_id directly (no surrogate key - not needed for SCD1, and
--- keeps consistency with the rest of the project, which uses business
--- keys). mandante is NOT included (always '400', zero variation).
--- tipo_cliente = PADRE / FILIAL / SIN_RFC / GENERICO / MARKETPLACE /
--- TRANSITORIA (SIN_RFC renamed from DIRECCION_ALTERNA and MARKETPLACE added
--- 2026-08-27; TRANSITORIA added 2026-09-05 for the Kushky/Conekta payment-
--- gateway clearing accounts, split out of MARKETPLACE), full logic in
--- gold.load_dim_cliente (sp_load_gold.sql). Only SIN_RFC is used as a filter
--- anywhere in gold (the two views exclude it); the rest are labels for slicing.
--- ==========================================================
+-- ----------------------------------------------------------------------------
+-- gold.dim_cliente: customer identity, SCD1. Loaded with UPDATE + INSERT, never
+-- TRUNCATE: it has incoming foreign keys.
+-- tipo_cliente: PADRE / FILIAL / SIN_RFC / GENERICO / MARKETPLACE / TRANSITORIA
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('gold.dim_cliente', 'U') IS NOT NULL
     DROP TABLE gold.dim_cliente;
 GO
@@ -135,29 +90,12 @@ CREATE TABLE gold.dim_cliente (
 );
 GO
 
-PRINT 'Table gold.dim_cliente created successfully.';
-GO
-
--- ==========================================================
--- 3. VIEW: gold.vw_cliente_canal_estatus
--- ACTIVO/LEGAL/INACTIVO/REVISAR/FUERA_DE_ALCANCE classification for each
--- customer+channel row of silver.sap_knvv (full grain, NOT yet reduced to 1
--- row per customer - gold.load_dim_cliente_comercial does that on top of
--- this view). Logic ported from ciosa.py (see dwh-ciosa-project-status.md
--- in memory for the detail of each rule), confirmed against real data:
---   - "Order block" = knvv.bloqueo_pedido (channel level, NOT kna1 - 1,429
---     customers have a different block between channels, confirming it's
---     the right field).
---   - "Sales zone" = knvv.region (BZIRK) - confirmed, 327 rows with
---     'MXZLEG' in real data.
---   - salesperson/credit_executive/manager: from silver.sap_knvp (roles
---     VE/E1/GR), taking the lowest 'contador' (PARZA) when there's more
---     than one assignment of the same role in the same channel (SAP
---     convention: lowest number = primary assignment).
---   - Customer prefix 5/6/7: applied on cliente_id ALREADY without leading
---     zeros (silver has done it that way since 2026-08-07) - matches how
---     ciosa.py read the field in Python (numeric, unpadded).
--- ==========================================================
+-- ----------------------------------------------------------------------------
+-- gold.vw_cliente_canal_estatus: ACTIVO / LEGAL / INACTIVO / REVISAR /
+-- FUERA_DE_ALCANCE per customer and channel. The one place the scope rules
+-- are defined. Salesperson, credit executive and manager: the lowest PARZA
+-- wins (SAP's primary assignment).
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('gold.vw_cliente_canal_estatus', 'V') IS NOT NULL
     DROP VIEW gold.vw_cliente_canal_estatus;
 GO
@@ -215,33 +153,8 @@ SELECT
     ge.gerente_nombre,
     k.rfc,
     CASE
-        -- 2026-08-14: scoping channel down to 10/40/60 (excluding
-        -- 20/retail) was tried across the WHOLE project - REVERTED
-        -- 2026-08-17. The original business rule (confirmed by the user) is
-        -- that REAL customers live in channel 10 (wholesale) / 20 (retail)
-        -- / 40 (direct) / 60 (wholesale via ATM, also counts) - all 4 are
-        -- real customers, "10/40/60 = wholesale only" is a REPORT SCOPE
-        -- decision (which channels go into the wholesale payment-behavior
-        -- analysis), not an "is this a real customer" decision. Both
-        -- questions got mixed up when the original change was made - a
-        -- retail customer (channel 20) IS a real customer, it just doesn't
-        -- apply to that particular report. The "wholesale only" filter
-        -- lives exclusively in the report, never here.
-        -- Channel '50' investigated 2026-08-17: confirmed it's NOT a real
-        -- customer channel - the largest account there (<cliente-10>, $171.5M)
-        -- belongs to a company OWNER (name withheld: public repo).
-        -- No channel-50 account has a ruta_nombre. Likely a related/
-        -- shareholder account, correctly falls into FUERA_DE_ALCANCE under
-        -- the rule below (it's not in 10/20/40/60).
-        -- Prefix '9' added 2026-08-27 - confirmed by the user (business
-        -- process owner) while validating gold.vw_cartera_abierta: cliente_id
-        -- starting with 9 are not real customers either, same tier as
-        -- 5/6/7 (not "real customer out of scope for one report" - the
-        -- distinction this project already got wrong once, for channel
-        -- 10/20/40/60, and reverted 2026-08-17 - see the note that used to
-        -- be right here). Example seen during validation: a channel-10
-        -- account with a 9-prefixed id was landing as INACTIVO (a real-looking
-        -- customer status) before this fix.
+        -- Channels 10/20/40/60 are real customers; which of them a report uses
+        -- is a report decision, not this one. Ids starting 5/6/7/9 are not customers.
         WHEN v.canal_distribucion NOT IN ('10', '20', '40', '60')
              OR v.cliente_id LIKE '5%' OR v.cliente_id LIKE '6%'
              OR v.cliente_id LIKE '7%' OR v.cliente_id LIKE '9%'
@@ -270,22 +183,11 @@ LEFT JOIN gerente ge ON ge.cliente_id = v.cliente_id AND ge.organizacion_ventas 
     AND ge.canal_distribucion = v.canal_distribucion AND ge.sector = v.sector AND ge.rn = 1;
 GO
 
-PRINT 'View gold.vw_cliente_canal_estatus created successfully.';
-GO
-
--- ==========================================================
--- 4. DIMENSION: gold.dim_cliente_comercial (SCD Type 2)
--- Grain: cliente_id (one representative per customer, chosen among their
--- channels via gold.vw_cliente_canal_estatus with priority ACTIVO > LEGAL >
--- REVISAR > INACTIVO > FUERA_DE_ALCANCE, final tiebreak by lowest
--- canal_distribucion - see gold.load_dim_cliente_comercial in
--- sp_load_gold.sql).
--- organizacion_ventas/canal_distribucion/sector are kept as columns (even
--- though the PK is only cliente_id) so gold.dim_cliente_credito can reuse
--- "which channel was chosen" when looking up analista_credito/cobrador.
--- SCD2: id_surrogate is the technical key the facts use. A unique filtered
--- index guarantees a single active version (es_vigente=1) per customer.
--- ==========================================================
+-- ----------------------------------------------------------------------------
+-- gold.dim_cliente_comercial: SCD2, one representative channel per customer
+-- (ACTIVO > LEGAL > REVISAR > INACTIVO > FUERA_DE_ALCANCE, then lowest channel).
+-- The channel columns let dim_cliente_credito reuse that choice.
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('gold.dim_cliente_comercial', 'U') IS NOT NULL
     DROP TABLE gold.dim_cliente_comercial;
 GO
@@ -319,20 +221,10 @@ CREATE UNIQUE INDEX UX_dim_cliente_comercial_vigente
     WHERE es_vigente = 1;
 GO
 
-PRINT 'Table gold.dim_cliente_comercial created successfully.';
-GO
-
--- ==========================================================
--- 5. DIMENSION: gold.dim_cliente_credito (SCD Type 2)
--- Grain: cliente_id. Attributes from silver.sap_knkk (already ~1:1 per
--- customer thanks to the KKBER='2000' filter in silver) + analista_credito
--- (role E1) and cobrador (role CC) from silver.sap_knvp, resolved on the
--- channel gold.dim_cliente_comercial ALREADY chose as the customer's
--- representative (which channel isn't re-decided here - that decision is
--- reused via a join to dim_cliente_comercial, a single source of truth).
--- SCD2: same mechanics as dim_cliente_comercial (id_surrogate, hash-diff,
--- versioning), already validated in production.
--- ==========================================================
+-- ----------------------------------------------------------------------------
+-- gold.dim_cliente_credito: SCD2 credit attributes. Credit analyst and
+-- collector are resolved on the channel dim_cliente_comercial chose.
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('gold.dim_cliente_credito', 'U') IS NOT NULL
     DROP TABLE gold.dim_cliente_credito;
 GO
@@ -343,7 +235,7 @@ CREATE TABLE gold.dim_cliente_credito (
     limite_credito           DECIMAL(15,2),
     bloqueo_credito          CHAR(1),
     clasificacion_riesgo     VARCHAR(5),
-    etiqueta_credito         VARCHAR(11),   -- raw KRAUS (includes FILIAL/LEGAL/BAJA*/CREDITOC/etc.)
+    etiqueta_credito         VARCHAR(11),   -- KRAUS as-is
     grupo_credito            VARCHAR(4),
     analista_credito_id      VARCHAR(8),
     analista_credito_nombre  VARCHAR(40),
@@ -363,67 +255,13 @@ CREATE UNIQUE INDEX UX_dim_cliente_credito_vigente
     WHERE es_vigente = 1;
 GO
 
-PRINT 'Table gold.dim_cliente_credito created successfully.';
-GO
-
--- ==========================================================
--- 6. FACT: gold.fact_saldo_cartera
--- "Periodic snapshot fact": every run of gold.load_fact_saldo_cartera adds
--- a new snapshot (fecha_snapshot = today) of each customer's open balance,
--- WITHOUT deleting previous snapshots - this is how the history that
--- silver.sap_bsid can't provide gets accumulated (bronze/silver.sap_bsid
--- are fully reloaded every day, with no MERGE or backfill, unlike bsad -
--- there was never a way to reconstruct a past date's balance). IMPORTANT
--- CONSEQUENCE: this fact CANNOT be backfilled historically - it only
--- starts accumulating from the first real day its load runs.
---
--- GRAIN: cliente_id + fecha_snapshot (decided 2026-08-11 over line grain -
--- see dwh-ciosa-project-status.md in memory for the full comparison).
--- Collapses 'sociedad' the same way dim_cliente_comercial/dim_cliente_credito
--- do (there's no dim_sociedad in this model). With ~91,593 line items /
--- ~4,568 customers with a balance today, line grain would have kept growing
--- ~33M rows/year indefinitely on a server with the already-known 2GB log
--- limit; customer grain grows ~1.67M rows/year, manageable.
---
--- AGGREGATED MEASURES (from silver.sap_bsid, per customer, as of the
--- snapshot date, amount signed by debe_haber and excluding
--- clase_documento='SA' - see the full note in the CREATE TABLE below):
---   saldo_total/saldo_no_vencido/saldo_1_16 (grace period)/saldo_vencido
---   (REAL, 17+ days), num_documentos_abiertos, dias_vencido_max, aging
---   buckets (17-31/32-180/181+, only over real saldo_vencido),
---   documentos_con_reclamacion/nivel_reclamacion_max (MANST, worst level
---   among its open documents).
---
--- DELIBERATELY LEFT BROAD SCOPE (2026-08-27): unlike gold.vw_cartera_abierta
--- (which got 3 scope filters the same day - canal 10/20/40/60,
--- tipo_cliente<>DIRECCION_ALTERNA, estatus_comercial<>FUERA_DE_ALCANCE),
--- this fact keeps NO scope filter on purpose - it's the only object in the
--- DWH that answers "how much does the WHOLE company owe, any channel/type",
--- and since it's a periodic snapshot that CANNOT be backfilled, narrowing
--- it in place would create a permanent discontinuity between already-
--- accumulated broad-scope history and any future narrow-scope snapshots.
--- If a wholesale/real-customer-only cartera number is needed, use
--- gold.vw_cartera_abierta - it reconciles against neither this fact's
--- saldo_total NOR PowerBI is expected to, by design (see that view's own
--- header for the full reasoning).
---
--- DPP / % on-time-late REMOVED 2026-08-27 - decided NOT to rebuild as a SQL
--- object at all. fecha_pago/dias_pago already live on gold.vw_pago_factura_simple
--- with full history since 2022, so the user chose to compute the DPP TREND
--- as a Power BI DAX time-intelligence measure directly over that view
--- (AVERAGEX(DATESINPERIOD(...))) instead of a new SQL view/table - same
--- pattern already used for credit utilization (DAX, not SQL, per DESIGN.md's
--- 5th table-vs-view question: "will this only ever be consumed from Power
--- BI?"). A gold.vw_comportamiento_pago_cliente view was drafted first
--- (recomputes live, "today" only, no real trend) and retired same-day once
--- this was raised - a live view can't show "what DPP looked like 3 months
--- ago" without re-running it with historical data, only DAX time
--- intelligence (or a future periodic-snapshot fact, if DAX ever proves too
--- slow) actually solves that. Living inside this fact was a carry-over from
--- when it migrated 2026-08-19 from the now-deleted gold.fact_aplicacion_pagos
--- (whose 3-tier matching had real over-attribution bugs - a $137 document
--- once "explained" $2.5M in invoices), not an architectural requirement.
--- ==========================================================
+-- ----------------------------------------------------------------------------
+-- gold.fact_saldo_cartera: daily snapshot of each customer's open balance.
+-- Cannot be backfilled (silver.sap_bsid keeps no history). No scope filter on
+-- purpose: it is the whole company's balance; gold.vw_cartera_abierta is the
+-- scoped view. Amounts signed by debe_haber, SA documents excluded, 1-16 days
+-- overdue is a grace period.
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('gold.fact_saldo_cartera', 'U') IS NOT NULL
     DROP TABLE gold.fact_saldo_cartera;
 GO
@@ -431,48 +269,20 @@ GO
 CREATE TABLE gold.fact_saldo_cartera (
     cliente_id                  VARCHAR(10) NOT NULL,
     fecha_snapshot               DATE        NOT NULL,
-
-    -- balance and aging - REDESIGNED 2026-08-18 after reconciling against
-    -- an external portfolio report and finding 3 real discrepancies:
-    --   1. silver.sap_bsid's monto_moneda_local NEVER carries a sign (same
-    --      as bsad) - debe_haber='H' (payments/credit notes/returns/
-    --      adjustments sitting as an unapplied open item) was being added
-    --      as debt instead of subtracted. It's now signed before
-    --      aggregating (see gold.load_fact_saldo_cartera Step 1).
-    --   2. clase_documento='SA' (GL journal entries) is excluded entirely -
-    --      these aren't real customer documents.
-    --   3. Real business rule: invoices overdue by 1-16 days are treated as
-    --      "healthy balance" (grace period), NOT as truly overdue -
-    --      confirmed by the user and validated with data (real overdue
-    --      with just this adjustment came out to $15.79M against the
-    --      external report's $15.38M, ~2.6% difference, within what's
-    --      expected from timing between snapshots).
-    -- Aging buckets were also redesigned with the same cutoffs as the
-    -- external report (17-31/32-180/181+) to be directly comparable.
     saldo_total                  DECIMAL(18,2) NOT NULL,
-    saldo_no_vencido              DECIMAL(18,2) NOT NULL,  -- fecha_vencimiento NULL or >= today (within terms)
-    saldo_1_16                   DECIMAL(18,2) NOT NULL,  -- grace period: 1-16 days overdue, treated as healthy by the business
-    saldo_vencido                DECIMAL(18,2) NOT NULL,  -- REAL OVERDUE: 17+ days (saldo_17_31+saldo_32_180+saldo_181_mas)
+    saldo_no_vencido              DECIMAL(18,2) NOT NULL,  -- not due yet
+    saldo_1_16                   DECIMAL(18,2) NOT NULL,  -- grace period
+    saldo_vencido                DECIMAL(18,2) NOT NULL,  -- 17+ days
     num_documentos_abiertos      INT NOT NULL,
-    dias_vencido_max             INT NULL,  -- max days overdue across ALL overdue documents (includes the grace period, it's the worst case regardless of the "real overdue" cutoff)
-
-    -- aging buckets (only over REAL saldo_vencido, 17+ days)
+    dias_vencido_max             INT NULL,  -- worst case, grace period included
     saldo_17_31                  DECIMAL(18,2) NOT NULL,
     saldo_32_180                 DECIMAL(18,2) NOT NULL,
     saldo_181_mas                DECIMAL(18,2) NOT NULL,
-
-    -- dunning / collections (aggregated from line level)
     documentos_con_reclamacion   INT NOT NULL,
     nivel_reclamacion_max        CHAR(1) NULL,
-
-    -- DPP / % pagos a tiempo-tarde REMOVED 2026-08-27 - ahora medida DAX en Power BI sobre gold.vw_pago_factura_simple, ver nota arriba
-
-    -- SCD2 surrogate keys, resolved via a temporal join to fecha_snapshot
     id_cliente_comercial         INT NULL,
     id_cliente_credito           INT NULL,
-
     fecha_carga                  DATETIME DEFAULT GETDATE(),
-
     CONSTRAINT PK_fact_saldo_cartera PRIMARY KEY CLUSTERED (fecha_snapshot, cliente_id),
     CONSTRAINT FK_fsc_cliente FOREIGN KEY (cliente_id) REFERENCES gold.dim_cliente (cliente_id),
     CONSTRAINT FK_fsc_fecha_snapshot FOREIGN KEY (fecha_snapshot) REFERENCES gold.dim_fecha (fecha),
@@ -481,69 +291,10 @@ CREATE TABLE gold.fact_saldo_cartera (
 );
 GO
 
-PRINT 'Table gold.fact_saldo_cartera created successfully.';
-GO
-
--- ==========================================================
--- gold.fact_aplicacion_pagos (bridge table invoice<->applied document, with
--- 3-tier REBZG/GRUPO_INAMBIGUO/no-match matching) was REMOVED 2026-08-19:
--- the matching logic turned out to have real over-attribution bugs (an
--- "unambiguous" candidate could explain invoices worth far more than it
--- actually covers - e.g. a $137 Z1 document attributed to $2.5M across
--- 4,724 invoices within a massive compensation group; confirmed in several
--- real cases before deciding to retire it).
--- Replaced by the simple gold.fact_pagos_compensados/gold.fact_facturas_compensadas +
--- gold.vw_pago_factura_simple design (only relates groups with EXACTLY 1
--- candidate payment, with no match tiers or partial application). The DPP
--- block of gold.fact_saldo_cartera that depended on this table was already
--- migrated before it was removed (see gold.load_fact_saldo_cartera Step 2).
--- ==========================================================
--- 6. FACT: gold.fact_pagos_compensados
--- Grain: 1 row = 1 "raw" deposit (silver.sap_bsad, clase_documento='DZ'
--- AND (sgtxt='Asignación Aut. Deposito' OR sgtxt LIKE 'BB%') AND
--- debe_haber<>'S' AND monto_moneda_local>0, AND not a self-canceling
--- internal pair - see gold.load_fact_pagos_compensados in sp_load_gold.sql,
--- fix 2026-08-29) - a customer payment not yet
--- allocated to invoices. The sgtxt condition went through 3 iterations
--- on 2026-08-29 (exact match -> IS NOT NULL -> this conservative pair) -
--- see gold.load_fact_pagos_compensados in sp_load_gold.sql and
--- dwh-ciosa-project-status.md in memory for the full investigation;
--- deliberately excludes CHEQUE DEVUELTO (bounced checks) and several
--- other unreviewed text patterns until someone confirms their business
--- legitimacy as real cobranza.
--- Filtered mirror, with no matching logic (unlike fact_aplicacion_pagos) -
--- the payment<->invoice relationship lives in gold.vw_pago_factura_simple
--- (a query, not a table), which only relates compensation groups with
--- EXACTLY 1 candidate payment.
--- debe_haber<>'S' FILTER added 2026-08-19 after analyzing July's
--- GRUPO_AMBIGUO_2+PAGOS cases: 4 of 5 sample groups turned out to be a
--- single real payment duplicated, not genuine ambiguity - a compensation's
--- "child" document always carries its own mirror/offsetting line (same
--- documento_id=documento_compensacion, debe_haber='S', same amount and same
--- sgtxt='Asignación Aut. Deposito' as the real deposit), which without this
--- filter was counted as a second candidate raw payment. Measured: applying
--- this filter reduced July's GRUPO_AMBIGUO_2+PAGOS from 92 payments/$1.52M
--- to 29 payments/$249K (-84% in amount), with almost no impact on
--- MATCHEADO_OK (most of the "disambiguated" payments had no invoice
--- anyway, they fell into SIN_FACTURA_EN_GRUPO). Same filter already
--- validated earlier in the gold.fact_aplicacion_pagos design (now retired)
--- for the same purpose.
--- monto_moneda_local>0 FILTER added 2026-08-19 (same session), after
--- analyzing the 29 payments that remained ambiguous: 6 of 14 sample groups
--- turned out to be the child's own "H" line but with a $0 amount
--- (technical residual, not real money) inflating the candidate count
--- alongside the real deposit. The other 8 groups in that sample (the
--- child's own "H" line WITH a real amount competing with an external raw
--- payment for the same money, or cleanup batches with multiple real
--- deposits/invoices from several months) are left as an accepted residual
--- on purpose - resolving them would require the "own vs. external" logic
--- that already caused several rounds of bugs in the fact_aplicacion_pagos
--- design, not worth it for a ~0.17% residual of the universe.
--- Load: gold.load_fact_pagos_compensados (sp_load_gold.sql) - incremental,
--- current + previous month by fecha_compensacion, the same pattern
--- silver.load_silver uses for bsad. Historical backfill:
--- 03_gold/backfill_fact_pagos_facturas_compensados.sql.
--- ==========================================================
+-- ----------------------------------------------------------------------------
+-- gold.fact_pagos_compensados: legacy raw deposits from silver.sap_bsad, source
+-- of gold.vw_pago_factura_simple. Kept until the report moves to fact_pagos.
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('gold.fact_pagos_compensados', 'U') IS NOT NULL
     DROP TABLE gold.fact_pagos_compensados;
 GO
@@ -554,37 +305,24 @@ CREATE TABLE gold.fact_pagos_compensados (
     ejercicio                 INT           NOT NULL,
     documento_id               VARCHAR(10)   NOT NULL,
     posicion                   INT           NOT NULL,
-    fecha_documento             DATE, -- real deposit date ("payment date")
-    fecha_contabilizacion       DATE, -- posting/GL date - added 2026-08-29, backfilled via ALTER TABLE on the live server (not re-run of this CREATE TABLE, which would have dropped real data) - this is the field that actually matches SAP's own monthly payment report period, NOT fecha_documento/fecha_compensacion (both tried and ruled out - see dwh-ciosa-project-status.md in memory)
+    fecha_documento             DATE, -- deposit date
+    fecha_contabilizacion       DATE, -- the date SAP's monthly payment report uses
     fecha_compensacion          DATE,
     monto_moneda_local          DECIMAL(15,2),
-    documento_compensacion      VARCHAR(10), -- compensation group shared with the invoices it covers
+    documento_compensacion      VARCHAR(10), -- clearing group shared with the invoices
     ejercicio_compensacion      INT,
     fecha_carga                 DATETIME DEFAULT GETDATE(),
     CONSTRAINT PK_fact_pagos_compensados PRIMARY KEY CLUSTERED (sociedad, cliente_id, ejercicio, documento_id, posicion)
 );
 GO
 
--- Index on the compensation group: gold.vw_pago_factura_simple (and any
--- ad-hoc analysis) groups/joins on this pair of columns constantly -
--- without this index it's a full table scan every time (confirmed
--- 2026-08-19, the reconciliation query was taking a long time).
 CREATE INDEX IX_fact_pagos_compensados_grupo ON gold.fact_pagos_compensados (documento_compensacion, ejercicio_compensacion);
 GO
 
-PRINT 'Table gold.fact_pagos_compensados created successfully.';
-GO
-
--- ==========================================================
--- 7. FACT: gold.fact_facturas_compensadas
--- Grain: 1 row = 1 already-cleared invoice (silver.sap_bsad,
--- clase_documento IN F1-F6). Same filtered mirror as fact_pagos_compensados,
--- with no matching logic.
--- Load: gold.load_fact_facturas_compensadas (sp_load_gold.sql) -
--- incremental, same pattern. Historical backfill:
--- 03_gold/backfill_fact_pagos_facturas_compensados.sql (run 2026-08-19,
--- complete history since 2022-01-01).
--- ==========================================================
+-- ----------------------------------------------------------------------------
+-- gold.fact_facturas_compensadas: legacy cleared invoices (F1-F6) from
+-- silver.sap_bsad.
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('gold.fact_facturas_compensadas', 'U') IS NOT NULL
     DROP TABLE gold.fact_facturas_compensadas;
 GO
@@ -606,133 +344,48 @@ CREATE TABLE gold.fact_facturas_compensadas (
 );
 GO
 
--- Same reason as gold.fact_pagos_compensados: gold.vw_pago_factura_simple
--- constantly joins on this pair of columns.
 CREATE INDEX IX_fact_facturas_compensadas_grupo ON gold.fact_facturas_compensadas (documento_compensacion, ejercicio_compensacion);
 GO
 
-PRINT 'Table gold.fact_facturas_compensadas created successfully.';
-GO
-
--- ==========================================================
--- 8. DIMENSION: gold.dim_empleado (SCD Type 1 - conformed employee dimension)
--- Added 2026-08-27, from the pending "Proposals in design" list in
--- DESIGN.md. Source: silver.sap_pa0001 (current record only).
--- PURPOSE: today, vendedor/gerente/analista_credito/cobrador each carry
--- their own *_id/*_nombre column pair, duplicated as plain text across
--- gold.dim_cliente_comercial (vendedor_id/nombre, gerente_id/nombre) and
--- gold.dim_cliente_credito (analista_credito_id/nombre, cobrador_id/nombre)
--- - the same employee can show up with the same name typed 4 separate
--- times. dim_empleado is a Kimball "role-playing dimension": ONE table,
--- joined multiple times (once per role, via Power BI relationships or a
--- query alias) instead of the name being repeated as text. It does NOT
--- replace the *_id columns already on dim_cliente_comercial/dim_cliente_credito
--- - those stay as-is; this only adds a place to join "by person" reporting
--- to (headcount-level attributes, one row per employee, not per assignment).
--- SCD1, no version history (employee identity - just id/name - changes
--- rarely enough that SCD2 isn't worth the complexity, same reasoning as
--- gold.dim_cliente). Key is id_empleado directly (PERNR, no surrogate key -
--- same business-key style as dim_cliente), so it matches
--- dim_cliente_comercial.vendedor_id/gerente_id and
--- dim_cliente_credito.analista_credito_id/cobrador_id with NO transformation
--- (none of those are zero-stripped either, see silver.sap_knvp.id_interlocutor).
--- NO FK constraints added from dim_cliente_comercial/dim_cliente_credito to
--- this table (deliberate, not an oversight): SAP end-dates an infotype 0001
--- row when someone leaves the company, so a *_id captured historically on
--- an SCD2 row could point to a PERNR that no longer has a current
--- (ENDDA='99991231') record in silver.sap_pa0001, and therefore never makes
--- it into this table - enforcing an FK here could break existing loads over
--- an ex-employee with no warning. Join by id_empleado at query time
--- (Power BI relationship or view) instead, same as any other unenforced
--- role-playing dimension.
--- Load pattern: explicit UPDATE+INSERT (gold.load_dim_empleado), never
--- TRUNCATE - same lesson as gold.dim_cliente (a TRUNCATE-based load becomes
--- unusable the moment any table gains an incoming FK to this one).
--- ==========================================================
+-- ----------------------------------------------------------------------------
+-- gold.dim_empleado: employees, SCD1. Role-playing dimension for salesperson,
+-- manager, credit analyst and collector. No foreign keys point to it:
+-- ex-employees drop out of silver.sap_pa0001.
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('gold.dim_empleado', 'U') IS NOT NULL
     DROP TABLE gold.dim_empleado;
 GO
 
 CREATE TABLE gold.dim_empleado (
-    id_empleado             VARCHAR(8) NOT NULL,   -- PERNR, raw format
+    id_empleado             VARCHAR(8) NOT NULL,   -- PERNR as-is
     nombre                  VARCHAR(40),
     fecha_actualizacion     DATETIME DEFAULT GETDATE(),
     CONSTRAINT PK_dim_empleado PRIMARY KEY CLUSTERED (id_empleado)
 );
 GO
 
-PRINT 'Table gold.dim_empleado created successfully.';
-GO
+-- ============================================================================
+-- Payment application model
+-- Created only if missing: these four tables hold the 2022-> backfill
+-- (backfill_fact_aplicacion_pagos.sql). To rebuild them, drop them by hand and
+-- run the backfill again.
+--   gold.fact_pagos                 money received, one row per payment line
+--   gold.fact_facturas              invoices, cleared and open
+--   gold.fact_aplicacion_pagos      bridge: which invoices each payment touched
+--   gold.fact_pagos_sin_aplicacion  payments that touched no invoice, and why
+-- The bridge carries no amount: at payment x invoice grain no amount adds up.
+-- Sum money from fact_pagos and fact_facturas with EXISTS.
+-- Columns added later by ALTER are kept last, in the server's column order.
+-- ============================================================================
 
-
-/*
-========================================================================================
-MODELO DE APLICACION DE PAGOS  -  4 tablas nuevas en gold
-========================================================================================
-Promocion a gold del modelo construido y validado en dwh_architecture/prueba/ durante
-2026-09-06/07. Sustituye conceptualmente a vw_pago_factura_simple +
-fact_pagos_compensados + fact_facturas_compensadas, pero NO los elimina: esos objetos
-se quedan vivos hasta que el modelo nuevo este completo y tenga su propio reporte
-(decision del usuario 2026-09-07). Conviven sin conflicto - nombres distintos, cargas
-independientes.
-
-    gold.fact_pagos                 el dinero que entro          ~614K filas (2022->hoy)
-    gold.fact_facturas              lo que se debe               ~3.27M filas
-    gold.fact_aplicacion_pagos      el puente pago<->factura     ~3-3.5M filas
-    gold.fact_pagos_sin_aplicacion  el dinero sin factura        ~2-3K filas
-
---- ESTAS CUATRO NO SE BORRAN AL CORRER ESTE ARCHIVO, Y ES A PROPOSITO ---
-Las otras ocho tablas de gold arrancan con DROP TABLE: se reconstruyen de cero y se
-repueblan con gold.load_gold en minutos. Estas cuatro NO. Contienen el backfill
-historico 2022->hoy, que se carga por anio con backfill_fact_aplicacion_pagos.sql y
-tarda mucho mas - un DROP aqui cuesta horas de recarga, no minutos.
-Por eso cada bloque de abajo dice IS NULL, no IS NOT NULL: si la tabla ya existe, NO SE
-TOCA. Correr este archivo completo es seguro para ellas. Para reconstruirlas de verdad
-hay que borrarlas a mano, a proposito, y volver a correr el backfill.
-
---- COMO RECONSTRUIR SOLO ESTAS CUATRO ---
-NO correr el archivo entero: las otras ocho SI se borran y te llevas por delante la capa
-completa (se recupera con gold.load_gold, pero no es lo que querias hacer).
-Descomentar el bloque de DROP de aqui abajo y correr SOLO de ahi hacia el final del
-archivo. Despues, backfill_fact_aplicacion_pagos.sql para repoblar 2022->hoy.
-
-    -- DROP TABLE gold.fact_pagos_sin_aplicacion;
-    -- DROP TABLE gold.fact_aplicacion_pagos;
-    -- DROP TABLE gold.fact_facturas;
-    -- DROP TABLE gold.fact_pagos;
-
---- LA DECISION CENTRAL: EL PUENTE NO LLEVA MONTO ---
-fact_aplicacion_pagos esta al grano (pago x factura) y ahi NINGUN monto es aditivo -
-ni el del pago ni el de la factura: los dos vienen heredados de un grano mas grueso.
-Medido en julio 2026: SUM sobre el join da ~$11.4 mil millones contra los ~$147.3M
-correctos, 83x inflado. El puente responde "que facturas toco este pago". El dinero se
-suma desde fact_pagos y fact_facturas con EXISTS.
-Consecuencia deliberada: NO existe un "monto asignado" por pareja pago-factura. En un
-grupo con varios pagos y varias facturas ese reparto seria inventado. vw_pago_factura_simple
-si lo calcula (monto_pago_asignado); este modelo se niega, y cualquier medida que lo use
-tendra que rediseñarse, no traducirse.
-
---- HISTORIA COMPLETA DESDE 2022 (decision del usuario 2026-09-07) ---
-Las facturas compensadas se cargan completas, no en ventana movil. Eso elimina el
-"margen empirico" que necesitaba el modelo de prueba: con toda la historia, la factura
-del grupo final SIEMPRE esta, asi que la regla del segundo salto deja de depender de una
-cobertura observada y pasa a ser exacta.
-========================================================================================
-*/
-
-
--- ========================================================================================
--- 1. gold.fact_pagos  -  el dinero que ENTRO. 1 fila = 1 linea de pago.
---
--- QUE CUENTA COMO PAGO (validado contra SAP en julio 2026: el mismo monto (exacto)):
---   clave 11 = deposito virgen (el dinero llegando al banco)
---   clave 15 en documento que NO es hijo = pago directo (dinero real sin deposito previo)
---   claves 05/08 sueltas = reversos y traspasos, ajustes negativos de pagos que si estan
--- Se EXCLUYEN las lineas de un DOCUMENTO HIJO: su clave 15 reaplica dinero ya contado en
--- la clave 11 y su clave 08 es el espejo. Sin ese filtro se cuenta el mismo deposito dos
--- veces (+~$1.8M en julio, 123 lineas) - mismo bug que ya tuvo fact_pagos_compensados.
--- ========================================================================================
--- IS NULL, no IS NOT NULL: si ya existe se respeta. Ver la nota de la cabecera.
+-- ----------------------------------------------------------------------------
+-- gold.fact_pagos
+-- A payment: DZ line with text 'Asignación Aut. Deposito', or key 11 (automatic
+-- deposit) with empty text, that is not a line of a child document (those
+-- re-apply money already counted). A reversal (FB08) of a counted line enters
+-- with its negative amount. Open payments (bsid) are a snapshot with
+-- fecha_compensacion NULL; a line in bsad and bsid at once: bsid wins.
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('gold.fact_pagos', 'U') IS NULL
 CREATE TABLE gold.fact_pagos (
     sociedad                VARCHAR(4)    NOT NULL,
@@ -740,58 +393,41 @@ CREATE TABLE gold.fact_pagos (
     ejercicio               INT           NOT NULL,
     documento_id            VARCHAR(10)   NOT NULL,
     posicion                INT           NOT NULL,
-
     documento_compensacion  VARCHAR(10),
     ejercicio_compensacion  INT,
-
-    fecha_documento         DATE,   -- fecha real del deposito
-    fecha_contabilizacion   DATE,   -- el campo que cuadra con el reporte mensual de SAP
-    fecha_compensacion      DATE,   -- cuando SAP liquido la linea
-
-    monto                   DECIMAL(15,2) NOT NULL,  -- YA FIRMADO: 'H' positivo, 'S' negativo
+    fecha_documento         DATE,   -- deposit date
+    fecha_contabilizacion   DATE,   -- the date of SAP's monthly payment report
+    fecha_compensacion      DATE,   -- NULL = open payment
+    monto                   DECIMAL(15,2) NOT NULL,  -- signed: H positive, S negative
     texto                   VARCHAR(50),
     clave_contabilizacion   VARCHAR(2),
-
-    cliente_comercial_sk    INT,    -- version SCD2 vigente el dia de fecha_contabilizacion
+    cliente_comercial_sk    INT,    -- SCD2 version at fecha_contabilizacion
     cliente_credito_sk      INT,
-
     fecha_carga             DATETIME DEFAULT GETDATE(),
+    pago_key AS (CAST(sociedad AS VARCHAR(4)) + '|' + CAST(ejercicio AS VARCHAR(4)) + '|'
+                 + documento_id + '|' + CAST(posicion AS VARCHAR(6))) PERSISTED,   -- Power BI key
+    cuenta_mayor            VARCHAR(10),    -- cash account of the document; NULL = no cash line
     CONSTRAINT PK_fact_pagos PRIMARY KEY CLUSTERED
         (sociedad, cliente_id, ejercicio, documento_id, posicion)
 );
 GO
 
--- El puente une por el grupo de compensacion.
 IF NOT EXISTS (SELECT 1 FROM sys.indexes
                WHERE name = 'IX_fact_pagos_grupo' AND object_id = OBJECT_ID('gold.fact_pagos'))
 CREATE INDEX IX_fact_pagos_grupo ON gold.fact_pagos (documento_compensacion, ejercicio_compensacion);
 GO
--- Toda consulta de cobranza filtra por periodo.
 IF NOT EXISTS (SELECT 1 FROM sys.indexes
                WHERE name = 'IX_fact_pagos_periodo' AND object_id = OBJECT_ID('gold.fact_pagos'))
 CREATE INDEX IX_fact_pagos_periodo ON gold.fact_pagos (fecha_compensacion);
 GO
-PRINT 'Table gold.fact_pagos ready (creada si faltaba, respetada si ya estaba).';
-GO
 
-
--- ========================================================================================
--- 2. gold.fact_facturas  -  lo que se DEBE. 1 fila = 1 linea de factura.
---
--- Dos poblaciones separadas por flag_compensada:
---   compensadas (bsad) -> historia completa desde 2022, tienen documento_compensacion
---   abiertas    (bsid) -> FOTO DEL PRESENTE, documento_compensacion NULL siempre
--- Las abiertas NO participan del puente (no tienen grupo). Estan para cartera y para la
--- regla REFERENCIA.
---
--- RESET DE COMPENSACION (FBRA): hay lineas que estan en bsad Y en bsid a la vez - se
--- compensaron y despues alguien deshizo la compensacion. GANA BSID, que es el estado de
--- hoy. Sin excluirlas del lado compensado la PK revienta, y peor: el modelo diria que
--- una factura esta pagada cuando sigue abierta.
---
--- Incluye D1 (deuda) ademas de F%. Las clases reales son F1-F5 y D1; F6 no existe.
--- ========================================================================================
--- IS NULL, no IS NOT NULL: si ya existe se respeta. Ver la nota de la cabecera.
+-- ----------------------------------------------------------------------------
+-- gold.fact_facturas
+-- Cleared invoices (bsad, full history) and open invoices (bsid, snapshot),
+-- split by flag_compensada. Classes F1-F5 and D1. A line in bsad and bsid at
+-- once: bsid wins. The effective-payment columns are filled by
+-- gold.load_fact_facturas_pago_efectivo, after the bridge.
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('gold.fact_facturas', 'U') IS NULL
 CREATE TABLE gold.fact_facturas (
     sociedad                VARCHAR(4)    NOT NULL,
@@ -799,24 +435,24 @@ CREATE TABLE gold.fact_facturas (
     ejercicio               INT           NOT NULL,
     documento_id            VARCHAR(10)   NOT NULL,
     posicion                INT           NOT NULL,
-
-    documento_compensacion  VARCHAR(10),   -- NULL en las abiertas, siempre
+    documento_compensacion  VARCHAR(10),   -- always NULL when open
     ejercicio_compensacion  INT,
-    clase_documento         VARCHAR(2)    NOT NULL,  -- distingue factura (F*) de deuda (D1)
-
+    clase_documento         VARCHAR(2)    NOT NULL,  -- F* invoice, D1 debt
     fecha_documento         DATE,
     fecha_vencimiento       DATE,
     fecha_contabilizacion   DATE,
     fecha_compensacion      DATE,
-
     monto                   DECIMAL(15,2) NOT NULL,
     clave_contabilizacion   VARCHAR(2),
     flag_compensada         BIT           NOT NULL,
-
     cliente_comercial_sk    INT,
     cliente_credito_sk      INT,
-
     fecha_carga             DATETIME DEFAULT GETDATE(),
+    fecha_pago_efectiva     DATE,          -- fecha_documento of the last payment that settled it
+    dias_pago               INT,           -- from due date; negative = paid before due
+    clasificacion_cobranza  VARCHAR(20),   -- PAGO_A_VENCIMIENTO / PAGO_A_MES / PAGO_ANTICIPADO
+    factura_key AS (CAST(sociedad AS VARCHAR(4)) + '|' + CAST(ejercicio AS VARCHAR(4)) + '|'
+                    + documento_id + '|' + CAST(posicion AS VARCHAR(6))) PERSISTED,   -- Power BI key
     CONSTRAINT PK_fact_facturas PRIMARY KEY CLUSTERED
         (sociedad, cliente_id, ejercicio, documento_id, posicion)
 );
@@ -830,55 +466,32 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes
                WHERE name = 'IX_fact_facturas_abiertas' AND object_id = OBJECT_ID('gold.fact_facturas'))
 CREATE INDEX IX_fact_facturas_abiertas ON gold.fact_facturas (flag_compensada, fecha_vencimiento);
 GO
-PRINT 'Table gold.fact_facturas ready (creada si faltaba, respetada si ya estaba).';
-GO
 
-
--- ========================================================================================
--- 3. gold.fact_aplicacion_pagos  -  EL PUENTE. 1 fila = 1 pago toco 1 factura.
---
--- SIN COLUMNA DE MONTO, a proposito (ver la cabecera del archivo).
---
--- PK = la PK del pago + la PK de la factura. Se ve pesada pero hace imposible el
--- duplicado por construccion. Con menos no alcanza: hay documentos de pago con dos
--- lineas apuntando al mismo grupo.
---
--- LAS TRES REGLAS (columna `regla`):
---   GRUPO          el grupo del pago YA contiene las facturas. Caso normal, 91% del dinero.
---   SEGUNDO_SALTO  el grupo del pago es un documento intermedio ("hijo") que reemite con
---                  lineas clave 15 hacia su propio grupo final, y ahi estan las facturas.
---   REFERENCIA     el hijo tiene una linea clave 15 ABIERTA con REBZG hacia una factura
---                  que TAMBIEN sigue abierta. Es el pago parcial.
--- Las tres usan llaves nativas de SAP. Cero reparto proporcional, cero heuristica.
---
--- QUE SIGNIFICA CADA FILA - leer antes de reportar:
---   GRUPO y SEGUNDO_SALTO dicen "este pago LIQUIDO esta factura".
---   REFERENCIA dice "este pago ABONO a esta factura, que sigue abierta".
--- GRUPO y SEGUNDO_SALTO son excluyentes entre si; REFERENCIA no lo es, a proposito: un
--- deposito puede liquidar tres facturas y abonar a una cuarta. Contar pagos por regla NO
--- suma al total, y es correcto que no sume.
--- ========================================================================================
--- IS NULL, no IS NOT NULL: si ya existe se respeta. Ver la nota de la cabecera.
+-- ----------------------------------------------------------------------------
+-- gold.fact_aplicacion_pagos
+-- One row = one payment touched one invoice. regla:
+--   GRUPO          the payment's clearing group holds the invoices
+--   SEGUNDO_SALTO  the group is a child document that clears on to a final group
+--   REFERENCIA     partial payment: an open key-15 line points to an open invoice
+-- GRUPO and SEGUNDO_SALTO settle the invoice; REFERENCIA pays part of it.
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('gold.fact_aplicacion_pagos', 'U') IS NULL
 CREATE TABLE gold.fact_aplicacion_pagos (
     sociedad                VARCHAR(4)  NOT NULL,
     cliente_id              VARCHAR(10) NOT NULL,
-
     ejercicio_pago          INT         NOT NULL,
     pago_id                 VARCHAR(10) NOT NULL,
     posicion_pago           INT         NOT NULL,
-
     ejercicio_factura       INT         NOT NULL,
     factura_id              VARCHAR(10) NOT NULL,
     posicion_factura        INT         NOT NULL,
-
-    -- El grupo donde REALMENTE esta la factura. En SEGUNDO_SALTO es el grupo final, no
-    -- el del pago: hace la cadena auditable hacia atras.
-    documento_compensacion  VARCHAR(10) NOT NULL,
+    documento_compensacion  VARCHAR(10) NOT NULL,   -- group where the invoice is (final group for SEGUNDO_SALTO)
     fecha_compensacion      DATE,
     regla                   VARCHAR(20) NOT NULL,
-
     fecha_carga             DATETIME DEFAULT GETDATE(),
+    -- No pago_key: a second relationship to fact_pagos makes Power BI refuse the model.
+    factura_key AS (CAST(sociedad AS VARCHAR(4)) + '|' + CAST(ejercicio_factura AS VARCHAR(4)) + '|'
+                    + factura_id + '|' + CAST(posicion_factura AS VARCHAR(6))) PERSISTED,
     CONSTRAINT PK_fact_aplicacion_pagos PRIMARY KEY CLUSTERED (
         sociedad, ejercicio_pago, pago_id, posicion_pago,
         ejercicio_factura, factura_id, posicion_factura
@@ -886,7 +499,6 @@ CREATE TABLE gold.fact_aplicacion_pagos (
 );
 GO
 
--- Para navegar en el otro sentido: que pagos liquidaron esta factura.
 IF NOT EXISTS (SELECT 1 FROM sys.indexes
                WHERE name = 'IX_fap_factura' AND object_id = OBJECT_ID('gold.fact_aplicacion_pagos'))
 CREATE INDEX IX_fap_factura ON gold.fact_aplicacion_pagos
@@ -896,45 +508,18 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes
                WHERE name = 'IX_fap_periodo' AND object_id = OBJECT_ID('gold.fact_aplicacion_pagos'))
 CREATE INDEX IX_fap_periodo ON gold.fact_aplicacion_pagos (fecha_compensacion, regla);
 GO
-PRINT 'Table gold.fact_aplicacion_pagos ready (creada si faltaba, respetada si ya estaba).';
-GO
 
-
--- ========================================================================================
--- 4. gold.fact_pagos_sin_aplicacion  -  por que este dinero no liquido ninguna factura.
---
--- ESTO ES COBRANZA, NO UN HUECO. El dinero SI entro (confirmado con el usuario
--- 2026-09-07): simplemente liquido documentos que no son factura de cliente - SA
--- (ajustes y comisiones) y AB (documentos de compensacion), mayormente de pasarela de
--- pago. Caso verificable en SAP: el pago <pago-14> de KUSHKY (~$354K) reparte en
--- tres grupos finales y en los tres el mayor debito es clase SA.
---
--- Por eso la etiqueta dice LIQUIDA_NO_FACTURA y NO "NO_IDENTIFICADO": la segunda
--- sugeriria que fallamos en encontrar algo, y no habia factura que encontrar.
---
--- MOTIVOS:
---   LIQUIDA_NO_FACTURA  el salto llega a un grupo cuyos debitos no son facturas
---   SIN_APLICACION      el grupo del pago no reenvia a ningun lado
---   CADENA_AMBIGUA      el intermedio recibio dinero de VARIOS pagos y se mezclo ahi
---                       dentro: no se puede decir cual financio que linea, y la guarda
---                       del puente los excluye a proposito. Agregada 2026-09-07 tras el
---                       backfill de 5 anios: 62 pagos / ~$3.1M caian en REVISAR
---                       solo por no tener etiqueta. NO son un caso desconocido - sabemos
---                       exactamente que son y decidimos no atribuirlos. En julio y agosto
---                       eran CERO; aparecen al mirar la historia completa.
---   LINEA_TECNICA       lineas cuya clave no es 11 ni 15 (debitos espejo 08, reversos 05)
---   REVISAR             caso desconocido. Debe dar 0 - si aparece, hay algo nuevo.
---
--- VA APARTE Y NO COMO FILAS DEL PUENTE: una fila del puente afirma "este pago toco ESTA
--- factura", y estos no tocaron ninguna. Meterlos obligaria a inventar un factura_id
--- centinela y a aflojar la PK.
--- Tampoco como columna de fact_pagos: el motivo se DERIVA de la logica de aplicacion, y
--- fact_pagos debe poder cargarse sola desde silver.
---
--- INVARIANTE DEL MODELO: todo pago esta en el puente O aqui, nunca en los dos ni en
--- ninguno, y los montos de ambos suman exactamente el total de fact_pagos.
--- ========================================================================================
--- IS NULL, no IS NOT NULL: si ya existe se respeta. Ver la nota de la cabecera.
+-- ----------------------------------------------------------------------------
+-- gold.fact_pagos_sin_aplicacion
+-- Money that came in and settled no customer invoice. motivo:
+--   LIQUIDA_NO_FACTURA    the chain reaches a group with no invoices (SA, AB)
+--   SIN_APLICACION        the payment's group leads nowhere
+--   CADENA_AMBIGUA        the intermediate document mixes several payments
+--   LINEA_TECNICA         key other than 11/15 (mirrors, reversals)
+--   PENDIENTE_DE_APLICAR  open payment, not applied yet
+--   REVISAR               unknown case; must be 0
+-- Every payment is in the bridge or here: never both, never neither.
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('gold.fact_pagos_sin_aplicacion', 'U') IS NULL
 CREATE TABLE gold.fact_pagos_sin_aplicacion (
     sociedad                VARCHAR(4)  NOT NULL,
@@ -942,12 +527,12 @@ CREATE TABLE gold.fact_pagos_sin_aplicacion (
     ejercicio               INT         NOT NULL,
     documento_id            VARCHAR(10) NOT NULL,
     posicion                INT         NOT NULL,
-
-    documento_compensacion  VARCHAR(10),   -- para trazar que SI liquido
+    documento_compensacion  VARCHAR(10),   -- what it did settle
     fecha_compensacion      DATE,
     motivo                  VARCHAR(24) NOT NULL,
-
     fecha_carga             DATETIME DEFAULT GETDATE(),
+    pago_key AS (CAST(sociedad AS VARCHAR(4)) + '|' + CAST(ejercicio AS VARCHAR(4)) + '|'
+                 + documento_id + '|' + CAST(posicion AS VARCHAR(6))) PERSISTED,   -- same expression as fact_pagos.pago_key
     CONSTRAINT PK_fact_pagos_sin_aplicacion PRIMARY KEY CLUSTERED
         (sociedad, cliente_id, ejercicio, documento_id, posicion)
 );
@@ -956,6 +541,4 @@ GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes
                WHERE name = 'IX_fpsa_periodo' AND object_id = OBJECT_ID('gold.fact_pagos_sin_aplicacion'))
 CREATE INDEX IX_fpsa_periodo ON gold.fact_pagos_sin_aplicacion (fecha_compensacion, motivo);
-GO
-PRINT 'Table gold.fact_pagos_sin_aplicacion ready (creada si faltaba, respetada si ya estaba).';
 GO

@@ -4,7 +4,8 @@
 (`gold.dim_tipo_documento`, `gold.fact_facturas`, `gold.fact_notas`,
 `gold.fact_pagos`, `gold.fact_aplicacion`) and their five loading procedures were
 dropped from the server on 2026-09-05 (script:
-`dwh_architecture/03_gold/drop_fact_aplicacion_v2.sql`), and their SQL files were
+`dwh_architecture/03_gold/drop_fact_aplicacion_v2.sql`, itself removed from the tree on
+2026-09-14 and kept in git history), and their SQL files were
 removed from the working tree. The user decided to re-approach the
 application-of-money logic from scratch.
 
@@ -24,8 +25,8 @@ a specification to follow.
 `alter_llaves_y_medidas_bi.sql` (`4601142`, never run on the server).
 
 **What survived in silver and is still live**: `clave_contabilizacion` (BSCHL) on
-`sap_bsad`/`sap_bsid` and the application fields on `sap_bsid`, added by
-`02_silver/alter_bsad_bsid_clave_contabilizacion.sql`. Those are source data, not
+`sap_bsad`/`sap_bsid` and the application fields on `sap_bsid`, added by a one-time
+ALTER script (retired 2026-09-14, in git history) and now part of `ddl_silver.sql`. Those are source data, not
 v2 logic, and any new design will want them.
 
 ---

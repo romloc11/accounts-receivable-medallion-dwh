@@ -1,22 +1,23 @@
+/* ============================================================================
+   Bronze tables
+   Purpose : Raw mirror of the SAP tables read from P01: same column names,
+             types and ORDER as the source.
+   Run     : on an empty server only. Every table is dropped and recreated, and
+             the history loaded by the backfills is lost.
+   Notes   : Column order is load-critical: the backfills insert with a
+             positional SELECT *. Generate new tables with
+             generar_ddl_desde_p01.sql, never by hand.
+             Load logging lives in 00_control/ddl_control.sql.
+   ============================================================================ */
 USE ANALISIS_DATOS;
 GO
 
-/*
-===============================================================================
-PROJECT: Enterprise Data Warehouse (dwh-ciosa)
-LAYER: Bronze (Raw Data Staging)
-AUTHOR: Roman Alejandro Lopez
-DESCRIPTION: DDL creation for the general customer master table using 
-             the exact nvarchar and decimal structural metadata from SAP.
-===============================================================================
-*/
 
-
-  
--- ============================================================================
--- 1. TABLE: bronze.sap_kna1 (Customer - COMPLETE)
--- ============================================================================
-IF OBJECT_ID('bronze.sap_kna1', 'U') IS NOT NULL 
+-- ----------------------------------------------------------------------------
+-- bronze.sap_kna1
+-- Customer master (KNA1). Full reload.
+-- ----------------------------------------------------------------------------
+IF OBJECT_ID('bronze.sap_kna1', 'U') IS NOT NULL
     DROP TABLE bronze.sap_kna1;
 GO
 
@@ -205,13 +206,13 @@ CREATE TABLE bronze.sap_kna1 (
     PSOO5               NVARCHAR(50),
     CONSTRAINT PK_sap_kna1 PRIMARY KEY CLUSTERED (MANDT, KUNNR)
 );
-PRINT 'Table bronze.sap_kna1 created successfully using exact SAP lengths.';
 GO
-  
--- ============================================================================
--- 2. TABLE: bronze.sap_knvp (Customer Partner Functions - COMPLETE)
--- ============================================================================
-IF OBJECT_ID('bronze.sap_knvp', 'U') IS NOT NULL 
+
+-- ----------------------------------------------------------------------------
+-- bronze.sap_knvp
+-- Customer partner functions (KNVP). Full reload.
+-- ----------------------------------------------------------------------------
+IF OBJECT_ID('bronze.sap_knvp', 'U') IS NOT NULL
     DROP TABLE bronze.sap_knvp;
 GO
 
@@ -223,7 +224,7 @@ CREATE TABLE bronze.sap_knvp (
     SPART      NVARCHAR(2) NOT NULL,
     PARVW      NVARCHAR(2) NOT NULL,
     PARZA      NVARCHAR(3) NOT NULL,
-    KUNN2      NVARCHAR(10), -- Mapped exactly as KUNN2 from your extraction
+    KUNN2      NVARCHAR(10),
     LIFNR      NVARCHAR(10),
     PERNR      NVARCHAR(8),
     PARNR      NVARCHAR(10),
@@ -231,13 +232,13 @@ CREATE TABLE bronze.sap_knvp (
     DEFPA      NVARCHAR(1),
     CONSTRAINT PK_sap_knvp PRIMARY KEY CLUSTERED (MANDT, KUNNR, VKORG, VTWEG, SPART, PARVW, PARZA)
 );
-PRINT 'Table bronze.sap_knvp created successfully using exact SAP lengths.';
 GO
 
--- ============================================================================
--- 3. TABLE: bronze.sap_knkk (Customer Credit Control Data - COMPLETE)
--- ============================================================================
-IF OBJECT_ID('bronze.sap_knkk', 'U') IS NOT NULL 
+-- ----------------------------------------------------------------------------
+-- bronze.sap_knkk
+-- Customer credit control (KNKK). Full reload.
+-- ----------------------------------------------------------------------------
+IF OBJECT_ID('bronze.sap_knkk', 'U') IS NOT NULL
     DROP TABLE bronze.sap_knkk;
 GO
 
@@ -280,15 +281,13 @@ CREATE TABLE bronze.sap_knkk (
     ABSBT      DECIMAL(15,2),
     CONSTRAINT PK_sap_knkk PRIMARY KEY CLUSTERED (MANDT, KUNNR, KKBER)
 );
-PRINT 'Table bronze.sap_knkk created successfully using exact SAP lengths.';
 GO
 
-
-
--- ============================================================================
--- 4. TABLE: bronze.sap_knvv (Customer Sales Data - EXACT SOURCE STRUCTURE)
--- ============================================================================
-IF OBJECT_ID('bronze.sap_knvv', 'U') IS NOT NULL 
+-- ----------------------------------------------------------------------------
+-- bronze.sap_knvv
+-- Customer sales data (KNVV). Full reload.
+-- ----------------------------------------------------------------------------
+IF OBJECT_ID('bronze.sap_knvv', 'U') IS NOT NULL
     DROP TABLE bronze.sap_knvv;
 GO
 
@@ -372,13 +371,14 @@ CREATE TABLE bronze.sap_knvv (
     [/BEV1/EMLGFORTS]  NVARCHAR(1),
     CONSTRAINT PK_sap_knvv PRIMARY KEY CLUSTERED (MANDT, KUNNR, VKORG, VTWEG, SPART)
 );
-PRINT 'Table bronze.sap_knvv created successfully using exact SAP source structure.';
 GO
 
--- ============================================================================
--- 5. TABLE: bronze.sap_bsid (Open Items - Accounts Receivable - COMPLETE)
--- ============================================================================
-IF OBJECT_ID('bronze.sap_bsid', 'U') IS NOT NULL DROP TABLE bronze.sap_bsid;
+-- ----------------------------------------------------------------------------
+-- bronze.sap_bsid
+-- Open customer items (BSID). Full reload: a paid item leaves BSID.
+-- ----------------------------------------------------------------------------
+IF OBJECT_ID('bronze.sap_bsid', 'U') IS NOT NULL
+    DROP TABLE bronze.sap_bsid;
 GO
 
 CREATE TABLE bronze.sap_bsid (
@@ -563,16 +563,16 @@ CREATE TABLE bronze.sap_bsid (
     PROPMANO        NVARCHAR(13),
     CONSTRAINT PK_sap_bsid PRIMARY KEY CLUSTERED (MANDT, BUKRS, KUNNR, GJAHR, BELNR, BUZEI)
 );
-PRINT 'Table bronze.sap_bsid created successfully.';
 GO
 
--- ============================================================================
--- 6. TABLE: bronze.sap_bsad (Cleared Items - Accounts Receivable - COMPLETE)
--- ============================================================================
-IF OBJECT_ID('bronze.sap_bsad', 'U') IS NOT NULL DROP TABLE bronze.sap_bsad;
+-- ----------------------------------------------------------------------------
+-- bronze.sap_bsad
+-- Cleared customer items (BSAD). Merge by AUGDT; history via bronze.backfill_bsad.
+-- ----------------------------------------------------------------------------
+IF OBJECT_ID('bronze.sap_bsad', 'U') IS NOT NULL
+    DROP TABLE bronze.sap_bsad;
 GO
 
--- We duplicate the exact structure since SAP BSAD and BSID share the same technical layout
 CREATE TABLE bronze.sap_bsad (
     MANDT           NVARCHAR(3) NOT NULL,
     BUKRS           NVARCHAR(4) NOT NULL,
@@ -755,12 +755,12 @@ CREATE TABLE bronze.sap_bsad (
     PROPMANO        NVARCHAR(13),
     CONSTRAINT PK_sap_bsad PRIMARY KEY CLUSTERED (MANDT, BUKRS, KUNNR, GJAHR, BELNR, BUZEI)
 );
-PRINT 'Table bronze.sap_bsad created successfully.';
 GO
 
--- ============================================================================
--- 7. TABLE: bronze.sap_knb1 (Customer Master - Company Code Data - COMPLETE)
--- ============================================================================
+-- ----------------------------------------------------------------------------
+-- bronze.sap_knb1
+-- Customer company code data (KNB1). Full reload.
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('bronze.sap_knb1', 'U') IS NOT NULL
     DROP TABLE bronze.sap_knb1;
 GO
@@ -845,12 +845,12 @@ CREATE TABLE bronze.sap_knb1 (
     GMVKZD      NVARCHAR(1),
     CONSTRAINT PK_sap_knb1 PRIMARY KEY CLUSTERED (MANDT, BUKRS, KUNNR)
 );
-PRINT 'Table bronze.sap_knb1 created successfully using exact SAP lengths.';
 GO
 
--- ============================================================================
--- 8. TABLE: bronze.sap_knb5 (Customer Master - Dunning Data - COMPLETE)
--- ============================================================================
+-- ----------------------------------------------------------------------------
+-- bronze.sap_knb5
+-- Customer dunning data (KNB5). Full reload.
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('bronze.sap_knb5', 'U') IS NOT NULL
     DROP TABLE bronze.sap_knb5;
 GO
@@ -869,194 +869,12 @@ CREATE TABLE bronze.sap_knb5 (
     BUSAB       NVARCHAR(2),
     CONSTRAINT PK_sap_knb5 PRIMARY KEY CLUSTERED (MANDT, KUNNR, BUKRS, MABER)
 );
-PRINT 'Table bronze.sap_knb5 created successfully using exact SAP lengths.';
 GO
 
--- ============================================================================
--- NOTE: bronze.sap_ausp (Characteristic Values / Classification System)
--- IS NOT IMPLEMENTED AS "payment assignment".
--- In real SAP, AUSP belongs to the CA-CL (Classification) module and stores
--- characteristic values assigned to objects (OBJEK, ATINN, ATWRT, etc.),
--- with no relationship to payment or clearing documents.
--- The "which invoice was paid with which document" link that AUSP was being
--- sought for is ALREADY covered by the AUGBL (clearing document) and AUGDT
--- (clearing date) fields present in bronze.sap_bsad (cleared items).
--- If partial-payment/application traceability is needed in the future,
--- consider adding BSEG (see the exclusion note below) or REGUH/REGUP (payment proposal).
--- ============================================================================
-
--- ============================================================================
--- NOTE: bronze.sap_bseg IS NOT IMPLEMENTED.
--- BSEG is a cluster table in SAP ECC (RFBLG cluster); its data is stored
--- compressed in binary format and is NOT accessible via direct SQL against
--- the p01 replica (verified: only RFBLG exists as a binary blob, plus
--- screen work tables like VBSEGK/VBSEGD/VBSEGS/EBSEG, none with the real
--- historical detail). Extracting it would require an ABAP-level extractor
--- (RFC_READ_TABLE, a BW extractor like 0FI_GL_4, or SLT in ABAP mode).
--- Bronze's current scope is AR (accounts receivable), already covered at
--- the line-item level by bronze.sap_bsid (open items) and
--- bronze.sap_bsad (cleared items), both transparent tables. If GL/vendor
--- detail outside AR is needed in the future, consider getting ABAP access
--- to BSEG at that point.
--- ============================================================================
-
--- ============================================================================
--- NOTE: bronze.sap_bkpf IS NOW IMPLEMENTED (see table 11 at the end of this file).
--- It was brought back 2026-09-11 with a concrete use case: BSAD/BSID carry the
--- payment LINES but not the document header, so there is no way to know which
--- document reverses which (STBLG/STJAH/STGRD) or which transaction created a
--- document (TCODE/USNAM). Without that, reversals had to be matched by guessing
--- on customer+amount+assignment: 73 of 188 clave-05 reversals came out ambiguous
--- and 46 had no match at all, which left one month $4.16M off.
--- TCODE also settles, with evidence instead of inference, why some payment lines
--- carry posting key 11 and others 15: in August 2026 all 10,553 key-11 lines were
--- created by OS_APPLICATION (the automatic deposit program) and the key-15 ones by
--- FBZ1/FB05 (manual posting / posting with clearing).
---
--- SCOPE: only BLART = 'DZ' is loaded. Full BKPF is the accounting journal for the
--- WHOLE company: 35.6M rows x 111 columns, against ~1.25M for DZ alone. Copying all
--- of it to answer a payments question would be expensive on an instance that already
--- has transaction-log limits. Widening the scope is a one-line change in the WHERE of
--- bronze.load_bronze and bronze.backfill_bkpf - but do it only when something
--- concrete consumes it, which is exactly the reason this table was dropped the
--- first time around.
---
--- NOTE: bronze.sap_vbrk / bronze.sap_vbrp ARE STILL NOT IMPLEMENTED.
--- They were designed, verified column by column against P01, and left ready
--- to go (including a yearly historical backfill procedure), but were
--- dropped from scope because no silver/gold table consumes them: the
--- project's current scope is AR/Credit & Collections + customer master,
--- already covered by kna1/knvp/knkk/knvv/knb1/knb5/bsid/bsad. bkpf is the
--- accounting journal for the ENTIRE company (not just AR) and vbrk/vbrp is
--- sales billing detail (SD module) - both outside the declared scope.
--- If a concrete use case that needs them comes up in the future, pick it
--- back up from the conversation history/version control: the structure
--- verification against SAP is already done, it just needs to be
--- reintegrated.
--- ============================================================================
-
--- ============================================================================
--- 9. SCHEMA/TABLE: control.sap_load_control (Bronze Load Auditing)
--- PURPOSE: Record every load run per table (full/incremental), its result
---          (SUCCESS/FAILED), rows processed, duration, and, for incremental
---          tables, the "highwater mark" (last date value loaded) so the
---          next run only pulls what's new.
--- ============================================================================
-IF OBJECT_ID('control.sap_load_control', 'U') IS NOT NULL
-    DROP TABLE control.sap_load_control;
-GO
-
-CREATE TABLE control.sap_load_control (
-    load_id             INT IDENTITY(1,1) NOT NULL,
-    table_name          NVARCHAR(128) NOT NULL,
-    load_type           NVARCHAR(20)  NOT NULL,  -- FULL / INCREMENTAL
-    load_status         NVARCHAR(10)  NOT NULL,  -- SUCCESS / FAILED
-    rows_processed      INT NULL,
-    start_time          DATETIME2 NOT NULL,
-    end_time            DATETIME2 NULL,
-    duration_seconds     INT NULL,
-    last_loaded_value    NVARCHAR(50) NULL,       -- highwater mark (e.g. max BUDAT/FKDAT loaded)
-    error_message       NVARCHAR(4000) NULL,
-    load_date           DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
-    CONSTRAINT PK_sap_load_control PRIMARY KEY CLUSTERED (load_id)
-);
-GO
-
-CREATE INDEX idx_load_control_table ON control.sap_load_control(table_name, load_date DESC);
-GO
-
-PRINT 'Table control.sap_load_control created successfully.';
-GO
-
--- ============================================================================
--- 10. PROCEDURE: control.sp_log_load
--- PURPOSE: Insert one audit record for each table loaded in Bronze.
---
--- WARNING (confirmed empirically): calling this procedure from INSIDE
--- another procedure (e.g. bronze.load_bronze) breaks compilation on this
--- SQL Server 2012 instance, with a misleading "Incorrect syntax near ')'"
--- error whose reported line number doesn't point to the real problem.
--- That's why bronze.load_bronze does NOT call this proc (see the header of
--- sp_load_bronze.sql). The proc itself compiles and can presumably be run
--- in isolation (its own batch, literal arguments). If audit logging needs
--- to be picked back up, try that first, in complete isolation, BEFORE
--- re-integrating it inside a load procedure.
--- ============================================================================
-IF OBJECT_ID('control.sp_log_load', 'P') IS NOT NULL
-    DROP PROCEDURE control.sp_log_load;
-GO
-
-CREATE PROCEDURE control.sp_log_load
-    @table_name         NVARCHAR(128),
-    @load_type          NVARCHAR(20),
-    @load_status        NVARCHAR(10),
-    @rows_processed     INT = NULL,
-    @start_time         DATETIME2,
-    @end_time           DATETIME2,
-    @last_loaded_value  NVARCHAR(50) = NULL,
-    @error_message      NVARCHAR(4000) = NULL
-AS
-BEGIN
-    SET NOCOUNT ON;
-
-    INSERT INTO control.sap_load_control (
-        table_name, load_type, load_status, rows_processed,
-        start_time, end_time, duration_seconds, last_loaded_value, error_message
-    )
-    VALUES (
-        @table_name, @load_type, @load_status, @rows_processed,
-        @start_time, @end_time, DATEDIFF(SECOND, @start_time, @end_time),
-        @last_loaded_value, @error_message
-    );
-END;
-GO
-
-PRINT 'Procedure control.sp_log_load created successfully.';
-GO
-
--- ============================================================================
--- 11. FUNCTION: control.fn_get_last_loaded_value
--- PURPOSE: Returns the last "highwater mark" logged with SUCCESS for an
---          incremental table (e.g. the max date already loaded), used to
---          filter only new records on the next run.
---          Returns '19000101' if the table has never been loaded (initial full load).
--- ============================================================================
-IF OBJECT_ID('control.fn_get_last_loaded_value', 'FN') IS NOT NULL
-    DROP FUNCTION control.fn_get_last_loaded_value;
-GO
-
-CREATE FUNCTION control.fn_get_last_loaded_value(@table_name NVARCHAR(128))
-RETURNS NVARCHAR(50)
-AS
-BEGIN
-    DECLARE @result NVARCHAR(50);
-
-    SELECT TOP 1 @result = last_loaded_value
-    FROM control.sap_load_control
-    WHERE table_name = @table_name
-      AND load_status = 'SUCCESS'
-      AND last_loaded_value IS NOT NULL
-    ORDER BY load_date DESC;
-
-    RETURN ISNULL(@result, '19000101');
-END;
-GO
-
-PRINT 'Function control.fn_get_last_loaded_value created successfully.';
-GO
-
--- ============================================================================
--- 12. TABLE: bronze.sap_tvv1t (Route Text / Customer Group 1 - COMPLETE)
--- PURPOSE: Standard SAP text table (translates KVGR1 into its readable
---          name, BEZEI). Added to resolve the real name of the "route"
---          used by the credit/collections department in its
---          active/legal/inactive customer classification
---          (silver.sap_knvv.ruta = KVGR1 is just the short 3-character
---          code, not the name like "CC131-E04" used in the business
---          rules).
--- Structure verified against real p01 (not guessed):
---   MANDT NVARCHAR(3), SPRAS NVARCHAR(1), KVGR1 NVARCHAR(3), BEZEI NVARCHAR(20)
--- ============================================================================
+-- ----------------------------------------------------------------------------
+-- bronze.sap_tvv1t
+-- Route names (TVV1T): KVGR1 code to readable name. Full reload.
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('bronze.sap_tvv1t', 'U') IS NOT NULL
     DROP TABLE bronze.sap_tvv1t;
 GO
@@ -1068,25 +886,13 @@ CREATE TABLE bronze.sap_tvv1t (
     BEZEI      NVARCHAR(20),
     CONSTRAINT PK_sap_tvv1t PRIMARY KEY CLUSTERED (MANDT, SPRAS, KVGR1)
 );
-PRINT 'Table bronze.sap_tvv1t created successfully using exact SAP lengths.';
 GO
 
--- ============================================================================
--- 13. TABLE: bronze.sap_pa0001 (Infotype 0001 - HR Organizational Assignment - COMPLETE)
--- PURPOSE: Standard SAP HR infotype. Added solely to resolve PERNR -> the
---          employee's real name (ENAME column) used in silver.sap_knvp's
---          partner functions (VE=salesperson, E1=credit executive,
---          GR=sales manager, CC=collector), which is exactly what the
---          active/legal/inactive customer classification needs (see
---          ciosa.py). The full structure is brought in for consistency
---          with the rest of bronze (exact SAP mirror), even though silver
---          will only use MANDT/PERNR/ENAME/BEGDA/ENDDA.
---          It's a date-effective infotype (BEGDA/ENDDA): the same PERNR
---          can have several historical rows, silver must filter for the
---          currently effective record.
--- Structure verified against real p01 (not guessed), 51 columns.
--- Primary key: standard SAP infotype structure (PSKEY).
--- ============================================================================
+-- ----------------------------------------------------------------------------
+-- bronze.sap_pa0001
+-- HR org assignment (PA0001): PERNR to employee name. Date-effective;
+-- silver keeps the current record. Full reload.
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('bronze.sap_pa0001', 'U') IS NOT NULL
     DROP TABLE bronze.sap_pa0001;
 GO
@@ -1145,18 +951,16 @@ CREATE TABLE bronze.sap_pa0001 (
     SGMNT      NVARCHAR(10),
     CONSTRAINT PK_sap_pa0001 PRIMARY KEY CLUSTERED (MANDT, PERNR, SUBTY, OBJPS, ENDDA, BEGDA, SEQNR)
 );
-PRINT 'Table bronze.sap_pa0001 created successfully using exact SAP lengths.';
 GO
 
--- ============================================================================
--- 11. TABLE: bronze.sap_bkpf (Accounting Document Header - COMPLETE)
--- ============================================================================
-IF OBJECT_ID('bronze.sap_bkpf', 'U') IS NOT NULL DROP TABLE bronze.sap_bkpf;
+-- ----------------------------------------------------------------------------
+-- bronze.sap_bkpf
+-- Document headers (BKPF), DZ only. Merge by BUDAT; history via bronze.backfill_bkpf.
+-- ----------------------------------------------------------------------------
+IF OBJECT_ID('bronze.sap_bkpf', 'U') IS NOT NULL
+    DROP TABLE bronze.sap_bkpf;
 GO
 
--- Column list and order taken directly from P01.p01.BKPF: bronze.backfill_bkpf
--- does a positional INSERT ... SELECT * (same reason as BSAD - see that backfill),
--- so the order here is not cosmetic, it's load-critical.
 CREATE TABLE bronze.sap_bkpf (
     MANDT            NVARCHAR(3) NOT NULL,
     BUKRS            NVARCHAR(4) NOT NULL,
@@ -1271,5 +1075,198 @@ CREATE TABLE bronze.sap_bkpf (
     KNUMV            NVARCHAR(10),
     CONSTRAINT PK_sap_bkpf PRIMARY KEY CLUSTERED (MANDT, BUKRS, BELNR, GJAHR)
 );
-PRINT 'Table bronze.sap_bkpf created successfully.';
+GO
+
+-- ----------------------------------------------------------------------------
+-- bronze.sap_bsas
+-- Cleared G/L lines, cash accounts 111xxx/113xxx (BSAS). Merge by AUGDT;
+-- history via bronze.backfill_bsas.
+-- Key is 6 columns, not P01's 9 (BSAS~0 adds AUGDT, AUGBL, ZUONR): those
+-- change when a line is re-cleared or reassigned and would duplicate it.
+-- ----------------------------------------------------------------------------
+IF OBJECT_ID('bronze.sap_bsas', 'U') IS NOT NULL
+    DROP TABLE bronze.sap_bsas;
+GO
+
+CREATE TABLE bronze.sap_bsas (
+    MANDT       NVARCHAR(3) NOT NULL,
+    BUKRS       NVARCHAR(4) NOT NULL,
+    HKONT       NVARCHAR(10) NOT NULL,
+    AUGDT       NVARCHAR(8),
+    AUGBL       NVARCHAR(10),
+    ZUONR       NVARCHAR(18),
+    GJAHR       NVARCHAR(4) NOT NULL,
+    BELNR       NVARCHAR(10) NOT NULL,
+    BUZEI       NVARCHAR(3) NOT NULL,
+    BUDAT       NVARCHAR(8),
+    BLDAT       NVARCHAR(8),
+    WAERS       NVARCHAR(5),
+    XBLNR       NVARCHAR(16),
+    BLART       NVARCHAR(2),
+    MONAT       NVARCHAR(2),
+    BSCHL       NVARCHAR(2),
+    SHKZG       NVARCHAR(1),
+    GSBER       NVARCHAR(4),
+    MWSKZ       NVARCHAR(2),
+    FKONT       NVARCHAR(3),
+    DMBTR       DECIMAL(13,2),
+    WRBTR       DECIMAL(13,2),
+    MWSTS       DECIMAL(13,2),
+    WMWST       DECIMAL(13,2),
+    SGTXT       NVARCHAR(50),
+    PROJN       NVARCHAR(16),
+    AUFNR       NVARCHAR(12),
+    WERKS       NVARCHAR(4),
+    KOSTL       NVARCHAR(10),
+    ZFBDT       NVARCHAR(8),
+    XOPVW       NVARCHAR(1),
+    VALUT       NVARCHAR(8),
+    BSTAT       NVARCHAR(1),
+    BDIFF       DECIMAL(13,2),
+    BDIF2       DECIMAL(13,2),
+    VBUND       NVARCHAR(6),
+    PSWSL       NVARCHAR(5),
+    WVERW       NVARCHAR(1),
+    DMBE2       DECIMAL(13,2),
+    DMBE3       DECIMAL(13,2),
+    MWST2       DECIMAL(13,2),
+    MWST3       DECIMAL(13,2),
+    BDIF3       DECIMAL(13,2),
+    RDIF3       DECIMAL(13,2),
+    XRAGL       NVARCHAR(1),
+    PROJK       NVARCHAR(8),
+    PRCTR       NVARCHAR(10),
+    XSTOV       NVARCHAR(1),
+    XARCH       NVARCHAR(1),
+    PSWBT       DECIMAL(13,2),
+    XNEGP       NVARCHAR(1),
+    RFZEI       NVARCHAR(3),
+    CCBTC       NVARCHAR(10),
+    XREF3       NVARCHAR(20),
+    BUPLA       NVARCHAR(4),
+    PPDIFF      DECIMAL(13,2),
+    PPDIF2      DECIMAL(13,2),
+    PPDIF3      DECIMAL(13,2),
+    BEWAR       NVARCHAR(3),
+    IMKEY       NVARCHAR(8),
+    DABRZ       NVARCHAR(8),
+    INTRENO     NVARCHAR(13),
+    GRANT_NBR   NVARCHAR(20),
+    FKBER       NVARCHAR(16),
+    FIPOS       NVARCHAR(14),
+    FISTL       NVARCHAR(16),
+    GEBER       NVARCHAR(10),
+    PPRCT       NVARCHAR(10),
+    BUZID       NVARCHAR(1),
+    AUGGJ       NVARCHAR(4),
+    UZAWE       NVARCHAR(2),
+    SEGMENT     NVARCHAR(10),
+    PSEGMENT    NVARCHAR(10),
+    PGEBER      NVARCHAR(10),
+    PGRANT_NBR  NVARCHAR(20),
+    MEASURE     NVARCHAR(24),
+    BUDGET_PD   NVARCHAR(10),
+    PBUDGET_PD  NVARCHAR(10),
+    FIPEX       NVARCHAR(24),
+    PRODPER     NVARCHAR(6),
+    QSSKZ       NVARCHAR(2),
+    PROPMANO    NVARCHAR(13),
+    CONSTRAINT PK_sap_bsas PRIMARY KEY CLUSTERED (MANDT, BUKRS, HKONT, GJAHR, BELNR, BUZEI)
+);
+GO
+
+-- ----------------------------------------------------------------------------
+-- bronze.sap_bsis
+-- Open G/L lines, cash accounts 111xxx/113xxx (BSIS). Same columns as BSAS;
+-- loaded in two steps (see bronze.load_bronze).
+-- ----------------------------------------------------------------------------
+IF OBJECT_ID('bronze.sap_bsis', 'U') IS NOT NULL
+    DROP TABLE bronze.sap_bsis;
+GO
+
+CREATE TABLE bronze.sap_bsis (
+    MANDT       NVARCHAR(3) NOT NULL,
+    BUKRS       NVARCHAR(4) NOT NULL,
+    HKONT       NVARCHAR(10) NOT NULL,
+    AUGDT       NVARCHAR(8),
+    AUGBL       NVARCHAR(10),
+    ZUONR       NVARCHAR(18),
+    GJAHR       NVARCHAR(4) NOT NULL,
+    BELNR       NVARCHAR(10) NOT NULL,
+    BUZEI       NVARCHAR(3) NOT NULL,
+    BUDAT       NVARCHAR(8),
+    BLDAT       NVARCHAR(8),
+    WAERS       NVARCHAR(5),
+    XBLNR       NVARCHAR(16),
+    BLART       NVARCHAR(2),
+    MONAT       NVARCHAR(2),
+    BSCHL       NVARCHAR(2),
+    SHKZG       NVARCHAR(1),
+    GSBER       NVARCHAR(4),
+    MWSKZ       NVARCHAR(2),
+    FKONT       NVARCHAR(3),
+    DMBTR       DECIMAL(13,2),
+    WRBTR       DECIMAL(13,2),
+    MWSTS       DECIMAL(13,2),
+    WMWST       DECIMAL(13,2),
+    SGTXT       NVARCHAR(50),
+    PROJN       NVARCHAR(16),
+    AUFNR       NVARCHAR(12),
+    WERKS       NVARCHAR(4),
+    KOSTL       NVARCHAR(10),
+    ZFBDT       NVARCHAR(8),
+    XOPVW       NVARCHAR(1),
+    VALUT       NVARCHAR(8),
+    BSTAT       NVARCHAR(1),
+    BDIFF       DECIMAL(13,2),
+    BDIF2       DECIMAL(13,2),
+    VBUND       NVARCHAR(6),
+    PSWSL       NVARCHAR(5),
+    WVERW       NVARCHAR(1),
+    DMBE2       DECIMAL(13,2),
+    DMBE3       DECIMAL(13,2),
+    MWST2       DECIMAL(13,2),
+    MWST3       DECIMAL(13,2),
+    BDIF3       DECIMAL(13,2),
+    RDIF3       DECIMAL(13,2),
+    XRAGL       NVARCHAR(1),
+    PROJK       NVARCHAR(8),
+    PRCTR       NVARCHAR(10),
+    XSTOV       NVARCHAR(1),
+    XARCH       NVARCHAR(1),
+    PSWBT       DECIMAL(13,2),
+    XNEGP       NVARCHAR(1),
+    RFZEI       NVARCHAR(3),
+    CCBTC       NVARCHAR(10),
+    XREF3       NVARCHAR(20),
+    BUPLA       NVARCHAR(4),
+    PPDIFF      DECIMAL(13,2),
+    PPDIF2      DECIMAL(13,2),
+    PPDIF3      DECIMAL(13,2),
+    BEWAR       NVARCHAR(3),
+    IMKEY       NVARCHAR(8),
+    DABRZ       NVARCHAR(8),
+    INTRENO     NVARCHAR(13),
+    GRANT_NBR   NVARCHAR(20),
+    FKBER       NVARCHAR(16),
+    FIPOS       NVARCHAR(14),
+    FISTL       NVARCHAR(16),
+    GEBER       NVARCHAR(10),
+    PPRCT       NVARCHAR(10),
+    BUZID       NVARCHAR(1),
+    AUGGJ       NVARCHAR(4),
+    UZAWE       NVARCHAR(2),
+    SEGMENT     NVARCHAR(10),
+    PSEGMENT    NVARCHAR(10),
+    PGEBER      NVARCHAR(10),
+    PGRANT_NBR  NVARCHAR(20),
+    MEASURE     NVARCHAR(24),
+    BUDGET_PD   NVARCHAR(10),
+    PBUDGET_PD  NVARCHAR(10),
+    FIPEX       NVARCHAR(24),
+    PRODPER     NVARCHAR(6),
+    QSSKZ       NVARCHAR(2),
+    PROPMANO    NVARCHAR(13),
+    CONSTRAINT PK_sap_bsis PRIMARY KEY CLUSTERED (MANDT, BUKRS, HKONT, GJAHR, BELNR, BUZEI)
+);
 GO

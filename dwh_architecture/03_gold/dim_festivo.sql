@@ -1,39 +1,13 @@
+/* ============================================================================
+   gold.dim_festivo
+   Purpose : Hand-maintained list of Mexican non-working days, official (LFT
+             art. 74) and banking (CNBV), 2022-2030. gold.load_dim_fecha reads it.
+   Run     : before the first gold.load_dim_fecha, and again after adding rows.
+   Notes   : Validated against collections per day 2023-2026: a holiday brings
+             0.5% of a normal business day, less than a Saturday (0.9%).
+   ============================================================================ */
 USE ANALISIS_DATOS;
 GO
-
-/*
-========================================================================================
-gold.dim_festivo  -  calendario de dias inhabiles  (2026-09-08)
-========================================================================================
-Lista MANTENIDA A MANO de festivos oficiales (LFT art. 74) y bancarios (CNBV).
-Cubre 2022-2030. Para extenderla: agregar filas aqui y volver a correr el archivo -
-el INSERT solo mete las fechas que faltan, no pisa lo que ya existe.
-
---- ESTA LISTA ESTA VALIDADA CONTRA LOS DATOS, NO SUPUESTA ---
-Se comparo la cobranza real por dia (gold.fact_pagos, fecha_documento) 2023-2026:
-
-    dia habil normal      921 dias   $7.57M promedio   100%
-    sabado                189 dias   $0.07M              0.9%
-    FESTIVO en dia habil   29 dias   $0.04M              0.5%
-    domingo               137 dias   $0.02M              0.2%
-
-Los festivos estan MAS muertos que un sabado. Uno por uno tampoco hay falsos
-positivos: el mas "vivo" es Virgen de Guadalupe con $146K promedio (1.9% de un dia
-normal); el resto va de $7K a $51K. Si algun ano se agrega un festivo que no cumpla
-esto, sobra en la lista.
-
-Y al reves: se buscaron dias ENTRE SEMANA con cobranza bajo el 20% que NO estuvieran
-en la lista. En 3.5 anos aparecio UNO SOLO, 2024-10-01 (0.6%), que es la transmision
-del Poder Ejecutivo - la reforma de 2019 la movio del 1-dic al 1-OCT y aplico por
-primera vez en 2024. Ya esta incluido. Que solo falte uno es la evidencia de que la
-lista esta completa para este negocio.
-
---- POR QUE TABLA Y NO UN CASE EN EL PROC ---
-Agregar un festivo tiene que ser un INSERT, no una recompilacion de gold.load_dim_fecha.
-Ademas los bancarios cambian por circular de CNBV y los de Semana Santa se mueven cada
-ano (Pascua), asi que la lista se toca seguido.
-========================================================================================
-*/
 
 IF OBJECT_ID('gold.dim_festivo', 'U') IS NULL
 CREATE TABLE gold.dim_festivo (
@@ -44,7 +18,7 @@ CREATE TABLE gold.dim_festivo (
 );
 GO
 
--- Solo inserta lo que falta: re-ejecutable, y no pisa festivos agregados a mano.
+-- Inserts only the missing dates: re-runnable, never overwrites a row added by hand.
 INSERT INTO gold.dim_festivo (fecha, nombre, tipo)
 SELECT v.fecha, v.nombre, v.tipo
 FROM (VALUES
@@ -153,5 +127,6 @@ FROM (VALUES
 WHERE NOT EXISTS (SELECT 1 FROM gold.dim_festivo f WHERE f.fecha = v.fecha);
 GO
 
+-- Check: holidays per year.
 SELECT anio = YEAR(fecha), festivos = COUNT(*) FROM gold.dim_festivo GROUP BY YEAR(fecha) ORDER BY 1;
 GO

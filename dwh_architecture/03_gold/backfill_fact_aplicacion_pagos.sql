@@ -1,45 +1,25 @@
+/* ============================================================================
+   Backfill of the payment application model
+   Purpose : Loads gold.fact_facturas, fact_pagos, fact_aplicacion_pagos and
+             fact_pagos_sin_aplicacion from 2022 on.
+   Run     : block by block, in order, checking the output of each one:
+               1. fact_facturas cleared, one year at a time
+               2. fact_facturas open
+               3. per year: pagos -> aplicacion -> sin_aplicacion
+               4. effective payment date, per year
+               5. checks
+             Every block deletes what it loads first: any block can be re-run.
+   Notes   : Step 1 does not use gold.load_fact_facturas: it ignores
+             @fecha_hasta, so a call from 2022 would be one 3.2M-row INSERT
+             against a 2 GB log.
+             All invoices must be loaded before the first bridge year: a 2022
+             payment can reach a 2023 invoice through the second hop.
+             Msg 9002 (log full): CHECKPOINT, then split that year in halves.
+   ============================================================================ */
 USE ANALISIS_DATOS;
 GO
 
-/*
-========================================================================================
-BACKFILL HISTORICO del modelo de aplicacion de pagos  -  2022-01-01 -> hoy
-========================================================================================
-CORRER BLOQUE POR BLOQUE, revisando la salida de cada uno. No de un jalon.
-
-Volumen esperado:
-    gold.fact_facturas compensadas   ~3,198,553   <- el pesado
-    gold.fact_facturas abiertas          70,967   (foto, se recarga sola)
-    gold.fact_pagos                     ~614,353   (~115-138K por anio)
-    gold.fact_aplicacion_pagos        ~3-3.5M
-    gold.fact_pagos_sin_aplicacion       ~2-3K
-
---- POR QUE ESTE ARCHIVO EXISTE, SI YA HAY PROCS ---
-gold.load_fact_facturas ignora @fecha_hasta a proposito: en carga incremental el techo
-truncaria las cadenas del segundo salto (probado - deja fuera facturas cuyo grupo final
-se compensa despues). Pero eso significa que llamarlo con '2022-01-01' haria UN SOLO
-INSERT de 3.2M filas, y el log de este servidor son 2 GB. Ya paso en este proyecto:
-el corte anual fue lo que permitio terminar la Fase A sin Msg 9002.
-Por eso el paso 1 inserta por anio SIN pasar por el proc. Durante un backfill completo
-el techo es inofensivo - al terminar estan todos los anios - y protege el log.
-
---- ORDEN OBLIGATORIO ---
-Primero fact_facturas COMPLETA. El puente de cualquier anio necesita las facturas de su
-grupo, y un pago de 2022 puede alcanzar una factura por segundo salto en 2023. Si se
-corre el puente antes de tener todas las facturas, faltan filas y no avisa.
-Despues, anio por anio: pagos -> puente -> sin_aplicacion.
-
---- SI SE INTERRUMPE ---
-Cada bloque es re-ejecutable: los procs borran su ventana antes de insertar. El paso 1
-tambien (borra el anio antes de insertarlo). Se puede repetir el anio que quedo a medias
-sin duplicar nada.
-========================================================================================
-*/
-
-
--- ========================================================================================
--- PASO 0 - Estado antes de empezar. Guarda esta salida.
--- ========================================================================================
+-- 0. State before starting: keep this output.
 SELECT 'fact_pagos' AS tabla, COUNT(*) AS filas FROM gold.fact_pagos
 UNION ALL SELECT 'fact_facturas', COUNT(*) FROM gold.fact_facturas
 UNION ALL SELECT 'fact_aplicacion_pagos', COUNT(*) FROM gold.fact_aplicacion_pagos
@@ -50,24 +30,22 @@ SELECT name AS archivo_log, size/128 AS mb_asignado,
 FROM sys.database_files WHERE type_desc = 'LOG';
 GO
 
-
--- ========================================================================================
--- PASO 1 - gold.fact_facturas COMPENSADAS, anio por anio.
---          Correr los cinco bloques uno a la vez, revisando el log entre cada uno.
---          NO usa el proc: ver la nota de la cabecera.
--- ========================================================================================
-
--- Limpieza del historico compensado, en lotes (el log).
+-- ----------------------------------------------------------------------------
+-- 1. fact_facturas, cleared invoices, one year at a time
+-- ----------------------------------------------------------------------------
+DECLARE @t DATETIME2(0) = SYSDATETIME(), @rows INT = 0;
 DECLARE @lote INT = 1;
 WHILE @lote > 0
 BEGIN
     DELETE TOP (50000) FROM gold.fact_facturas WHERE flag_compensada = 1;
     SET @lote = @@ROWCOUNT;
+    SET @rows = @rows + @lote;
 END
-PRINT 'Historico compensado limpiado.';
+EXEC control.log_step 'backfill gold.fact_facturas', 'delete cleared', @t, @rows;
 GO
 
--- ---- 2022 ---- (repetir cambiando las dos fechas para 2023, 2024, 2025, 2026)
+-- 2022 (repeat changing both dates for 2023, 2024, 2025 and 2026)
+DECLARE @t DATETIME2(0) = SYSDATETIME(), @rows INT;
 INSERT INTO gold.fact_facturas (
     sociedad, cliente_id, ejercicio, documento_id, posicion,
     documento_compensacion, ejercicio_compensacion, clase_documento,
@@ -97,26 +75,24 @@ WHERE b.mandante = '400'
         SELECT c1.cliente_id FROM gold.dim_cliente_comercial c1
         WHERE c1.estatus_comercial <> 'FUERA_DE_ALCANCE'
           AND c1.canal_distribucion IN (10, 40, 60))
-  -- Reset de compensacion (FBRA): gana bsid, que es el estado de hoy.
+  -- Clearing reset (FBRA): bsid wins, it is today's state.
   AND NOT EXISTS (
         SELECT 1 FROM silver.sap_bsid i
         WHERE i.mandante = b.mandante AND i.sociedad = b.sociedad
           AND i.cliente_id = b.cliente_id AND i.ejercicio = b.ejercicio
           AND i.documento_id = b.documento_id AND i.posicion = b.posicion);
-PRINT '2022 compensadas: ' + CAST(@@ROWCOUNT AS VARCHAR(12));
+SET @rows = @@ROWCOUNT;
+EXEC control.log_step 'backfill gold.fact_facturas', 'cleared 2022', @t, @rows;
 GO
 
--- Entre anio y anio, revisar el log. Si pasa de ~1,200 MB, hacer CHECKPOINT y esperar.
+-- Between years, check the log. Above ~1,200 MB run CHECKPOINT first.
 SELECT FILEPROPERTY('ANALISIS_DATOS_log','SpaceUsed')/128 AS log_mb_usado;
 GO
 
-
--- ========================================================================================
--- PASO 2 - las ABIERTAS. Una sola vez: es una foto del presente, no tiene anios.
---          Se puede hacer con el proc, que ya las recarga completas.
---          (Ojo: el proc tambien recargaria las compensadas desde @fecha_desde. Para
---           evitarlo, este INSERT va directo.)
--- ========================================================================================
+-- ----------------------------------------------------------------------------
+-- 2. fact_facturas, open invoices: a snapshot of today, loaded once
+-- ----------------------------------------------------------------------------
+DECLARE @t DATETIME2(0) = SYSDATETIME(), @rows INT;
 DECLARE @lote2 INT = 1;
 WHILE @lote2 > 0
 BEGIN
@@ -151,23 +127,17 @@ WHERE b.mandante = '400'
         SELECT c1.cliente_id FROM gold.dim_cliente_comercial c1
         WHERE c1.estatus_comercial <> 'FUERA_DE_ALCANCE'
           AND c1.canal_distribucion IN (10, 40, 60));
-PRINT 'Abiertas: ' + CAST(@@ROWCOUNT AS VARCHAR(12)) + ' (esperado ~70,967)';
+SET @rows = @@ROWCOUNT;
+EXEC control.log_step 'backfill gold.fact_facturas', 'open', @t, @rows;
 GO
 
--- Control del paso 1+2 antes de seguir: NO continuar si esto no cuadra.
+-- Check before going on: flag 0 about 70K rows, flag 1 about 3.2M.
 SELECT flag_compensada, COUNT(*) AS filas FROM gold.fact_facturas GROUP BY flag_compensada;
--- esperado: 0 -> ~70,967   |   1 -> ~3,198,553
 GO
 
-
--- ========================================================================================
--- PASO 3 - pagos, puente y sin_aplicacion, ANIO POR ANIO.
---          Correr un anio completo (los tres EXEC) antes de pasar al siguiente.
---          Aqui SI se usan los procs: ellos borran su ventana antes de insertar, asi que
---          repetir un anio es seguro.
--- ========================================================================================
-
--- ---- 2022 ----
+-- ----------------------------------------------------------------------------
+-- 3. Payments, bridge and sin_aplicacion, one whole year at a time
+-- ----------------------------------------------------------------------------
 EXEC gold.load_fact_pagos                '2022-01-01', '2023-01-01';
 EXEC gold.load_fact_aplicacion_pagos     '2022-01-01', '2023-01-01';
 EXEC gold.load_fact_pagos_sin_aplicacion '2022-01-01', '2023-01-01';
@@ -175,7 +145,6 @@ GO
 SELECT FILEPROPERTY('ANALISIS_DATOS_log','SpaceUsed')/128 AS log_mb_usado;
 GO
 
--- ---- 2023 ----
 EXEC gold.load_fact_pagos                '2023-01-01', '2024-01-01';
 EXEC gold.load_fact_aplicacion_pagos     '2023-01-01', '2024-01-01';
 EXEC gold.load_fact_pagos_sin_aplicacion '2023-01-01', '2024-01-01';
@@ -183,7 +152,6 @@ GO
 SELECT FILEPROPERTY('ANALISIS_DATOS_log','SpaceUsed')/128 AS log_mb_usado;
 GO
 
--- ---- 2024 ----
 EXEC gold.load_fact_pagos                '2024-01-01', '2025-01-01';
 EXEC gold.load_fact_aplicacion_pagos     '2024-01-01', '2025-01-01';
 EXEC gold.load_fact_pagos_sin_aplicacion '2024-01-01', '2025-01-01';
@@ -191,7 +159,6 @@ GO
 SELECT FILEPROPERTY('ANALISIS_DATOS_log','SpaceUsed')/128 AS log_mb_usado;
 GO
 
--- ---- 2025 ----
 EXEC gold.load_fact_pagos                '2025-01-01', '2026-01-01';
 EXEC gold.load_fact_aplicacion_pagos     '2025-01-01', '2026-01-01';
 EXEC gold.load_fact_pagos_sin_aplicacion '2025-01-01', '2026-01-01';
@@ -199,16 +166,34 @@ GO
 SELECT FILEPROPERTY('ANALISIS_DATOS_log','SpaceUsed')/128 AS log_mb_usado;
 GO
 
--- ---- 2026 ---- (sin tope: hasta hoy)
+-- Current year: no upper bound.
 EXEC gold.load_fact_pagos                '2026-01-01';
 EXEC gold.load_fact_aplicacion_pagos     '2026-01-01';
 EXEC gold.load_fact_pagos_sin_aplicacion '2026-01-01';
 GO
 
+-- ----------------------------------------------------------------------------
+-- 4. Effective payment date on the invoices, one year at a time
+-- ----------------------------------------------------------------------------
+CHECKPOINT;
+EXEC gold.load_fact_facturas_pago_efectivo '2022-01-01', '2023-01-01';
+GO
+CHECKPOINT;
+EXEC gold.load_fact_facturas_pago_efectivo '2023-01-01', '2024-01-01';
+GO
+CHECKPOINT;
+EXEC gold.load_fact_facturas_pago_efectivo '2024-01-01', '2025-01-01';
+GO
+CHECKPOINT;
+EXEC gold.load_fact_facturas_pago_efectivo '2025-01-01', '2026-01-01';
+GO
+CHECKPOINT;
+EXEC gold.load_fact_facturas_pago_efectivo '2026-01-01';
+GO
 
--- ========================================================================================
--- PASO 4 - VALIDACION FINAL. Las cinco tienen que pasar.
--- ========================================================================================
+-- ----------------------------------------------------------------------------
+-- 5. Checks: B + C = A; D, E and F must be 0.
+-- ----------------------------------------------------------------------------
 SELECT 'A. total fact_pagos' AS invariante,
        CAST(CAST(SUM(monto) AS DECIMAL(18,2)) AS VARCHAR(24)) AS valor
 FROM gold.fact_pagos
@@ -250,10 +235,9 @@ UNION ALL
 SELECT 'F. etiqueta REVISAR (debe ser 0)',
        CAST(COUNT(*) AS VARCHAR(24))
 FROM gold.fact_pagos_sin_aplicacion WHERE motivo = 'REVISAR';
--- B + C tiene que dar exactamente A.
 GO
 
--- Cobertura por anio: sirve para ver si algun anio se comporta distinto.
+-- Coverage per year.
 SELECT YEAR(p.fecha_compensacion) AS anio,
        COUNT(*) AS pagos,
        CAST(SUM(p.monto) AS DECIMAL(18,2)) AS total,

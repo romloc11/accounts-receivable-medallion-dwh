@@ -1,6 +1,6 @@
-# Design Decisions — Gold Layer
+# Design Decisions
 
-This document explains the *why* behind every table, view, and modeling decision in the Gold layer — not just what exists, but what alternatives were discarded and why. The code already has extensive inline comments (`dwh_architecture/03_gold/*.sql`); this document organizes them into a coherent narrative for someone who didn't live through the design process.
+This document explains the *why* behind the load conventions, the Bronze and Silver layers, and every table, view, and modeling decision in the Gold layer — not just what exists, but what alternatives were discarded and why. The SQL files keep only a header and short comments where a line would otherwise look wrong; the longer reasoning lives here.
 
 ## General principle: when a table, when a view?
 
@@ -12,6 +12,43 @@ Four questions, in order, decide whether a Gold-layer object should be a physica
 4. **If none of the three apply** — it's just re-arranging/filtering/joining data that's already materialized somewhere else, with no new identity and no need to accumulate — **it's a view**. Recomputing it on every query is cheap and keeps the business logic (which tends to keep evolving) separate from the heavy physical tables.
 
 A fifth question, mostly for ratios/percentages: **will this only ever be consumed from Power BI?** If so, it shouldn't even be a SQL object — it should be a DAX measure. Averaging a ratio that's already computed per row (instead of summing numerator and denominator separately and dividing at the end) gives a mathematically incorrect result at any grain other than the row's exact grain — DAX solves this natively by respecting the filter context.
+
+---
+
+## Load conventions
+
+### One format for every SQL file
+Every file opens with the same header block (object, purpose, how to run it, notes). Comments inside the code explain *why* a line is the way it is, never *what* it does. Long rationale belongs in this document.
+
+### Logging: `control.log_step` and `control.load_log`
+Every load procedure and backfill script reports each step through one procedure, `control.log_step(@process_name, @step_name, @start_time, @rows_affected, @error_message, @error_line)`. It does two things:
+- prints a line while the load runs (`RAISERROR ... WITH NOWAIT`, so it appears immediately instead of when the batch ends): `process | step | N rows | S s`, or `!! process | step | ... | line L: message` on failure;
+- inserts the same row into `control.load_log` (status, rows, start/end, duration, error line and message), so load times and failures can be queried after the fact.
+
+The procedure template is fixed: `@proc`, `@step`, `@t0`, `@t` declared at the top; each step sets `@step` and `@t`, runs its statement, captures `@@ROWCOUNT`, and calls `log_step`; a final `'total'` step measures the whole run; a single `CATCH` rolls back any open transaction, logs the failed step with `ERROR_MESSAGE()`/`ERROR_LINE()`, and re-`THROW`s so a SQL Agent job still fails. Invariant checks are logged as steps named `check: ... (must be 0)`, with the count in the rows column.
+
+It replaces `control.sap_load_control` / `control.sp_log_load`, which were never populated. The old procedure was removed from every load because calling it broke compilation with `Incorrect syntax near ')'`. The real cause was found later: the calls passed **functions as `EXEC` parameters** (`@end_time = SYSDATETIME()`), which T-SQL does not allow. A procedure calling a procedure with variables works fine, so `log_step` is always called with variables or literals, never with a function in the argument list.
+
+### Target server limits that shape the code
+SQL Server 2014 SP3: no `CREATE OR ALTER`, no `TRIM()` (use `LTRIM(RTRIM())`), a 2 GB transaction log in SIMPLE recovery. Any historical load is split by year (by semester if it still hits Msg 9002) with a `CHECKPOINT` between chunks. `ddl_*.sql` files drop and recreate their tables; never run one to add a single table.
+
+---
+
+## Bronze
+
+A raw mirror of SAP tables from the source instance, no transformations. Master data and open items (`kna1`, `knvp`, `knkk`, `knvv`, `knb1`, `knb5`, `bsid`, `tvv1t`, `pa0001`) are truncated and reloaded whole every day. High-volume history tables are merged by primary key on a rolling current + previous month window, with their full history loaded once by a year-by-year backfill:
+- **`sap_bsad`** (cleared customer items) — window on `AUGDT`, the clearing date: a line enters BSAD when it is cleared, and keeps an older posting date.
+- **`sap_bkpf`** (document headers, `BLART = 'DZ'` only) — window on `BUDAT`. Brought in for the reversal link (`STBLG`/`STJAH`) and the creating transaction. Full BKPF is the company's whole journal (35.6M rows × 111 columns vs ~1.25M for DZ); widening the scope is a one-line change, to be done only when something consumes it. `STBLG` is filled on the original when it is reversed later, so the merge refreshes it on existing rows.
+- **`sap_bsas`** (cleared G/L lines, cash accounts only) — window on `AUGDT`. The bank side of a payment, which BSAD cannot show (its account is the customer reconciliation account). The company's monthly cash report is built on it. Key has 6 columns: `MANDT, BUKRS, HKONT, GJAHR, BELNR, BUZEI`.
+- **`sap_bsis`** (open G/L lines, same accounts) — two steps. Accounts that never clear (the vast majority of rows) are merged on a `BUDAT` window, because their lines never leave BSIS. Open-item accounts (`SKB1.XOPVW = 'X'`) are deleted and reloaded whole on every run, in one transaction, because an open item disappears the day it is cleared.
+
+Not implemented: `BSEG` is a cluster table and cannot be read by SQL on the replica (BSAS/BSIS replace it for G/L lines); `AUSP` is classification data, not payment assignment; `VBRK`/`VBRP` were designed and dropped because nothing consumes them.
+
+---
+
+## Silver
+
+One bronze table → one silver table; no cross-entity joins. Silver is where scope (`mandante`, company code), types and nulls are fixed: text dates `YYYYMMDD`/`'00000000'` become `DATE` through `TRY_CONVERT(DATE, NULLIF(..., '00000000'), 112)`, empty strings become `NULL`, leading zeros are stripped from customer keys, and SAP flags `'X'` become `BIT`. Only columns some consumer uses are carried; an attribute is filtered out only when no consumer could need the other rows, otherwise it is kept as a flag. `sap_bsad`, `sap_bkpf`, `sap_bsas` and `sap_bsis` follow bronze's window, with their own historical backfill scripts. `silver.sap_bsad` has an index on `documento_compensacion`: without it the payment model's child-document checks scanned 11.9M rows.
 
 ---
 
@@ -35,7 +72,7 @@ Nothing in gold filters on this value: the only live `tipo_cliente` predicate an
 
 The rule applied: **group attributes by how often they change together, not by which business entity they conceptually "belong" to**. `dim_cliente_comercial` (channel, region, route, salesperson) changes occasionally; `dim_cliente_credito` (limit, block, risk classification) changes often — each versions at its own pace. The real cost: an analyst needs more joins to put together a complete report — a conscious trade-off, not a free one.
 
-**SCD2 mechanics** (the same in both tables): `id_surrogate` (IDENTITY, the technical key the facts use), business key (`cliente_id`), `hash_atributos` (`HASHBYTES('SHA2_256', ...)` over the tracked columns — supported on SQL Server 2012 SP1, confirmed), `fecha_inicio_vigencia`/`fecha_fin_vigencia`/`es_vigente`, plus a unique filtered index `WHERE es_vigente=1` that guarantees a single active version per customer. Implemented as explicit sequential steps in a temp table (stage → close changed version → insert new version), not a single `MERGE` — easier to debug on this server than compacting everything into one statement.
+**SCD2 mechanics** (the same in both tables): `id_surrogate` (IDENTITY, the technical key the facts use), business key (`cliente_id`), `hash_atributos` (`HASHBYTES('SHA2_256', ...)` over the tracked columns — supported on the target server, confirmed), `fecha_inicio_vigencia`/`fecha_fin_vigencia`/`es_vigente`, plus a unique filtered index `WHERE es_vigente=1` that guarantees a single active version per customer. Implemented as explicit sequential steps in a temp table (stage → close changed version → insert new version), not a single `MERGE` — easier to debug on this server than compacting everything into one statement.
 
 **`dim_cliente_comercial` keeps `organizacion_ventas`/`canal_distribucion`/`sector`** even though the primary key is just `cliente_id`, so `dim_cliente_credito` can reuse "which channel was already chosen as the customer's representative" when looking up the credit analyst/collector — a single source of truth for that decision, not re-resolved in the second table.
 
@@ -77,6 +114,61 @@ Built 2026-08-27. **Why it exists**: `vendedor`/`gerente` (on `dim_cliente_comer
 **Self-canceling internal pair excluded (2026-08-29)**: a document can carry two of its own lines inside a *self-referencing* compensation group (`documento_compensacion = documento_id`) — one `'S'` line (already excluded by the `debe_haber<>'S'` filter above) and one `'H'` line with the exact same amount, netting to zero. That `'H'` line is an internal reclassification receiving its own reversal, not a second real deposit — but before this fix it counted as a second "candidate" alongside the real payment (a genuinely different document) sharing the same compensation group, making `vw_pago_factura_simple`'s "only relate groups with exactly 1 candidate" rule wrongly treat the whole group as ambiguous and exclude it. Found from a real SAP screenshot of one such group; validated against all of July's ambiguous groups before implementing: resolves 102 of 129 previously-ambiguous groups (+~$192K recovered), while the other 27 groups (genuinely 2+ different real deposits, different amounts) correctly remain excluded as ambiguous (~$287K). Fix is a `NOT EXISTS` added to the same filter, checking for a same-document/same-amount/opposite-side `'H'` row before admitting it.
 
 **Backfill kept separate from the incremental load**: `backfill_fact_pagos_facturas_compensados.sql` (complete history since 2022, run once) vs. `gold.load_fact_pagos_compensados`/`load_fact_facturas_compensadas` (incremental, current + previous month) — the same pattern `silver.load_silver` uses for `bsad`, so as not to reprocess 11.9M rows on every daily refresh.
+
+---
+
+## Payment application model
+
+Four tables (`fact_pagos`, `fact_facturas`, `fact_aplicacion_pagos`, `fact_pagos_sin_aplicacion`) plus `fact_facturas.fecha_pago_efectiva`, loaded by five procedures that always run in this order: `load_fact_pagos` → `load_fact_facturas` → `load_fact_aplicacion_pagos` → `load_fact_facturas_pago_efectivo` → `load_fact_pagos_sin_aplicacion`. Changing the order raises no error; it silently loses rows. They live in `sp_load_gold.sql` with the rest of the layer because SQL Server resolves procedure names at run time: `gold.load_gold` compiles even if they do not exist. Their tables use `IF OBJECT_ID(...) IS NULL` in `ddl_gold.sql`, so rerunning the DDL does not wipe the history.
+
+### The rules that define the model
+They appear in several procedures; changing one means changing it everywhere.
+1. **Customer scope**: channel 10/40/60, `estatus_comercial <> 'FUERA_DE_ALCANCE'`.
+2. **Payments**: DZ lines with text `'Asignación Aut. Deposito'`, or posting key 11 with empty text. Key 11 with any other text was a bounced check; other keys need the text, or keys 08/07/17 and re-applied 15s get in.
+   - **Child documents excluded**: a DZ that clears a key-11 line re-applies money already counted in that key 11.
+   - **Clearing resets (FBRA)**: a line present in both bsad and bsid is open today; bsid wins.
+   - **Open payments**: bsid lines with the same rule are loaded whole on every run with `fecha_compensacion NULL` as the marker, and labeled `PENDIENTE_DE_APLICAR` in `sin_aplicacion`.
+   - **Reversals (FB08)**: the reversal line of a counted line (same customer and position, opposite amount, `bkpf.indicador_reversa = '2'`) is added so it subtracts. Matched by line, not document, because a reversal mirrors every line of the original, counted or not; matching by document unbalanced 30 pairs. A reversal that entered by its own text but whose original was not counted is removed.
+   - **`cuenta_mayor`**: the cash account of the same document from `silver.sap_bsas`/`sap_bsis`. `NULL` means no cash-account line was found for that document in either table.
+3. **Invoices**: `debe_haber = 'S'`, class `F%` or `D1`, clearing resets excluded on the cleared side.
+
+### Bridge rules
+- **GRUPO** — the invoices in the payment's own clearing group.
+- **SEGUNDO_SALTO** — only when GRUPO found nothing: the payment clears an intermediate document whose key-15 line clears a group with invoices. Hops are aggregated to (child, final group) first, or a child with three key-15 lines to the same group triples every invoice. A guard counts the payment documents feeding each intermediate: with more than one, the money is mixed and the chain is not followed (`CADENA_AMBIGUA` in `sin_aplicacion`).
+- **REFERENCIA** — the child's open key-15 line points to an invoice that is still open (a partial payment).
+
+`sin_aplicacion` labels everything else, and the order of its `CASE` defines the label: `LINEA_TECNICA` (key not 11/15), `SIN_APLICACION` (no hop), `LIQUIDA_NO_FACTURA` (hop reaches no invoice), `CADENA_AMBIGUA`, and `REVISAR` for the unknown case, which must be 0. The invariant "every payment is in the bridge or in `sin_aplicacion`" is checked after every run.
+
+### Load mechanics, each learned from a failure
+- **`OPTION (RECOMPILE)` on windowed statements.** The procedures declare `@fecha_desde DATE = NULL` and compute the default inside. SQL Server compiles with the value *received*: `>= NULL` estimates one row and builds nested loops that then walk ~80,000 real rows. Measured on `load_fact_facturas`: >20 min without parameters, 9.1 s with a date. `WITH RECOMPILE` on the `EXEC` does not help (it compiles on entry, still NULL); statement-level recompile does. A manual call with a date can reuse the good cached plan and hide the problem — test without parameters.
+- **Delete and insert in one transaction**, `XACT_ABORT ON`, rollback in `CATCH`. Two failures in one day left `fact_pagos` 13,000 rows short and `fact_facturas` without its cleared invoices, and the tables stayed queryable with less money and no signal.
+- **Batched deletes (50,000)** avoid one giant delete and lock escalation, but inside the transaction they do not bound the log; the window size does. These procedures are for incremental windows only — history loads by year in `backfill_fact_aplicacion_pagos.sql`.
+- **Delete by key as well as by window**: a re-cleared payment or invoice keeps its old stored clearing date, outside the window, and would collide with its new row.
+- **`fact_facturas` deletes run before its inserts**: the key has no `flag_compensada`, so an invoice that went from open to cleared collides with its old row.
+- **`@fecha_hasta` is ignored on the cleared-invoice side**: a payment in the window can reach, through the second hop, an invoice cleared later.
+- **No `N''` prefix** against `VARCHAR` columns with a binary collation: the literal converts the column and one statement went from 2 s to 150 s.
+- **Qualified aliases inside `NOT EXISTS`**: an unqualified column binds to the inner table and the condition is always true.
+
+---
+
+## Collections budget
+
+### Tables
+`fact_presupuesto_cobranza` (one row per day) answers "are we on track"; `fact_presupuesto_cartera` (one row per aging bucket × ejecutivo × region × channel × status) answers "why did it miss" — without it a bad month cannot be diagnosed later, because the portfolio has moved. The daily table has no actual amount: it was filled once a month and never refreshed, so on day 20 it still showed day 4. Actuals live in `gold.vw_cobranza_diaria`. The rate used is stored with the budget, because rates are recalibrated every run and an old forecast must stay auditable. The segment grain is fine (~2,000 rows a month) but never by customer: a population rate on one customer's row would read as that customer's target. Attributes are stored as resolved at the cut-off, so a reassignment does not move a past budget.
+
+### The model (v2, by aging)
+v1 predicted each invoice's payment date from the customer's history. Its 1.8% error was measured on invoices already known to be paid; as a real forecast it missed by 65.8%, because an overdue open invoice had no prediction and ~12% of the portfolio belongs to customers with no payment history. v2 asks a different question — what fraction of this amount of this age comes in this month — so every invoice falls in a bucket and the cold start disappears.
+
+Budget = **T1** (portfolio open at the cut-off × its bucket's recovery rate) + **T2** (collected from day 1 to the cut-off, observed) + **T3** (invoiced-and-collected within the month plus unlinked payments, a factor k over T1). The cut-off is the 4th business day, when the number is issued; the open portfolio drops sharply over the first week, so the budget is a number *and* a date.
+
+Buckets split "not yet due" into A1 (due this month, ~71% recovered) and A2 (due later, ~15%); together they averaged 46.5%, describing neither. G (overdue more than a year) recovers 0% three years running and is shown apart, since the manual method counts it in full. Out of sample (2024-2025 parameters, Jan-Aug 2026): manual method 23.4% mean absolute error, v1 65.8%, v2 3.53%. Rates barely drift in the buckets that carry the money, and the result does not depend on the calibration window (3.53 / 3.51 / 3.53%).
+
+The production procedure calibrates on the 24 closed months before the target, with rates by bucket × `tipo_gestion`: legal and extrajudicial collection pay about half in the large buckets, and a global rate would credit them double. A cell with fewer than 500 invoices falls back to the bucket rate (`tasa_origen = 'BUCKET'`). It runs once a month, not inside `load_gold`: a budget recalculated nightly chases the actuals. `@forzar = 0` refuses to replace a budget issued with another cut-off.
+
+Known limits: T3 is a correlation, not a mechanism, and will drift if the channel mix or credit terms change (its proper replacement is a billing forecast); the historical portfolio is rebuilt from today's state, so an invoice cancelled after a past cut-off is missing from it.
+
+### The monthly breakdown
+`desglose_cobranza_mes.sql` measures a month backwards in the same slices. Measured by invoice, not by payment: a deposit settling several invoices cannot be split without inventing. "Invoiced and collected in the month" is a cross-section, not a fourth slice — it is taken out of the other slices so they add up. The gap to the month's cash is mostly payments bringing more or less than the face value of the invoices they settle, since the bridge links but does not split amounts.
 
 ---
 
@@ -148,9 +240,9 @@ Built 2026-08-27, from the pending "Proposals in design" list. Source: `silver.s
 - **`gold.fact_aplicacion_pagos`** (removed 2026-08-19) — the 3-tier matching design (`REBZG`/unambiguous-group/no-match) had real over-attribution bugs: a $137 document could "explain" $2.5M in invoices within a massive compensation group, confirmed in several real cases. Replaced by the deliberately simpler design of `fact_pagos_compensados`/`fact_facturas_compensadas` + `vw_pago_factura_simple` — it only relates groups with exactly 1 candidate, with no match tiers or partial application. Less coverage, but without the risk of incorrect attribution.
 - **`gold.fact_movimientos_compensados`** (removed 2026-08-13) — a complete line-level mirror of ALL of `bsad`. Explicit decision not to carry a whole silver table into gold undifferentiated — instead, build facts focused on specific business questions (the origin of `fact_aplicacion_pagos`, and later of `fact_pagos_compensados`/`fact_facturas_compensadas`).
 - **`gold.vw_pago_virgen` / `gold.vw_factura` / `gold.vw_clasificacion_vencimiento_pago`** — prototypes from the design stage of `fact_aplicacion_pagos` and `clasificacion_cobranza`. The code already said "retired," but the actual `DROP` on the server was never run — found and cleaned up in the 2026-08-21 orphaned-object audit.
-- **`gold.load_fact_pagos` / `gold.load_fact_facturas`** — procedures with the pre-rename name, internal body still pointing at tables that no longer exist. Orphaned for the same reason: the rename created the new objects but never `DROP`ped the old ones.
+- **`gold.load_fact_pagos` / `gold.load_fact_facturas`** — procedures with the pre-rename name, internal body still pointing at tables that no longer exist. Orphaned for the same reason: the rename created the new objects but never `DROP`ped the old ones. (The current procedures with these names belong to the payment application model above and are unrelated.)
 - **`gold.vw_comportamiento_pago_cliente`** (drafted and retired same day, 2026-08-27) — never deployed to the server. Meant to replace `fact_saldo_cartera`'s removed DPP columns, but a live view can only ever show "DPP as of right now," not a real trend over time - the user wants to analyze payment behavior across time, which needs either DAX time-intelligence (the chosen path, see `gold.vw_pago_factura_simple`'s section above) or a genuine periodic-snapshot fact, never a view.
-- **`gold.fact_aplicacion` v2** — the 5-object application strategy (`dim_tipo_documento`, `fact_facturas`, `fact_notas`, `fact_pagos`, `fact_aplicacion`), adopted 2026-09-04 and **retired 2026-09-05**: the user chose to re-approach the logic from scratch rather than carry it forward. Dropped from the server with `03_gold/drop_fact_aplicacion_v2.sql` (13.4M rows, no FKs, nothing else depended on them — `gold.load_gold` never called its procs and Power BI never referenced its tables). The full design record, and the investigation evidence behind it, is kept in `docs/archive/fact_aplicacion_v2_retirado.md`; the SQL is in git history. `vw_pago_factura_simple` was never displaced and remains the dashboard's source.
+- **`gold.fact_aplicacion` v2** — the 5-object application strategy (`dim_tipo_documento`, `fact_facturas`, `fact_notas`, `fact_pagos`, `fact_aplicacion`), adopted 2026-09-04 and **retired 2026-09-05**: the user chose to re-approach the logic from scratch rather than carry it forward. Dropped from the server with `03_gold/drop_fact_aplicacion_v2.sql` (a one-time script, since removed from the tree and kept in git history; 13.4M rows, no FKs, nothing else depended on them — `gold.load_gold` never called its procs and Power BI never referenced its tables). The full design record, and the investigation evidence behind it, is kept in `docs/archive/fact_aplicacion_v2_retirado.md`; the SQL is in git history. `vw_pago_factura_simple` was never displaced and remains the dashboard's source.
 
 ---
 

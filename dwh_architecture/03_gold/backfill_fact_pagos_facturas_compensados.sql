@@ -1,51 +1,24 @@
+/* ============================================================================
+   Backfill gold.fact_pagos_compensados / gold.fact_facturas_compensadas
+   Purpose : Loads the legacy settled facts from 2022 up to the daily merge
+             window (first day of the previous month).
+   Run     : one block at a time, in order. Each block is DELETE + INSERT for
+             one clearing year: safe to re-run. Then the check at the end.
+   Notes   : gold.vw_pago_factura_simple needs the full history of both tables
+             to count candidates per clearing group.
+             Msg 9002 (log full): split that year in halves.
+   ============================================================================ */
 USE ANALISIS_DATOS;
 GO
 
-/*
-========================================================================================
-HISTORICAL BACKFILL: gold.fact_pagos_compensados / gold.fact_facturas_compensadas
-========================================================================================
-PURPOSE:
-gold.load_fact_pagos_compensados / gold.load_fact_facturas_compensadas (incremental MERGE in sp_load_gold.sql)
-only maintain current month + previous month, the same way silver.load_silver does with bsad.
-This script brings in the complete history since 2022-01-01 (the same start date as
-silver.sap_bsad, confirmed via MIN(AUGDT) in bronze's original backfill).
-
-UNLIKE gold.fact_aplicacion_pagos (which was scoped to 2024+ because its 3-tier matching
-logic was expensive per row), fact_pagos_compensados/fact_facturas_compensadas are a simple filter
-+ INSERT over silver.sap_bsad (the same per-row cost as silver.sap_bsad's own backfill,
-which already ran in 5 yearly chunks with no issue) - there's no computational reason to
-scope the range, and gold.vw_pago_factura_simple needs the complete history of BOTH
-tables to correctly count candidates per compensation group (if history were missing
-from one but not the other, the "num_pagos_candidatos" count per group would be wrong
-for groups with activity outside the partial window).
-
-debe_haber<>'S' FILTER in fact_pagos_compensados (added 2026-08-19, see ddl_gold.sql section 6):
-excludes the mirror/offsetting line that the "child" document of a compensation always
-carries (same documento_id=documento_compensacion, same amount, same
-sgtxt='Asignación Aut. Deposito' as the real deposit, but debe_haber='S') - without this
-filter it was counted as a second candidate raw payment, falsely inflating ambiguity in
-gold.vw_pago_factura_simple.
-
-UPPER BOUND:
-Same as backfill_bsad_historico.sql: the bound is computed dynamically (first day of
-the month before today) so as not to step on the window the daily incremental already
-maintains.
-
-CHUNK PATTERN: one chunk per year, DELETE + INSERT (idempotent). If a given year breaks
-with "Msg 9002: transaction log full," split that year into half-years/quarters, same
-method as backfill_bsad_historico.sql. Don't run two chunks at once in different tabs -
-one at a time, checking the PRINT output before continuing.
-========================================================================================
-*/
-
+-- Upper bound: the daily merge owns everything from this date on.
 DECLARE @limite_check DATE = DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()) - 1, 0);
 SELECT @limite_check AS limite_superior_backfill_fecha_compensacion;
 GO
 
--- ========================================================================================
--- Full 2022
--- ========================================================================================
+-- 2022
+DECLARE @t DATETIME2(0) = SYSDATETIME(), @rows INT;
+
 DELETE FROM gold.fact_pagos_compensados
 WHERE fecha_compensacion >= '20220101' AND fecha_compensacion < '20230101';
 
@@ -60,10 +33,10 @@ SELECT
     documento_compensacion, ejercicio_compensacion
 FROM silver.sap_bsad b
 WHERE b.clase_documento = 'DZ'
-  AND (b.sgtxt = 'Asignación Aut. Deposito' OR b.sgtxt LIKE 'BB%') -- updated 2026-08-29, see sp_load_gold.sql / dwh-ciosa-project-status.md in memory
+  AND (b.sgtxt = 'Asignación Aut. Deposito' OR b.sgtxt LIKE 'BB%')
   AND b.debe_haber <> 'S'
   AND b.monto_moneda_local > 0
-  AND NOT ( -- self-canceling internal pair excluded, fix 2026-08-29, see sp_load_gold.sql
+  AND NOT ( -- not a self-canceling internal pair
       b.documento_compensacion = b.documento_id
       AND EXISTS (
           SELECT 1 FROM silver.sap_bsad b2
@@ -76,7 +49,10 @@ WHERE b.clase_documento = 'DZ'
   )
   AND b.fecha_compensacion >= '20220101' AND fecha_compensacion < '20230101';
 
-PRINT 'fact_pagos_compensados - rows inserted 2022: ' + CAST(@@ROWCOUNT AS VARCHAR);
+SET @rows = @@ROWCOUNT;
+EXEC control.log_step 'backfill gold.fact_pagos_compensados', '2022', @t, @rows;
+
+SET @t = SYSDATETIME();
 
 DELETE FROM gold.fact_facturas_compensadas
 WHERE fecha_compensacion >= '20220101' AND fecha_compensacion < '20230101';
@@ -94,12 +70,13 @@ FROM silver.sap_bsad
 WHERE clase_documento IN ('F1', 'F2', 'F3', 'F4', 'F5', 'F6')
   AND fecha_compensacion >= '20220101' AND fecha_compensacion < '20230101';
 
-PRINT 'fact_facturas_compensadas - rows inserted 2022: ' + CAST(@@ROWCOUNT AS VARCHAR);
+SET @rows = @@ROWCOUNT;
+EXEC control.log_step 'backfill gold.fact_facturas_compensadas', '2022', @t, @rows;
 GO
 
--- ========================================================================================
--- Full 2023
--- ========================================================================================
+-- 2023
+DECLARE @t DATETIME2(0) = SYSDATETIME(), @rows INT;
+
 DELETE FROM gold.fact_pagos_compensados
 WHERE fecha_compensacion >= '20230101' AND fecha_compensacion < '20240101';
 
@@ -114,10 +91,10 @@ SELECT
     documento_compensacion, ejercicio_compensacion
 FROM silver.sap_bsad b
 WHERE b.clase_documento = 'DZ'
-  AND (b.sgtxt = 'Asignación Aut. Deposito' OR b.sgtxt LIKE 'BB%') -- updated 2026-08-29, see sp_load_gold.sql / dwh-ciosa-project-status.md in memory
+  AND (b.sgtxt = 'Asignación Aut. Deposito' OR b.sgtxt LIKE 'BB%')
   AND b.debe_haber <> 'S'
   AND b.monto_moneda_local > 0
-  AND NOT ( -- self-canceling internal pair excluded, fix 2026-08-29, see sp_load_gold.sql
+  AND NOT ( -- not a self-canceling internal pair
       b.documento_compensacion = b.documento_id
       AND EXISTS (
           SELECT 1 FROM silver.sap_bsad b2
@@ -130,7 +107,10 @@ WHERE b.clase_documento = 'DZ'
   )
   AND b.fecha_compensacion >= '20230101' AND fecha_compensacion < '20240101';
 
-PRINT 'fact_pagos_compensados - rows inserted 2023: ' + CAST(@@ROWCOUNT AS VARCHAR);
+SET @rows = @@ROWCOUNT;
+EXEC control.log_step 'backfill gold.fact_pagos_compensados', '2023', @t, @rows;
+
+SET @t = SYSDATETIME();
 
 DELETE FROM gold.fact_facturas_compensadas
 WHERE fecha_compensacion >= '20230101' AND fecha_compensacion < '20240101';
@@ -148,12 +128,13 @@ FROM silver.sap_bsad
 WHERE clase_documento IN ('F1', 'F2', 'F3', 'F4', 'F5', 'F6')
   AND fecha_compensacion >= '20230101' AND fecha_compensacion < '20240101';
 
-PRINT 'fact_facturas_compensadas - rows inserted 2023: ' + CAST(@@ROWCOUNT AS VARCHAR);
+SET @rows = @@ROWCOUNT;
+EXEC control.log_step 'backfill gold.fact_facturas_compensadas', '2023', @t, @rows;
 GO
 
--- ========================================================================================
--- Full 2024
--- ========================================================================================
+-- 2024
+DECLARE @t DATETIME2(0) = SYSDATETIME(), @rows INT;
+
 DELETE FROM gold.fact_pagos_compensados
 WHERE fecha_compensacion >= '20240101' AND fecha_compensacion < '20250101';
 
@@ -168,10 +149,10 @@ SELECT
     documento_compensacion, ejercicio_compensacion
 FROM silver.sap_bsad b
 WHERE b.clase_documento = 'DZ'
-  AND (b.sgtxt = 'Asignación Aut. Deposito' OR b.sgtxt LIKE 'BB%') -- updated 2026-08-29, see sp_load_gold.sql / dwh-ciosa-project-status.md in memory
+  AND (b.sgtxt = 'Asignación Aut. Deposito' OR b.sgtxt LIKE 'BB%')
   AND b.debe_haber <> 'S'
   AND b.monto_moneda_local > 0
-  AND NOT ( -- self-canceling internal pair excluded, fix 2026-08-29, see sp_load_gold.sql
+  AND NOT ( -- not a self-canceling internal pair
       b.documento_compensacion = b.documento_id
       AND EXISTS (
           SELECT 1 FROM silver.sap_bsad b2
@@ -184,7 +165,10 @@ WHERE b.clase_documento = 'DZ'
   )
   AND b.fecha_compensacion >= '20240101' AND fecha_compensacion < '20250101';
 
-PRINT 'fact_pagos_compensados - rows inserted 2024: ' + CAST(@@ROWCOUNT AS VARCHAR);
+SET @rows = @@ROWCOUNT;
+EXEC control.log_step 'backfill gold.fact_pagos_compensados', '2024', @t, @rows;
+
+SET @t = SYSDATETIME();
 
 DELETE FROM gold.fact_facturas_compensadas
 WHERE fecha_compensacion >= '20240101' AND fecha_compensacion < '20250101';
@@ -202,12 +186,13 @@ FROM silver.sap_bsad
 WHERE clase_documento IN ('F1', 'F2', 'F3', 'F4', 'F5', 'F6')
   AND fecha_compensacion >= '20240101' AND fecha_compensacion < '20250101';
 
-PRINT 'fact_facturas_compensadas - rows inserted 2024: ' + CAST(@@ROWCOUNT AS VARCHAR);
+SET @rows = @@ROWCOUNT;
+EXEC control.log_step 'backfill gold.fact_facturas_compensadas', '2024', @t, @rows;
 GO
 
--- ========================================================================================
--- Full 2025
--- ========================================================================================
+-- 2025
+DECLARE @t DATETIME2(0) = SYSDATETIME(), @rows INT;
+
 DELETE FROM gold.fact_pagos_compensados
 WHERE fecha_compensacion >= '20250101' AND fecha_compensacion < '20260101';
 
@@ -222,10 +207,10 @@ SELECT
     documento_compensacion, ejercicio_compensacion
 FROM silver.sap_bsad b
 WHERE b.clase_documento = 'DZ'
-  AND (b.sgtxt = 'Asignación Aut. Deposito' OR b.sgtxt LIKE 'BB%') -- updated 2026-08-29, see sp_load_gold.sql / dwh-ciosa-project-status.md in memory
+  AND (b.sgtxt = 'Asignación Aut. Deposito' OR b.sgtxt LIKE 'BB%')
   AND b.debe_haber <> 'S'
   AND b.monto_moneda_local > 0
-  AND NOT ( -- self-canceling internal pair excluded, fix 2026-08-29, see sp_load_gold.sql
+  AND NOT ( -- not a self-canceling internal pair
       b.documento_compensacion = b.documento_id
       AND EXISTS (
           SELECT 1 FROM silver.sap_bsad b2
@@ -238,7 +223,10 @@ WHERE b.clase_documento = 'DZ'
   )
   AND b.fecha_compensacion >= '20250101' AND fecha_compensacion < '20260101';
 
-PRINT 'fact_pagos_compensados - rows inserted 2025: ' + CAST(@@ROWCOUNT AS VARCHAR);
+SET @rows = @@ROWCOUNT;
+EXEC control.log_step 'backfill gold.fact_pagos_compensados', '2025', @t, @rows;
+
+SET @t = SYSDATETIME();
 
 DELETE FROM gold.fact_facturas_compensadas
 WHERE fecha_compensacion >= '20250101' AND fecha_compensacion < '20260101';
@@ -256,14 +244,12 @@ FROM silver.sap_bsad
 WHERE clase_documento IN ('F1', 'F2', 'F3', 'F4', 'F5', 'F6')
   AND fecha_compensacion >= '20250101' AND fecha_compensacion < '20260101';
 
-PRINT 'fact_facturas_compensadas - rows inserted 2025: ' + CAST(@@ROWCOUNT AS VARCHAR);
+SET @rows = @@ROWCOUNT;
+EXEC control.log_step 'backfill gold.fact_facturas_compensadas', '2025', @t, @rows;
 GO
 
--- ========================================================================================
--- Partial 2026: from Jan 1st up to the bound the incremental already covers
--- (dynamic bound - does NOT touch the 2-month window that load_fact_pagos_compensados/
--- load_fact_facturas_compensadas maintain)
--- ========================================================================================
+-- 2026 up to the daily merge window
+DECLARE @t DATETIME2(0) = SYSDATETIME(), @rows INT;
 DECLARE @limite_date DATE = DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()) - 1, 0);
 
 DELETE FROM gold.fact_pagos_compensados
@@ -280,10 +266,10 @@ SELECT
     documento_compensacion, ejercicio_compensacion
 FROM silver.sap_bsad b
 WHERE b.clase_documento = 'DZ'
-  AND (b.sgtxt = 'Asignación Aut. Deposito' OR b.sgtxt LIKE 'BB%') -- updated 2026-08-29, see sp_load_gold.sql / dwh-ciosa-project-status.md in memory
+  AND (b.sgtxt = 'Asignación Aut. Deposito' OR b.sgtxt LIKE 'BB%')
   AND b.debe_haber <> 'S'
   AND b.monto_moneda_local > 0
-  AND NOT ( -- self-canceling internal pair excluded, fix 2026-08-29, see sp_load_gold.sql
+  AND NOT ( -- not a self-canceling internal pair
       b.documento_compensacion = b.documento_id
       AND EXISTS (
           SELECT 1 FROM silver.sap_bsad b2
@@ -296,7 +282,10 @@ WHERE b.clase_documento = 'DZ'
   )
   AND b.fecha_compensacion >= '20260101' AND fecha_compensacion < @limite_date;
 
-PRINT 'fact_pagos_compensados - rows inserted 2026 (partial, up to the incremental''s bound): ' + CAST(@@ROWCOUNT AS VARCHAR);
+SET @rows = @@ROWCOUNT;
+EXEC control.log_step 'backfill gold.fact_pagos_compensados', '2026 partial', @t, @rows;
+
+SET @t = SYSDATETIME();
 
 DELETE FROM gold.fact_facturas_compensadas
 WHERE fecha_compensacion >= '20260101' AND fecha_compensacion < @limite_date;
@@ -314,13 +303,11 @@ FROM silver.sap_bsad
 WHERE clase_documento IN ('F1', 'F2', 'F3', 'F4', 'F5', 'F6')
   AND fecha_compensacion >= '20260101' AND fecha_compensacion < @limite_date;
 
-PRINT 'fact_facturas_compensadas - rows inserted 2026 (partial, up to the incremental''s bound): ' + CAST(@@ROWCOUNT AS VARCHAR);
+SET @rows = @@ROWCOUNT;
+EXEC control.log_step 'backfill gold.fact_facturas_compensadas', '2026 partial', @t, @rows;
 GO
 
--- ========================================================================================
--- Final check: total in gold vs. what's in silver.sap_bsad before the incremental's
--- bound (should match exactly if every chunk ran correctly)
--- ========================================================================================
+-- Check: rows before the window, silver vs gold. Both pairs must match.
 DECLARE @limite_final DATE = DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()) - 1, 0);
 
 SELECT
