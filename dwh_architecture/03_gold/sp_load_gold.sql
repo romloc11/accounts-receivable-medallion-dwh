@@ -1675,7 +1675,10 @@ BEGIN
                -- The order of the branches defines the labels. CADENA_AMBIGUA goes last: it
                -- applies only when the hop did reach invoices and the guard excluded it.
                -- REVISAR is the unknown case and must be 0.
-               CASE WHEN x.clave_contabilizacion NOT IN ('11','15') THEN 'LINEA_TECNICA'
+               -- REVERSADO first: a reversed deposit and its reversal net to zero and are
+               -- not work for anyone, whatever their posting key or clearing chain.
+               CASE WHEN x.reversa = 1                            THEN 'REVERSADO'
+                    WHEN x.clave_contabilizacion NOT IN ('11','15') THEN 'LINEA_TECNICA'
                     WHEN x.tiene_salto      = 0        THEN 'SIN_APLICACION'
                     WHEN x.salto_a_facturas = 0        THEN 'LIQUIDA_NO_FACTURA'
                     WHEN x.n_pagos_intermedio > 1      THEN 'CADENA_AMBIGUA'
@@ -1685,8 +1688,12 @@ BEGIN
                    p.documento_compensacion, p.fecha_compensacion, p.clave_contabilizacion,
                    MAX(CASE WHEN s.grupo_final IS NOT NULL THEN 1 ELSE 0 END) AS tiene_salto,
                    MAX(CASE WHEN f.documento_compensacion IS NOT NULL THEN 1 ELSE 0 END) AS salto_a_facturas,
-                   MAX(ISNULL(g.n_pagos, 1)) AS n_pagos_intermedio
+                   MAX(ISNULL(g.n_pagos, 1)) AS n_pagos_intermedio,
+                   MAX(CASE WHEN k.indicador_reversa IN ('1','2') THEN 1 ELSE 0 END) AS reversa
             FROM   gold.fact_pagos p
+            -- indicador_reversa: '1' the document was reversed, '2' it is the reversal.
+            LEFT JOIN silver.sap_bkpf k ON k.mandante = '400' AND k.sociedad = p.sociedad
+                                       AND k.ejercicio = p.ejercicio AND k.documento_id = p.documento_id
             LEFT JOIN #guarda2 g ON g.intermedio = p.documento_compensacion
             -- LEFT JOIN: a payment with no hop must survive; that makes it SIN_APLICACION.
             LEFT JOIN #salto2 s ON s.hijo = p.documento_compensacion

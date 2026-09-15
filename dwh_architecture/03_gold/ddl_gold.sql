@@ -512,6 +512,7 @@ GO
 -- ----------------------------------------------------------------------------
 -- gold.fact_pagos_sin_aplicacion
 -- Money that came in and settled no customer invoice. motivo:
+--   REVERSADO             the document was reversed, or is the reversal (net zero)
 --   LIQUIDA_NO_FACTURA    the chain reaches a group with no invoices (SA, AB)
 --   SIN_APLICACION        the payment's group leads nowhere
 --   CADENA_AMBIGUA        the intermediate document mixes several payments

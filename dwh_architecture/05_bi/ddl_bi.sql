@@ -160,6 +160,18 @@ SELECT
     CASE WHEN s.motivo IS NULL THEN 'APLICADO' ELSE 'SIN APLICACION' END         AS estatus_aplicacion,
     COALESCE(s.motivo, 'APLICADO')                                               AS motivo_aplicacion,
     CASE WHEN p.fecha_compensacion IS NULL THEN 1 ELSE 0 END                     AS es_abierto,
+    -- How long an open deposit has been waiting to be applied.
+    CASE WHEN p.fecha_compensacion IS NULL THEN DATEDIFF(DAY, p.fecha_documento, GETDATE()) END AS dias_pendiente,
+    CASE WHEN p.fecha_compensacion IS NOT NULL THEN NULL
+         WHEN DATEDIFF(DAY, p.fecha_documento, GETDATE()) <= 7  THEN '0-7 d'
+         WHEN DATEDIFF(DAY, p.fecha_documento, GETDATE()) <= 30 THEN '8-30 d'
+         WHEN DATEDIFF(DAY, p.fecha_documento, GETDATE()) <= 90 THEN '31-90 d'
+         ELSE '+90 d' END                                                        AS rango_pendiente,
+    CASE WHEN p.fecha_compensacion IS NOT NULL THEN NULL
+         WHEN DATEDIFF(DAY, p.fecha_documento, GETDATE()) <= 7  THEN 1
+         WHEN DATEDIFF(DAY, p.fecha_documento, GETDATE()) <= 30 THEN 2
+         WHEN DATEDIFF(DAY, p.fecha_documento, GETDATE()) <= 90 THEN 3
+         ELSE 4 END                                                              AS rango_pendiente_orden,
     p.monto
 FROM gold.fact_pagos p
 LEFT JOIN gold.fact_pagos_sin_aplicacion s
@@ -242,6 +254,45 @@ LEFT JOIN gold.dim_cliente_comercial dcc ON dcc.id_surrogate = COALESCE(vc.id_su
 LEFT JOIN gold.dim_cliente_credito   dk  ON dk.id_surrogate  = COALESCE(vk.id_surrogate, f.cliente_credito_sk)
 WHERE f.flag_compensada = 0
    OR f.fecha_compensacion >= DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()) - 36, 0);
+GO
+
+-- ----------------------------------------------------------------------------
+-- bi.fact_creditos_abiertos: open bsid lines that are not invoices (open deposits,
+-- credit notes, SA/AB adjustments), signed. Open invoices + these = what customers
+-- owe today. Attributes from the customer's current version, like open invoices.
+-- ----------------------------------------------------------------------------
+IF OBJECT_ID('bi.fact_creditos_abiertos', 'V') IS NOT NULL DROP VIEW bi.fact_creditos_abiertos;
+GO
+CREATE VIEW bi.fact_creditos_abiertos
+AS
+SELECT
+    CONVERT(VARCHAR(4), b.sociedad) + '|' + CONVERT(VARCHAR(4), b.ejercicio) + '|'
+        + b.documento_id + '|' + CONVERT(VARCHAR(6), b.posicion)                AS credito_key,
+    b.cliente_id,
+    COALESCE(LTRIM(RTRIM(vc.canal_distribucion)), 'SIN CANAL')                  AS canal_key,
+    COALESCE(UPPER(NULLIF(LTRIM(RTRIM(vc.region)), '')), 'SIN REGION')          AS region_key,
+    COALESCE(UPPER(NULLIF(LTRIM(RTRIM(vk.analista_credito_nombre)), '')), '(SIN ASIGNAR)') AS ejecutivo_key,
+    COALESCE(vc.estatus_comercial, 'SIN DATO')                                  AS estatus_comercial,
+    b.documento_id                                                              AS documento,
+    b.posicion,
+    b.clase_documento,
+    b.clave_contabilizacion,
+    b.fecha_documento,
+    b.sgtxt                                                                     AS texto,
+    CASE WHEN b.clase_documento = 'DZ'       THEN 'Pago o deposito abierto'
+         WHEN b.clase_documento LIKE 'C%'    THEN 'Nota de credito'
+         WHEN b.clase_documento IN ('SA','AB') THEN 'Ajuste contable'
+         ELSE 'Otro' END                                                        AS tipo_credito,
+    CASE WHEN b.debe_haber = 'H' THEN -b.monto_moneda_local ELSE b.monto_moneda_local END AS monto
+FROM silver.sap_bsid b
+LEFT JOIN gold.dim_cliente_comercial vc ON vc.cliente_id = b.cliente_id AND vc.es_vigente = 1
+LEFT JOIN gold.dim_cliente_credito   vk ON vk.cliente_id = b.cliente_id AND vk.es_vigente = 1
+WHERE b.mandante = '400'
+  AND NOT (b.debe_haber = 'S' AND (b.clase_documento LIKE 'F%' OR b.clase_documento = 'D1'))
+  AND b.cliente_id IN (
+        SELECT c1.cliente_id FROM gold.dim_cliente_comercial c1
+        WHERE c1.estatus_comercial <> 'FUERA_DE_ALCANCE'
+          AND c1.canal_distribucion IN (10, 40, 60));
 GO
 
 -- ----------------------------------------------------------------------------
