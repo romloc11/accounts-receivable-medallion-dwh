@@ -233,8 +233,13 @@ CROSS APPLY (
             ELSE 'G'
         END AS bucket_key
 ) x
-LEFT JOIN gold.dim_cliente_comercial dcc ON dcc.id_surrogate = f.cliente_comercial_sk
-LEFT JOIN gold.dim_cliente_credito   dk  ON dk.id_surrogate  = f.cliente_credito_sk
+-- Open invoices are a snapshot of today: they take the customer's current version, so
+-- scope, ejecutivo and region match the budget. Cleared invoices keep the version
+-- stored when they were posted.
+LEFT JOIN gold.dim_cliente_comercial vc  ON vc.cliente_id = f.cliente_id AND vc.es_vigente = 1 AND f.flag_compensada = 0
+LEFT JOIN gold.dim_cliente_credito   vk  ON vk.cliente_id = f.cliente_id AND vk.es_vigente = 1 AND f.flag_compensada = 0
+LEFT JOIN gold.dim_cliente_comercial dcc ON dcc.id_surrogate = COALESCE(vc.id_surrogate, f.cliente_comercial_sk)
+LEFT JOIN gold.dim_cliente_credito   dk  ON dk.id_surrogate  = COALESCE(vk.id_surrogate, f.cliente_credito_sk)
 WHERE f.flag_compensada = 0
    OR f.fecha_compensacion >= DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()) - 36, 0);
 GO
