@@ -955,10 +955,20 @@ Por eso el lado abierto se borra y recarga COMPLETO en cada corrida, sin ventana
 cargara por ventana, se acumularian facturas "abiertas" que se pagaron hace meses.
 Es la misma logica del reset FBRA aplicada a la carga: bsid manda sobre el estado de hoy.
 
+Desde el 2026-09-14 gold.fact_pagos lleva el MISMO patron: los pagos abiertos de bsid
+(depositos que entraron y nadie ha aplicado) se recargan completos en cada corrida, con
+fecha_compensacion NULL como marca. El puente nunca los liga, y gold.load_fact_pagos_sin_aplicacion
+los etiqueta PENDIENTE_DE_APLICAR, asi que la invariante "todo pago esta en el puente O en
+sin_aplicacion" sigue valiendo para ellos. Por eso los tres procs de pagos traen, ademas de
+su ventana, un paso por "fecha_compensacion IS NULL".
+
 --- LOS TRES FILTROS QUE DEFINEN EL MODELO ---
 Aparecen en varios procs; si se cambian, hay que cambiarlos en todos:
   1. alcance de cliente: canal 10/40/60, estatus <> FUERA_DE_ALCANCE
-  2. pagos: DZ + sgtxt 'Asignacion Aut. Deposito', EXCLUYENDO lineas de documento hijo
+  2. pagos: DZ + (texto 'Asignacion Aut. Deposito', o clave 11 con texto VACIO),
+     EXCLUYENDO lineas de documento hijo. La clave 11 sin texto entra desde el
+     2026-09-14 - ver el comentario en gold.load_fact_pagos. Compensados (bsad, sin
+     resets FBRA) y abiertos (bsid) con la misma regla
   3. facturas: debe_haber='S', clase F% o D1, EXCLUYENDO resets FBRA del lado compensado
 ========================================================================================
 */
@@ -1037,7 +1047,7 @@ AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;   -- ver "ATOMICIDAD" en la cabecera
-    DECLARE @t0 DATETIME = GETDATE(), @n INT, @lote INT, @recomp INT;
+    DECLARE @t0 DATETIME = GETDATE(), @n INT, @lote INT, @recomp INT, @n_abie INT, @descomp INT;
 
     IF @fecha_desde IS NULL
         SET @fecha_desde = DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()) - 1, 0);
@@ -1060,9 +1070,22 @@ BEGIN
             CASE WHEN b.debe_haber = 'H' THEN b.monto_moneda_local
                  ELSE -1 * b.monto_moneda_local END AS monto,
             b.sgtxt AS texto, b.clave_contabilizacion,
+            cta.cuenta_mayor,
             dcc.id_surrogate AS cliente_comercial_sk, dck.id_surrogate AS cliente_credito_sk
         INTO #pag
         FROM silver.sap_bsad b
+        /* CUENTA MAYOR (agregado 2026-09-14): la cuenta de efectivo donde cayo el dinero
+           -banco, caja o transitoria de pasarela-, tomada de la linea de banco del MISMO
+           documento. Sirve para filtrar por banco; ver alter_fact_pagos_cuenta_mayor.sql.
+           Una sola cuenta por documento, medido: ningun documento de 2026 cae en dos
+           cuentas de efectivo, asi que MIN() no elige, solo desempaca la unica que hay.
+           NULL = sin linea en una cuenta de efectivo (110 documentos en 2026). */
+        LEFT JOIN (SELECT documento_id, ejercicio, MIN(cuenta_mayor) AS cuenta_mayor
+                   FROM (SELECT documento_id, ejercicio, cuenta_mayor FROM silver.sap_bsas WHERE clase_documento = 'DZ'
+                         UNION ALL
+                         SELECT documento_id, ejercicio, cuenta_mayor FROM silver.sap_bsis WHERE clase_documento = 'DZ') e
+                   GROUP BY documento_id, ejercicio) cta
+               ON cta.documento_id = b.documento_id AND cta.ejercicio = b.ejercicio
         LEFT JOIN gold.dim_cliente_comercial dcc
                ON dcc.cliente_id = b.cliente_id
               AND b.fecha_contabilizacion >= dcc.fecha_inicio_vigencia
@@ -1079,7 +1102,21 @@ BEGIN
              Medido el 2026-09-09 sobre esta misma consulta: 2.4 s sin N, 149.6 s con N,
              identicas 14,061 filas. Sin los LEFT JOIN a las dimensiones la diferencia no
              aparece -por eso una prueba simplificada la deja pasar-. */
-          AND b.sgtxt = 'Asignación Aut. Deposito'
+          /* TEXTO (cambio 2026-09-14, decision del usuario). El filtro exigia el texto a todo,
+             y una comparacion contra NULL nunca da verdadero: una clave 11 -el programa
+             automatico de depositos, OS_APPLICATION- que llegaba SIN texto se perdia, aunque
+             es dinero que entra y el reporte del banco la trae (julio 2026: 88 docs,
+             $1,200,205.22 en las cuentas del reporte).
+             Por eso la clave 11 entra con texto VACIO, no con cualquier texto. Una clave 11
+             con otro texto es otra cosa: en julio y agosto el unico texto distinto fue
+             'CHEQUE DEVUELTO' (4 lineas, $124,643.65), ninguna en el reporte. Un cheque
+             devuelto no es cobranza, y "clave 11 con cualquier texto" los metia.
+             A lo que no es clave 11 se le sigue exigiendo el texto. Quitarlo por completo mete
+             clave 08 (consume un credito de OTRO documento), 07/17 (compensacion interna) y
+             15 re-aplicadas: julio +$569K de clave 15 contra -$985K de clave 08. El neto sale
+             chico por casualidad, no porque sea dinero nuevo.
+             Plan medido con los JOIN a dimensiones: 2.5 s con esta condicion, 3.1 s sin ella. */
+          AND (b.sgtxt = 'Asignación Aut. Deposito' OR (b.clave_contabilizacion = '11' AND b.sgtxt IS NULL))
           AND b.fecha_compensacion >= @fecha_desde
           AND (@fecha_hasta IS NULL OR b.fecha_compensacion < @fecha_hasta)
           AND b.cliente_id IN (
@@ -1095,8 +1132,73 @@ BEGIN
                 WHERE h.mandante = '400' AND h.clase_documento = 'DZ'
                   AND h.clave_contabilizacion = '11'
                   AND h.documento_compensacion = b.documento_id)
+          /* RESET DE COMPENSACION (FBRA): la linea sigue en bsad como compensada pero volvio a
+             bsid porque se deshizo la compensacion. GANA BSID, que es el estado de hoy - la
+             misma regla que gold.load_fact_facturas. Sin esto la llave entra dos veces, aqui y
+             en #abi, y el INSERT revienta. Medido 2026-09-14: 2 lineas, $54,480.88. */
+          AND NOT EXISTS (
+                SELECT 1 FROM silver.sap_bsid i
+                WHERE i.mandante = b.mandante AND i.sociedad = b.sociedad
+                  AND i.cliente_id = b.cliente_id AND i.ejercicio = b.ejercicio
+                  AND i.documento_id = b.documento_id AND i.posicion = b.posicion)
         OPTION (RECOMPILE);   -- ver "EL DEFAULT NULL" en la cabecera
         CREATE UNIQUE CLUSTERED INDEX ix_pag ON #pag(sociedad, cliente_id, ejercicio, documento_id, posicion);
+
+        /* PAGOS ABIERTOS (agregado 2026-09-14, decision del usuario). Depositos que ya entraron al
+           banco y todavia nadie aplica a facturas. Viven en silver.sap_bsid, no en bsad, y hasta
+           ese dia fact_pagos no los veia: aparecian hasta que alguien los aplicaba.
+           Misma regla que las compensadas: DZ, texto, alcance, sin documento hijo.
+           ES UNA FOTO DEL PRESENTE, como las facturas abiertas de gold.load_fact_facturas: se
+           borran y recargan COMPLETOS en cada corrida, sin ventana, sin importar @fecha_desde.
+           Un deposito abierto hoy puede estar aplicado manana; entonces sale de aqui y entra por
+           la ventana de compensadas con la misma llave.
+           fecha_compensacion NULL = pago abierto. Se escribe NULL a proposito y no la columna de
+           bsid (que hoy siempre viene NULL): el borrado de abiertos va por IS NULL, y un valor
+           inesperado alla dejaria filas que ninguna corrida vuelve a borrar.
+           Medido 2026-09-14: 261 lineas / $9,674,832.04 (245 de 2026). Los 24 documentos de julio
+           y agosto en las cuentas del reporte estan en el export, identicos al centavo. */
+        IF OBJECT_ID('tempdb..#abi') IS NOT NULL DROP TABLE #abi;
+        SELECT
+            b.sociedad, b.cliente_id, b.ejercicio, b.documento_id, b.posicion,
+            CAST(NULL AS VARCHAR(10)) AS documento_compensacion, CAST(NULL AS INT) AS ejercicio_compensacion,
+            b.fecha_documento, b.fecha_contabilizacion, CAST(NULL AS DATE) AS fecha_compensacion,
+            CASE WHEN b.debe_haber = 'H' THEN b.monto_moneda_local
+                 ELSE -1 * b.monto_moneda_local END AS monto,
+            b.sgtxt AS texto, b.clave_contabilizacion,
+            cta.cuenta_mayor,
+            dcc.id_surrogate AS cliente_comercial_sk, dck.id_surrogate AS cliente_credito_sk
+        INTO #abi
+        FROM silver.sap_bsid b
+        LEFT JOIN (SELECT documento_id, ejercicio, MIN(cuenta_mayor) AS cuenta_mayor
+                   FROM (SELECT documento_id, ejercicio, cuenta_mayor FROM silver.sap_bsas WHERE clase_documento = 'DZ'
+                         UNION ALL
+                         SELECT documento_id, ejercicio, cuenta_mayor FROM silver.sap_bsis WHERE clase_documento = 'DZ') e
+                   GROUP BY documento_id, ejercicio) cta
+               ON cta.documento_id = b.documento_id AND cta.ejercicio = b.ejercicio
+        LEFT JOIN gold.dim_cliente_comercial dcc
+               ON dcc.cliente_id = b.cliente_id
+              AND b.fecha_contabilizacion >= dcc.fecha_inicio_vigencia
+              AND (dcc.fecha_fin_vigencia IS NULL OR b.fecha_contabilizacion <= dcc.fecha_fin_vigencia)
+        LEFT JOIN gold.dim_cliente_credito dck
+               ON dck.cliente_id = b.cliente_id
+              AND b.fecha_contabilizacion >= dck.fecha_inicio_vigencia
+              AND (dck.fecha_fin_vigencia IS NULL OR b.fecha_contabilizacion <= dck.fecha_fin_vigencia)
+        WHERE b.mandante = '400'
+          AND b.clase_documento = 'DZ'
+          AND (b.sgtxt = 'Asignación Aut. Deposito' OR (b.clave_contabilizacion = '11' AND b.sgtxt IS NULL))
+          AND b.cliente_id IN (
+                SELECT c1.cliente_id FROM gold.dim_cliente_comercial c1
+                WHERE c1.estatus_comercial <> 'FUERA_DE_ALCANCE'
+                  AND c1.canal_distribucion IN (10, 40, 60))
+          -- Documento hijo: tambien hay lineas abiertas de hijo (la clave 15 que espera
+          -- aplicarse). Reaplican dinero ya contado; se excluyen igual que arriba.
+          AND NOT EXISTS (
+                SELECT 1 FROM silver.sap_bsad h
+                WHERE h.mandante = '400' AND h.clase_documento = 'DZ'
+                  AND h.clave_contabilizacion = '11'
+                  AND h.documento_compensacion = b.documento_id)
+        OPTION (RECOMPILE);
+        CREATE UNIQUE CLUSTERED INDEX ix_abi ON #abi(sociedad, cliente_id, ejercicio, documento_id, posicion);
 
         -- 1. Borrado de la ventana, en lotes (ver cabecera).
         SET @lote = 1;
@@ -1108,6 +1210,10 @@ BEGIN
               OPTION (RECOMPILE);
             SET @lote = @@ROWCOUNT;
         END
+
+        -- 1b. Abiertos: TODOS, sin ventana - es una foto del presente (ver #abi arriba). El
+        --     borrado de la ventana no los toca: NULL >= fecha nunca es verdadero. Cientos de filas.
+        DELETE FROM gold.fact_pagos WHERE fecha_compensacion IS NULL;
 
         /* 2. RECOMPENSACIONES. El borrado de arriba se guia por la fecha GUARDADA, y esa
            fecha SE MUEVE: si a un pago se le deshace la compensacion y se le rehace
@@ -1125,23 +1231,50 @@ BEGIN
         OPTION (RECOMPILE);
         SET @recomp = @@ROWCOUNT;
 
+        /* 2b. DESCOMPENSADOS - el caso inverso. Un pago guardado como compensado que HOY esta
+           abierto (reset FBRA): su fila vieja tiene fecha, sobrevive a los borrados de arriba si
+           esa fecha cae fuera de la ventana, y choca con su version abierta. Por llave contra
+           lo que va a entrar, por la misma razon que el paso 2. */
+        DELETE g
+        FROM   gold.fact_pagos g
+        JOIN   #abi c ON c.sociedad = g.sociedad AND c.cliente_id = g.cliente_id
+                     AND c.ejercicio = g.ejercicio AND c.documento_id = g.documento_id
+                     AND c.posicion = g.posicion;
+        SET @descomp = @@ROWCOUNT;
+
         INSERT INTO gold.fact_pagos (
             sociedad, cliente_id, ejercicio, documento_id, posicion,
             documento_compensacion, ejercicio_compensacion,
             fecha_documento, fecha_contabilizacion, fecha_compensacion,
-            monto, texto, clave_contabilizacion,
+            monto, texto, clave_contabilizacion, cuenta_mayor,
             cliente_comercial_sk, cliente_credito_sk)
         SELECT sociedad, cliente_id, ejercicio, documento_id, posicion,
                documento_compensacion, ejercicio_compensacion,
                fecha_documento, fecha_contabilizacion, fecha_compensacion,
-               monto, texto, clave_contabilizacion,
+               monto, texto, clave_contabilizacion, cuenta_mayor,
                cliente_comercial_sk, cliente_credito_sk
         FROM #pag;
         SET @n = @@ROWCOUNT;
 
+        INSERT INTO gold.fact_pagos (
+            sociedad, cliente_id, ejercicio, documento_id, posicion,
+            documento_compensacion, ejercicio_compensacion,
+            fecha_documento, fecha_contabilizacion, fecha_compensacion,
+            monto, texto, clave_contabilizacion, cuenta_mayor,
+            cliente_comercial_sk, cliente_credito_sk)
+        SELECT sociedad, cliente_id, ejercicio, documento_id, posicion,
+               documento_compensacion, ejercicio_compensacion,
+               fecha_documento, fecha_contabilizacion, fecha_compensacion,
+               monto, texto, clave_contabilizacion, cuenta_mayor,
+               cliente_comercial_sk, cliente_credito_sk
+        FROM #abi;
+        SET @n_abie = @@ROWCOUNT;
+
         COMMIT TRANSACTION;
 
         PRINT '   Filas: ' + CAST(@n AS VARCHAR(12))
+            + ' | Abiertos (bsid): ' + CAST(@n_abie AS VARCHAR(12))
+            + ' | Descompensados: ' + CAST(@descomp AS VARCHAR(12))
             + ' | Recompensados rescatados: ' + CAST(@recomp AS VARCHAR(12))
             + ' | Duracion: ' + CAST(DATEDIFF(SECOND, @t0, GETDATE()) AS VARCHAR(10)) + ' s';
     END TRY
@@ -1388,6 +1521,18 @@ BEGIN
         WHERE  p.fecha_compensacion >= @fecha_desde
           AND (@fecha_hasta IS NULL OR p.fecha_compensacion < @fecha_hasta)
         OPTION (RECOMPILE);
+
+        /* PAGOS QUE HOY ESTAN ABIERTOS (2026-09-14). Desde ese dia gold.fact_pagos trae los
+           pagos abiertos de bsid, con fecha_compensacion NULL. Ninguna regla de abajo los liga
+           -no tienen grupo- y la ventana nunca los toca. Pero un pago que estaba compensado y
+           se descompenso (reset FBRA) deja aqui sus filas viejas: si su fecha guardada cae fuera
+           de la ventana sobreviven, y el pago queda en el puente Y en sin_aplicacion. */
+        DELETE a
+        FROM   gold.fact_aplicacion_pagos a
+        JOIN   gold.fact_pagos p
+               ON  p.sociedad = a.sociedad AND p.ejercicio = a.ejercicio_pago
+               AND p.documento_id = a.pago_id AND p.posicion = a.posicion_pago
+        WHERE  p.fecha_compensacion IS NULL;
 
         -------------------------------------------------------- REGLA 1: GRUPO
         INSERT INTO gold.fact_aplicacion_pagos (
@@ -1653,7 +1798,7 @@ AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;   -- ver "ATOMICIDAD" en la cabecera
-    DECLARE @t0 DATETIME = GETDATE(), @n INT, @lote INT, @revisar INT, @huerfanos INT;
+    DECLARE @t0 DATETIME = GETDATE(), @n INT, @lote INT, @revisar INT, @huerfanos INT, @n_abie INT;
 
     IF @fecha_desde IS NULL
         SET @fecha_desde = DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()) - 1, 0);
@@ -1689,6 +1834,17 @@ BEGIN
         WHERE  p.fecha_compensacion >= @fecha_desde
           AND (@fecha_hasta IS NULL OR p.fecha_compensacion < @fecha_hasta)
         OPTION (RECOMPILE);
+
+        /* PAGOS ABIERTOS (2026-09-14): foto del presente, igual que en gold.load_fact_pagos.
+           Se van los que se guardaron abiertos -aunque hoy ya no lo esten- y los que hoy estan
+           abiertos aunque se hubieran guardado compensados (reset FBRA). Abajo se reinsertan. */
+        DELETE FROM gold.fact_pagos_sin_aplicacion WHERE fecha_compensacion IS NULL;
+        DELETE a
+        FROM   gold.fact_pagos_sin_aplicacion a
+        JOIN   gold.fact_pagos p
+               ON  p.sociedad = a.sociedad AND p.ejercicio = a.ejercicio
+               AND p.documento_id = a.documento_id AND p.posicion = a.posicion
+        WHERE  p.fecha_compensacion IS NULL;
 
         IF OBJECT_ID('tempdb..#salto2') IS NOT NULL DROP TABLE #salto2;
         SELECT DISTINCT h.documento_id AS hijo, h.documento_compensacion AS grupo_final,
@@ -1761,6 +1917,23 @@ BEGIN
         OPTION (RECOMPILE);   -- ver "EL DEFAULT NULL" en la cabecera
         SET @n = @@ROWCOUNT;
 
+        /* PENDIENTE_DE_APLICAR: el deposito ya entro al banco y nadie lo ha aplicado. No es un
+           caso de las ramas de arriba -esas explican por que un pago COMPENSADO no llego a
+           facturas; este todavia no se compensa-. Sale de aqui el dia que se aplica.
+           Ningun pago abierto puede estar en el puente: no tiene grupo, y REFERENCIA sale de la
+           clave 15 abierta del HIJO, que fact_pagos excluye (medido 2026-09-14: 0 lineas
+           abiertas con REBZG hacia factura). La clave distinta de 11/15 sigue siendo tecnica. */
+        INSERT INTO gold.fact_pagos_sin_aplicacion (
+            sociedad, cliente_id, ejercicio, documento_id, posicion,
+            documento_compensacion, fecha_compensacion, motivo)
+        SELECT p.sociedad, p.cliente_id, p.ejercicio, p.documento_id, p.posicion,
+               NULL, NULL,
+               CASE WHEN p.clave_contabilizacion NOT IN ('11','15') THEN 'LINEA_TECNICA'
+                    ELSE 'PENDIENTE_DE_APLICAR' END
+        FROM   gold.fact_pagos p
+        WHERE  p.fecha_compensacion IS NULL;
+        SET @n_abie = @@ROWCOUNT;
+
         COMMIT TRANSACTION;
 
         -- Las invariantes van FUERA de la transaccion, a proposito: solo leen, y si algo
@@ -1784,7 +1957,19 @@ BEGIN
                              AND s.documento_id=p.documento_id AND s.posicion=p.posicion)
                              OPTION (RECOMPILE);   -- ver "EL DEFAULT NULL" en la cabecera
 
+        -- Los abiertos no tienen fecha: la consulta de arriba no los ve. Mismo invariante.
+        SELECT @huerfanos = @huerfanos + COUNT(*)
+        FROM   gold.fact_pagos p
+        WHERE  p.fecha_compensacion IS NULL
+          AND  NOT EXISTS (SELECT 1 FROM gold.fact_aplicacion_pagos a
+                           WHERE a.sociedad=p.sociedad AND a.ejercicio_pago=p.ejercicio
+                             AND a.pago_id=p.documento_id AND a.posicion_pago=p.posicion)
+          AND  NOT EXISTS (SELECT 1 FROM gold.fact_pagos_sin_aplicacion s
+                           WHERE s.sociedad=p.sociedad AND s.ejercicio=p.ejercicio
+                             AND s.documento_id=p.documento_id AND s.posicion=p.posicion);
+
         PRINT '   Filas: ' + CAST(@n AS VARCHAR(12))
+            + ' | Pendientes de aplicar (abiertos): ' + CAST(@n_abie AS VARCHAR(12))
             + ' | Duracion: ' + CAST(DATEDIFF(SECOND, @t0, GETDATE()) AS VARCHAR(10)) + ' s';
         PRINT '   INVARIANTES (las dos deben ser 0) -> etiqueta REVISAR: ' + CAST(@revisar AS VARCHAR(12))
             + ' | pagos sin clasificar: ' + CAST(@huerfanos AS VARCHAR(12));

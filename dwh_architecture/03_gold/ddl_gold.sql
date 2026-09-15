@@ -728,9 +728,19 @@ cobertura observada y pasa a ser exacta.
 --   clave 11 = deposito virgen (el dinero llegando al banco)
 --   clave 15 en documento que NO es hijo = pago directo (dinero real sin deposito previo)
 --   claves 05/08 sueltas = reversos y traspasos, ajustes negativos de pagos que si estan
+-- TEXTO (2026-09-14): la clave 11 cuenta aunque venga SIN texto; con otro texto (por ejemplo
+-- 'CHEQUE DEVUELTO') no. Al resto se le sigue exigiendo 'Asignacion Aut. Deposito'. El
+-- cuadre de julio citado arriba es ANTERIOR a este cambio. Ver gold.load_fact_pagos.
 -- Se EXCLUYEN las lineas de un DOCUMENTO HIJO: su clave 15 reaplica dinero ya contado en
 -- la clave 11 y su clave 08 es el espejo. Sin ese filtro se cuenta el mismo deposito dos
 -- veces (+~$1.8M en julio, 123 lineas) - mismo bug que ya tuvo fact_pagos_compensados.
+--
+-- DOS POBLACIONES (desde 2026-09-14), igual que fact_facturas:
+--   compensados (bsad) -> historia desde 2022, cargados por ventana de fecha_compensacion
+--   abiertos    (bsid) -> FOTO DEL PRESENTE: depositos que ya entraron y nadie ha aplicado.
+--                         fecha_compensacion NULL es la marca. Se recargan completos en cada
+--                         corrida; el dia que se aplican salen de aqui y vuelven por la ventana.
+-- Reset FBRA (linea en bsad y en bsid a la vez): GANA BSID, es el estado de hoy.
 -- ========================================================================================
 -- IS NULL, no IS NOT NULL: si ya existe se respeta. Ver la nota de la cabecera.
 IF OBJECT_ID('gold.fact_pagos', 'U') IS NULL
@@ -746,11 +756,13 @@ CREATE TABLE gold.fact_pagos (
 
     fecha_documento         DATE,   -- fecha real del deposito
     fecha_contabilizacion   DATE,   -- el campo que cuadra con el reporte mensual de SAP
-    fecha_compensacion      DATE,   -- cuando SAP liquido la linea
+    fecha_compensacion      DATE,   -- cuando SAP liquido la linea; NULL = pago abierto (bsid)
 
     monto                   DECIMAL(15,2) NOT NULL,  -- YA FIRMADO: 'H' positivo, 'S' negativo
     texto                   VARCHAR(50),
     clave_contabilizacion   VARCHAR(2),
+    cuenta_mayor            VARCHAR(10),    -- cuenta de efectivo del documento (2026-09-14): en un
+                                            -- servidor existente la agrega alter_fact_pagos_cuenta_mayor.sql
 
     cliente_comercial_sk    INT,    -- version SCD2 vigente el dia de fecha_contabilizacion
     cliente_credito_sk      INT,
@@ -923,6 +935,11 @@ GO
 --                       exactamente que son y decidimos no atribuirlos. En julio y agosto
 --                       eran CERO; aparecen al mirar la historia completa.
 --   LINEA_TECNICA       lineas cuya clave no es 11 ni 15 (debitos espejo 08, reversos 05)
+--   PENDIENTE_DE_APLICAR (2026-09-14) pago ABIERTO: el deposito entro y nadie lo ha aplicado.
+--                       fecha_compensacion NULL, igual que en fact_pagos. Foto del presente:
+--                       se recarga completa y el pago sale de aqui el dia que se aplica.
+--                       Ninguno puede ir al puente - no tiene grupo, y REFERENCIA sale de la
+--                       clave 15 abierta del hijo, que fact_pagos excluye.
 --   REVISAR             caso desconocido. Debe dar 0 - si aparece, hay algo nuevo.
 --
 -- VA APARTE Y NO COMO FILAS DEL PUENTE: una fila del puente afirma "este pago toco ESTA
