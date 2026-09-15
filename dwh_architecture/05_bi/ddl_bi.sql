@@ -152,6 +152,11 @@ SELECT
     p.clave_contabilizacion,
     p.texto,
     p.cuenta_mayor,
+    -- Same account ranges bronze loads: 113* bank accounts, 111* payment-gateway clearing accounts.
+    CASE WHEN p.cuenta_mayor LIKE '0000113%' THEN 'Banco'
+         WHEN p.cuenta_mayor LIKE '0000111%' THEN 'Pasarela de pago'
+         WHEN p.cuenta_mayor IS NULL         THEN 'Sin cuenta de efectivo'
+         ELSE 'Otra cuenta' END                                                  AS tipo_cuenta,
     CASE WHEN s.motivo IS NULL THEN 'APLICADO' ELSE 'SIN APLICACION' END         AS estatus_aplicacion,
     COALESCE(s.motivo, 'APLICADO')                                               AS motivo_aplicacion,
     CASE WHEN p.fecha_compensacion IS NULL THEN 1 ELSE 0 END                     AS es_abierto,

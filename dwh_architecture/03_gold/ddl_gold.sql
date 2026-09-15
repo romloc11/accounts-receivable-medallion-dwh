@@ -542,3 +542,17 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes
                WHERE name = 'IX_fpsa_periodo' AND object_id = OBJECT_ID('gold.fact_pagos_sin_aplicacion'))
 CREATE INDEX IX_fpsa_periodo ON gold.fact_pagos_sin_aplicacion (fecha_compensacion, motivo);
 GO
+
+-- ----------------------------------------------------------------------------
+-- gold.cuenta_mayor_excluida: cash accounts whose payments are not cobranza.
+-- Business configuration inserted by hand; account codes are not kept in this
+-- repository. Read by gold.load_fact_pagos.
+-- ----------------------------------------------------------------------------
+IF OBJECT_ID('gold.cuenta_mayor_excluida', 'U') IS NULL
+CREATE TABLE gold.cuenta_mayor_excluida (
+    cuenta_mayor  VARCHAR(10)  NOT NULL,   -- with leading zeros, as in fact_pagos.cuenta_mayor
+    motivo        VARCHAR(200) NOT NULL,
+    fecha_alta    DATETIME     NOT NULL DEFAULT GETDATE(),
+    CONSTRAINT PK_cuenta_mayor_excluida PRIMARY KEY CLUSTERED (cuenta_mayor)
+);
+GO
