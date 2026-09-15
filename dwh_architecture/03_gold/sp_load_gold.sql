@@ -1,55 +1,22 @@
+/* ============================================================================
+   Gold load procedures
+   Objects : gold.load_dim_fecha, load_dim_cliente, load_dim_cliente_comercial,
+             load_dim_cliente_credito, load_fact_saldo_cartera,
+             load_fact_pagos_compensados, load_fact_facturas_compensadas,
+             load_dim_empleado, load_fact_pagos, load_fact_facturas,
+             load_fact_aplicacion_pagos, load_fact_facturas_pago_efectivo,
+             load_fact_pagos_sin_aplicacion, load_gold
+   Run     : EXEC gold.load_gold;   after silver.load_silver
+   Notes   : Every procedure can also run alone. Running this whole file is
+             safe: it only drops and creates procedures.
+   ============================================================================ */
 USE ANALISIS_DATOS;
-/*
-===============================================================================
-PROJECT: Enterprise Data Warehouse (dwh-ciosa)
-LAYER: Gold - load procedures for the star schema.
-
-STYLE: one stored procedure per dimension/fact, kept separate for isolated
-testing/debugging - same reasoning as the rest of this project given how many
-unexplained compilation issues this SQL Server 2012 instance has produced
-when things got batched together.
-
-CONSOLIDATED 2026-08-20 via gold.load_gold at the bottom of this file - an
-orchestrator that just EXECs the individual procedures below in the correct
-dependency order, so a full refresh is one EXEC instead of remembering 6.
-The individual procedures still exist and can still be run standalone for
-debugging - gold.load_gold adds no logic of its own, only sequencing. This
-EXEC-calling-proc pattern has NOT been tested before on this server (the
-only confirmed-broken proc-calling-proc pattern is control.sp_log_load, a
-different and more complex case with named params - see
-dwh-ciosa-sqlserver-constraints in memory) - if gold.load_gold ever fails to
-compile or run with a hard-to-trace error, this pattern is the first suspect.
-
-gold.dim_fecha IS loaded here (gold.load_dim_fecha, first procedure below) -
-2026-08-20: changed from a static one-time-populated calendar to a growing
-one, extended by this procedure on every gold.load_gold run. Retires the old
-populate_dim_fecha.sql (its bootstrap logic - what to do when the table is
-empty - is now just the NULL case inside this procedure).
-===============================================================================
-*/
 GO
 
-
--- ==========================================================
--- gold.load_dim_fecha (Calendar, no SCD)
--- REDESIGNED 2026-08-20: gold.dim_fecha went from static (2020-01-01 to
--- 2035-12-31, populated once) to growing - fixed lower bound at 2022-01-01
--- (bronze.sap_bsad's real start date), upper bound = today + 1 year (a
--- cushion for future due dates like NET-90 terms), automatically extended
--- on every run. Reason: the static range offered years with no real
--- transactions at all (e.g. the Power BI report's Year filter showed the
--- full 2020-2035 even though real data only existed since 2022) - see
--- dwh-ciosa-project-status in memory for the full detail.
---
--- Idempotent and safe to run every day: if it's already up to date
--- (MAX(fecha) >= today+1 year), the WHILE doesn't iterate at all. If the
--- table is empty (first time, new database), it starts from the fixed
--- lower bound - this replaces the bootstrap that populate_dim_fecha.sql
--- (now retired) used to do. NEVER deletes existing rows - only appends new
--- days at the end, never uses TRUNCATE (gold.fact_saldo_cartera already
--- has a real FK to this table with data - TRUNCATE would fail, the same
--- reason that already forced gold.load_dim_cliente to be redesigned).
--- ==========================================================
+-- ----------------------------------------------------------------------------
+-- gold.load_dim_fecha: appends days up to today + 1 year (from 2022-01-01 on an
+-- empty table) and recalculates the business-day columns for every row.
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('gold.load_dim_fecha', 'P') IS NOT NULL
     DROP PROCEDURE gold.load_dim_fecha;
 GO
@@ -58,14 +25,20 @@ CREATE PROCEDURE gold.load_dim_fecha
 AS
 BEGIN
     SET NOCOUNT ON;
-    DECLARE @start_time DATETIME, @end_time DATETIME, @rows_count INT = 0;
+
+    DECLARE @proc VARCHAR(128) = 'gold.load_dim_fecha',
+            @step VARCHAR(128) = 'start',
+            @t0   DATETIME2(0) = SYSDATETIME(),
+            @t    DATETIME2(0) = SYSDATETIME(),
+            @rows INT = 0,
+            @err  VARCHAR(4000),
+            @line INT;
     DECLARE @fecha_max_actual DATE, @fecha_max_objetivo DATE, @fecha_cursor DATE;
 
     BEGIN TRY
-        SET @start_time = GETDATE();
-        PRINT '>> Loading gold.dim_fecha...';
+        SET @step = 'gold.dim_fecha new days'; SET @t = SYSDATETIME();
 
-        SET DATEFIRST 7;  -- Sunday = 1, explicit so it doesn't depend on server configuration
+        SET DATEFIRST 7;  -- Sunday = 1, whatever the server setting
 
         SELECT @fecha_max_actual = MAX(fecha) FROM gold.dim_fecha;
         SET @fecha_max_objetivo = DATEADD(YEAR, 1, CAST(GETDATE() AS DATE));
@@ -100,18 +73,15 @@ BEGIN
                 CASE WHEN DATEPART(WEEKDAY, @fecha_cursor) IN (1, 7) THEN 1 ELSE 0 END,
                 DATEPART(ISO_WEEK, @fecha_cursor)
             );
-            SET @rows_count = @rows_count + 1;
+            SET @rows = @rows + 1;
             SET @fecha_cursor = DATEADD(DAY, 1, @fecha_cursor);
         END
+        EXEC control.log_step @proc, @step, @t, @rows;
 
-        -- ------------------------------------------------------------------
-        -- DIAS HABILES: se recalculan COMPLETAS, no solo para los dias nuevos.
-        -- El WHILE de arriba solo INSERTA, y estas columnas no dependen solo de la
-        -- fila: dia_habil_del_mes y dias_habiles_mes dependen del MES entero, y todas
-        -- dependen de gold.dim_festivo, que puede crecer despues. Si se calcularan al
-        -- insertar, agregar un festivo de 2027 dejaria mal numerado todo ese mes y
-        -- nadie se enteraria. Son ~72K filas: recalcular todo cuesta menos de 1 s.
-        -- ------------------------------------------------------------------
+        -- Recalculated for the whole table, not only the new days: they depend on the
+        -- whole month and on gold.dim_festivo, which can grow later.
+        SET @step = 'gold.dim_fecha business days'; SET @t = SYSDATETIME();
+
         UPDATE d
         SET    d.es_festivo     = CASE WHEN f.fecha IS NULL THEN 0 ELSE 1 END,
                d.nombre_festivo = f.nombre
@@ -135,39 +105,28 @@ BEGIN
         UPDATE d SET d.dias_habiles_mes = t.n
         FROM   gold.dim_fecha d JOIN t ON t.anio = d.anio AND t.mes = d.mes;
 
-        -- El mismo dia si ya es habil; si no, el siguiente que lo sea. Aqui vive la
-        -- regla del pronostico: una fecha de pago predicha que cae en domingo o
-        -- festivo se RECORRE, no se pierde ni se reparte.
+        -- A predicted payment date on a Sunday or a holiday moves to the next business day.
         UPDATE d
         SET    d.siguiente_dia_habil = (SELECT MIN(h.fecha) FROM gold.dim_fecha h
                                         WHERE h.fecha >= d.fecha AND h.es_dia_habil = 1)
         FROM   gold.dim_fecha d;
+        EXEC control.log_step @proc, @step, @t;
 
-        SET @end_time = GETDATE();
-        PRINT 'New days added: ' + CAST(@rows_count AS NVARCHAR) + ' | dias habiles recalculados | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
+        EXEC control.log_step @proc, 'total', @t0;
     END TRY
     BEGIN CATCH
-        PRINT 'ERROR in gold.dim_fecha: ' + ERROR_MESSAGE();
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+        SELECT @err = ERROR_MESSAGE(), @line = ERROR_LINE();
+        EXEC control.log_step @proc, @step, @t, NULL, @err, @line;
         THROW;
-    END CATCH;
+    END CATCH
 END;
 GO
 
-PRINT 'Procedure gold.load_dim_fecha created successfully.';
-GO
-
--- ==========================================================
--- gold.load_dim_cliente (SCD Type 1)
--- 2026-08-17: redesigned from TRUNCATE+INSERT to explicit UPDATE+INSERT (no
--- DELETE) - TRUNCATE stopped being viable as soon as gold.fact_aplicacion_pagos
--- added its FK to this table (SQL Server doesn't allow TRUNCATE on a table
--- referenced by an FK, regardless of whether the child table is empty).
--- Customers that no longer appear in kna1 are not deleted (a real hard
--- delete of a customer has never been observed in SAP, and deleting here
--- would risk breaking the facts' FKs if it ever does happen) - existing
--- ones are only updated and new ones inserted, the same "explicit, not
--- MERGE" principle already established for this file's SCD2 tables.
--- ==========================================================
+-- ----------------------------------------------------------------------------
+-- gold.load_dim_cliente: SCD1 by UPDATE + INSERT, never TRUNCATE (the table has
+-- incoming foreign keys). Customers gone from SAP are kept.
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('gold.load_dim_cliente', 'P') IS NOT NULL
     DROP PROCEDURE gold.load_dim_cliente;
 GO
@@ -176,11 +135,17 @@ CREATE PROCEDURE gold.load_dim_cliente
 AS
 BEGIN
     SET NOCOUNT ON;
-    DECLARE @start_time DATETIME, @end_time DATETIME, @rows_updated INT, @rows_inserted INT;
+
+    DECLARE @proc VARCHAR(128) = 'gold.load_dim_cliente',
+            @step VARCHAR(128) = 'start',
+            @t0   DATETIME2(0) = SYSDATETIME(),
+            @t    DATETIME2(0) = SYSDATETIME(),
+            @err  VARCHAR(4000),
+            @line INT;
+    DECLARE @rows_updated INT, @rows_inserted INT;
 
     BEGIN TRY
-        SET @start_time = GETDATE();
-        PRINT '>> Loading gold.dim_cliente...';
+        SET @step = 'gold.dim_cliente source'; SET @t = SYSDATETIME();
 
         IF OBJECT_ID('tempdb..#fuente_cliente') IS NOT NULL
             DROP TABLE #fuente_cliente;
@@ -189,42 +154,20 @@ BEGIN
             k.cliente_id,
             k.rfc,
             CASE
-                -- MARKETPLACE added 2026-08-27 - TOP priority (checked before FILIAL/SIN_RFC/GENERICO)
-                -- because these named accounts span every RFC bucket: Amazon has a real RFC (would
-                -- otherwise fall to PADRE), most Mercado Libre/Claro Shop variants have RFC='XAXX010101000'
-                -- (would otherwise fall to GENERICO), and the payment-gateway clearing accounts
-                -- (Mercado Libre/Mercado Pago "INGRESOS TRANSITORIA") have RFC NULL
-                -- (would otherwise fall to SIN_RFC). Identified by name, not RFC - confirmed against
-                -- real data 2026-08-27 (see dwh-ciosa-project-status.md in memory for the full account
-                -- list, 30 rows checked one by one before writing this). 'OPENPAY INGRESOS TRANSITORIA'
-                -- uses an EXACT match, not LIKE 'OPENPAY%' - a real customer, 'OPENPAY SAPI DE CV'
-                -- (RFC OPE130906HN4, unrelated to the payment gateway), would have been caught by a
-                -- broader pattern - confirmed by the user this must NOT be MARKETPLACE.
-                -- TRANSITORIA added 2026-09-05 (user decision) - checked BEFORE MARKETPLACE
-                -- because these two used to fall in that bucket. Payment-gateway clearing
-                -- accounts: money lands here on the gateway's own settlement calendar and is
-                -- then moved to the real customer, so they are neither a sales channel nor a
-                -- customer with credit behaviour. Only the two that actually move money:
-                --   <cliente-1> KUSHKY INGRESOS TRANSITORIA   (169 pagos / $33.66M in 2026)
-                --   <cliente-2> CONEKTA OXXO INGRESOS TRANSITORIA (2 pagos / ~$41K in 2026)
-                -- The other three '%INGRESOS TRANSITORIA%' accounts (MERCADO LIBRE <cliente-3>,
-                -- MERCADO PAGO <cliente-4>, OPENPAY <cliente-5>) carry $0 and stay MARKETPLACE by
-                -- the user's explicit decision - if any of them ever activates, this is the
-                -- branch to extend. Verified 2026-09-05: LIKE 'KUSHKY%'/'CONEKTA%' matches
-                -- exactly these two rows in silver.sap_kna1, nothing else.
+                -- Payment-gateway clearing accounts that move money: first.
                 WHEN k.nombre LIKE 'KUSHKY%' OR k.nombre LIKE 'CONEKTA%'
                     THEN 'TRANSITORIA'
+                -- Before the RFC rules: these accounts span every RFC case. OPENPAY is an
+                -- exact match because a real customer is named OPENPAY SAPI DE CV.
                 WHEN k.nombre = 'OPENPAY INGRESOS TRANSITORIA'
                      OR k.nombre LIKE 'MERCADO LIBRE%' OR k.nombre LIKE 'MERCADO PAGO%'
                      OR k.nombre LIKE '%AMAZON%' OR k.nombre LIKE 'CLAROSHOP%'
                     THEN 'MARKETPLACE'
                 WHEN kk.etiqueta_credito = 'FILIAL' THEN 'FILIAL'
-                -- Renamed from 'DIRECCION_ALTERNA' to 'SIN_RFC' 2026-08-27, user's own naming
-                -- preference - same condition (RFC IS NULL), no logic change.
                 WHEN k.rfc IS NULL THEN 'SIN_RFC'
                 WHEN k.rfc IN ('XAXX010101000', 'XEXX010101000') THEN 'GENERICO'
                 ELSE 'PADRE'
-            END AS tipo_cliente,  -- confirmed 2026-08-07: KRAUS='FILIAL' takes priority, then null/generic RFC
+            END AS tipo_cliente,
             k.nombre, k.nombre2, k.pais, k.estado, k.poblacion, k.codigo_postal, k.calle,
             k.bloqueo_pedido, k.regimen_fiscal, k.telefono, k.telefono_extra, k.whatsapp,
             k.fecha_creacion, k.grupo_cuentas, k.proveedor_vinculado, k.flag_bloqueado,
@@ -236,9 +179,7 @@ BEGIN
         LEFT JOIN silver.sap_knkk kk
             ON kk.cliente_id = k.cliente_id;
 
-        -- Step 1: update customers that already exist (regardless of
-        -- whether anything actually changed - SCD1 always overwrites,
-        -- there's no version to protect)
+        SET @step = 'gold.dim_cliente update'; SET @t = SYSDATETIME();
         UPDATE d
         SET d.rfc = f.rfc, d.tipo_cliente = f.tipo_cliente, d.nombre = f.nombre, d.nombre2 = f.nombre2,
             d.pais = f.pais, d.estado = f.estado, d.poblacion = f.poblacion, d.codigo_postal = f.codigo_postal,
@@ -254,8 +195,9 @@ BEGIN
         FROM gold.dim_cliente d
         JOIN #fuente_cliente f ON f.cliente_id = d.cliente_id;
         SET @rows_updated = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @rows_updated;
 
-        -- Step 2: insert new customers (didn't previously exist in dim_cliente)
+        SET @step = 'gold.dim_cliente insert'; SET @t = SYSDATETIME();
         INSERT INTO gold.dim_cliente (
             cliente_id, rfc, tipo_cliente, nombre, nombre2, pais, estado,
             poblacion, codigo_postal, calle, bloqueo_pedido, regimen_fiscal,
@@ -278,29 +220,24 @@ BEGIN
             SELECT 1 FROM gold.dim_cliente d WHERE d.cliente_id = f.cliente_id
         );
         SET @rows_inserted = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @rows_inserted;
 
         DROP TABLE #fuente_cliente;
 
-        SET @end_time = GETDATE();
-        PRINT 'Rows updated: ' + CAST(@rows_updated AS NVARCHAR) + ' | New rows: ' + CAST(@rows_inserted AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
+        EXEC control.log_step @proc, 'total', @t0;
     END TRY
     BEGIN CATCH
-        PRINT 'ERROR in gold.dim_cliente: ' + ERROR_MESSAGE();
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+        SELECT @err = ERROR_MESSAGE(), @line = ERROR_LINE();
+        EXEC control.log_step @proc, @step, @t, NULL, @err, @line;
         THROW;
-    END CATCH;
+    END CATCH
 END;
 GO
 
-PRINT 'Procedure gold.load_dim_cliente created successfully.';
-GO
-
--- ==========================================================
--- gold.load_dim_cliente_comercial (SCD Type 2)
--- The project's first real SCD2 - built in explicit steps (temp table +
--- UPDATE + INSERT) instead of a single MERGE, given this SQL Server 2012
--- instance's history of hard-to-trace compilation errors when too much
--- gets grouped into a single batch.
--- ==========================================================
+-- ----------------------------------------------------------------------------
+-- gold.load_dim_cliente_comercial: SCD2 in explicit steps
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('gold.load_dim_cliente_comercial', 'P') IS NOT NULL
     DROP PROCEDURE gold.load_dim_cliente_comercial;
 GO
@@ -309,15 +246,20 @@ CREATE PROCEDURE gold.load_dim_cliente_comercial
 AS
 BEGIN
     SET NOCOUNT ON;
-    DECLARE @start_time DATETIME, @end_time DATETIME, @rows_count INT;
+
+    DECLARE @proc VARCHAR(128) = 'gold.load_dim_cliente_comercial',
+            @step VARCHAR(128) = 'start',
+            @t0   DATETIME2(0) = SYSDATETIME(),
+            @t    DATETIME2(0) = SYSDATETIME(),
+            @rows INT,
+            @err  VARCHAR(4000),
+            @line INT;
     DECLARE @hoy DATE = CAST(GETDATE() AS DATE);
 
     BEGIN TRY
-        SET @start_time = GETDATE();
-        PRINT '>> Loading gold.dim_cliente_comercial...';
+        -- 1. Representative channel per customer: status priority, then lowest channel.
+        SET @step = 'gold.dim_cliente_comercial representative'; SET @t = SYSDATETIME();
 
-        -- Step 1: pick the representative channel per customer (status
-        -- priority, then lowest canal_distribucion as the final tiebreak)
         IF OBJECT_ID('tempdb..#representante') IS NOT NULL
             DROP TABLE #representante;
 
@@ -350,7 +292,8 @@ BEGIN
 
         DELETE FROM #representante WHERE rn <> 1;
 
-        -- Step 2: close active versions whose attribute hash changed
+        -- 2. Close the current version where the attribute hash changed.
+        SET @step = 'gold.dim_cliente_comercial close changed'; SET @t = SYSDATETIME();
         UPDATE d
         SET d.es_vigente = 0,
             d.fecha_fin_vigencia = DATEADD(DAY, -1, @hoy)
@@ -358,11 +301,11 @@ BEGIN
         JOIN #representante r ON r.cliente_id = d.cliente_id
         WHERE d.es_vigente = 1
           AND d.hash_atributos <> r.hash_atributos;
+        SET @rows = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @rows;
 
-        -- Step 3: insert a new version for customers that are new or have a
-        -- different hash (step 2 already closed the previous active
-        -- version for the ones that changed, so "no active version" covers
-        -- both cases: new AND changed)
+        -- 3. New version for new customers and for the ones closed in step 2.
+        SET @step = 'gold.dim_cliente_comercial insert versions'; SET @t = SYSDATETIME();
         INSERT INTO gold.dim_cliente_comercial (
             cliente_id, organizacion_ventas, canal_distribucion, sector,
             region, ruta, ruta_nombre, condicion_pago,
@@ -380,32 +323,26 @@ BEGIN
             WHERE d.cliente_id = r.cliente_id AND d.es_vigente = 1
         );
 
-        SET @rows_count = @@ROWCOUNT;
+        SET @rows = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @rows;
 
         DROP TABLE #representante;
 
-        SET @end_time = GETDATE();
-        PRINT 'New/versioned rows: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
+        EXEC control.log_step @proc, 'total', @t0;
     END TRY
     BEGIN CATCH
-        PRINT 'ERROR in gold.dim_cliente_comercial: ' + ERROR_MESSAGE();
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+        SELECT @err = ERROR_MESSAGE(), @line = ERROR_LINE();
+        EXEC control.log_step @proc, @step, @t, NULL, @err, @line;
         THROW;
-    END CATCH;
+    END CATCH
 END;
 GO
 
-PRINT 'Procedure gold.load_dim_cliente_comercial created successfully.';
-GO
-
--- ==========================================================
--- gold.load_dim_cliente_credito (SCD Type 2)
--- Requires gold.dim_cliente_comercial to already be loaded (it relies on
--- its active version to know "which channel" to use when looking up the
--- analyst/collector). Not called automatically - execution order
--- (comercial before credito) is the responsibility of whoever runs the
--- procedures, not a wrapper that calls one from the other (same reasoning
--- as dq, see the note in sp_load_dq.sql).
--- ==========================================================
+-- ----------------------------------------------------------------------------
+-- gold.load_dim_cliente_credito: SCD2. Needs gold.dim_cliente_comercial loaded
+-- first: the analyst and collector are taken on the channel it chose.
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('gold.load_dim_cliente_credito', 'P') IS NOT NULL
     DROP PROCEDURE gold.load_dim_cliente_credito;
 GO
@@ -414,18 +351,21 @@ CREATE PROCEDURE gold.load_dim_cliente_credito
 AS
 BEGIN
     SET NOCOUNT ON;
-    DECLARE @start_time DATETIME, @end_time DATETIME, @rows_count INT;
+
+    DECLARE @proc VARCHAR(128) = 'gold.load_dim_cliente_credito',
+            @step VARCHAR(128) = 'start',
+            @t0   DATETIME2(0) = SYSDATETIME(),
+            @t    DATETIME2(0) = SYSDATETIME(),
+            @rows INT,
+            @err  VARCHAR(4000),
+            @line INT;
     DECLARE @hoy DATE = CAST(GETDATE() AS DATE);
 
     BEGIN TRY
-        SET @start_time = GETDATE();
-        PRINT '>> Loading gold.dim_cliente_credito...';
+        -- 1. Credit analyst (E1) and collector (CC) on the representative channel,
+        --    lowest PARZA when a role is assigned twice.
+        SET @step = 'gold.dim_cliente_credito source'; SET @t = SYSDATETIME();
 
-        -- Step 1: credit analyst (E1) and collector (CC), resolved on the
-        -- channel gold.dim_cliente_comercial already chose as the
-        -- representative (same lowest-'contador' tiebreak used in
-        -- gold.vw_cliente_canal_estatus, in case there's more than one
-        -- assignment of the same role in that channel)
         IF OBJECT_ID('tempdb..#representante_credito') IS NOT NULL
             DROP TABLE #representante_credito;
 
@@ -479,7 +419,8 @@ BEGIN
             ON co.cliente_id = k.cliente_id AND co.organizacion_ventas = dc.organizacion_ventas
             AND co.canal_distribucion = dc.canal_distribucion AND co.sector = dc.sector AND co.rn = 1;
 
-        -- Step 2: close active versions whose attribute hash changed
+        -- 2. Close the current version where the attribute hash changed.
+        SET @step = 'gold.dim_cliente_credito close changed'; SET @t = SYSDATETIME();
         UPDATE d
         SET d.es_vigente = 0,
             d.fecha_fin_vigencia = DATEADD(DAY, -1, @hoy)
@@ -487,8 +428,11 @@ BEGIN
         JOIN #representante_credito r ON r.cliente_id = d.cliente_id
         WHERE d.es_vigente = 1
           AND d.hash_atributos <> r.hash_atributos;
+        SET @rows = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @rows;
 
-        -- Step 3: insert a new version for customers that are new or have a different hash
+        -- 3. New version for new customers and for the ones closed in step 2.
+        SET @step = 'gold.dim_cliente_credito insert versions'; SET @t = SYSDATETIME();
         INSERT INTO gold.dim_cliente_credito (
             cliente_id, limite_credito, bloqueo_credito, clasificacion_riesgo,
             etiqueta_credito, grupo_credito, analista_credito_id, analista_credito_nombre,
@@ -504,34 +448,26 @@ BEGIN
             WHERE d.cliente_id = r.cliente_id AND d.es_vigente = 1
         );
 
-        SET @rows_count = @@ROWCOUNT;
+        SET @rows = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @rows;
 
         DROP TABLE #representante_credito;
 
-        SET @end_time = GETDATE();
-        PRINT 'New/versioned rows: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
+        EXEC control.log_step @proc, 'total', @t0;
     END TRY
     BEGIN CATCH
-        PRINT 'ERROR in gold.dim_cliente_credito: ' + ERROR_MESSAGE();
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+        SELECT @err = ERROR_MESSAGE(), @line = ERROR_LINE();
+        EXEC control.log_step @proc, @step, @t, NULL, @err, @line;
         THROW;
-    END CATCH;
+    END CATCH
 END;
 GO
 
-PRINT 'Procedure gold.load_dim_cliente_credito created successfully.';
-GO
-
--- ==========================================================
--- gold.load_fact_saldo_cartera
--- Daily snapshot of each customer's open balance (silver.sap_bsid,
--- aggregated at the customer level) + historical payment behavior (DPP and
--- % on-time/late, from gold.fact_aplicacion_pagos WHERE
--- tipo_aplicacion='PAGO' - see Step 2 below). Fixed and validated
--- 2026-08-17 (first successful run: 4,571 customers with a balance). NEVER
--- deletes previous days' snapshots - only appends today's (with a DELETE
--- of today's date first, so it's safe to re-run it the same day without
--- duplicating).
--- ==========================================================
+-- ----------------------------------------------------------------------------
+-- gold.load_fact_saldo_cartera: today's snapshot of each customer's open balance.
+-- Re-runnable the same day: today's snapshot is replaced.
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('gold.load_fact_saldo_cartera', 'P') IS NOT NULL
     DROP PROCEDURE gold.load_fact_saldo_cartera;
 GO
@@ -540,32 +476,26 @@ CREATE PROCEDURE gold.load_fact_saldo_cartera
 AS
 BEGIN
     SET NOCOUNT ON;
-    DECLARE @start_time DATETIME, @end_time DATETIME, @rows_count INT;
+
+    DECLARE @proc VARCHAR(128) = 'gold.load_fact_saldo_cartera',
+            @step VARCHAR(128) = 'start',
+            @t0   DATETIME2(0) = SYSDATETIME(),
+            @t    DATETIME2(0) = SYSDATETIME(),
+            @rows INT,
+            @err  VARCHAR(4000),
+            @line INT;
     DECLARE @hoy DATE = CAST(GETDATE() AS DATE);
 
     BEGIN TRY
-        SET @start_time = GETDATE();
-        PRINT '>> Loading gold.fact_saldo_cartera (snapshot ' + CONVERT(VARCHAR, @hoy, 23) + ')...';
-
-        -- Idempotent: if it already ran today, that snapshot gets replaced (not duplicated)
+        SET @step = 'gold.fact_saldo_cartera delete today'; SET @t = SYSDATETIME();
         DELETE FROM gold.fact_saldo_cartera WHERE fecha_snapshot = @hoy;
+        SET @rows = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @rows;
 
-        -- Step 1: aggregate silver.sap_bsid at the customer level.
-        -- REDESIGNED 2026-08-18 after reconciling against an external
-        -- portfolio report (see ddl_gold.sql for the full detail of the 3
-        -- causes found):
-        --   1. monto_moneda_local NEVER carries a sign (same as bsad) -
-        --      debe_haber='H' (payments/credit notes/returns/adjustments
-        --      sitting as an unapplied open item) is signed as NEGATIVE
-        --      before aggregating (#bsid_firmado) - without this it was
-        --      added as debt instead of subtracted ($143.2M wrongly added
-        --      across ALL of bsid, unfiltered).
-        --   2. clase_documento='SA' (GL journal entries) excluded entirely
-        --      - these aren't real customer documents.
-        --   3. 16-day grace period: 1-16 days overdue = "healthy balance"
-        --      (saldo_1_16, does NOT count in saldo_vencido), only 17+
-        --      days is truly overdue. Aging buckets re-cut to
-        --      17-31/32-180/181+ to be comparable with the external report.
+        -- Amounts signed by debe_haber; SA documents are not customer documents.
+        -- 1-16 days overdue is a grace period; overdue buckets are 17-31 / 32-180 / 181+.
+        SET @step = 'gold.fact_saldo_cartera aggregate'; SET @t = SYSDATETIME();
+
         IF OBJECT_ID('tempdb..#bsid_firmado') IS NOT NULL
             DROP TABLE #bsid_firmado;
 
@@ -599,12 +529,7 @@ BEGIN
 
         DROP TABLE #bsid_firmado;
 
-        -- Step 2 (DPP / % on-time-late) REMOVED 2026-08-27 - now a Power BI
-        -- DAX time-intelligence measure over gold.vw_pago_factura_simple,
-        -- not a SQL object. See this table's own header comment in
-        -- ddl_gold.sql for the full reasoning.
-
-        -- Step 2 (was Step 3): combine balance + SCD2 dimensions (temporal join to @hoy) and insert
+        SET @step = 'gold.fact_saldo_cartera insert'; SET @t = SYSDATETIME();
         INSERT INTO gold.fact_saldo_cartera (
             cliente_id, fecha_snapshot,
             saldo_total, saldo_no_vencido, saldo_1_16, saldo_vencido, num_documentos_abiertos, dias_vencido_max,
@@ -625,34 +550,25 @@ BEGIN
         LEFT JOIN gold.dim_cliente_credito dcr
             ON dcr.cliente_id = s.cliente_id
             AND @hoy BETWEEN dcr.fecha_inicio_vigencia AND ISNULL(dcr.fecha_fin_vigencia, '99991231');
-        SET @rows_count = @@ROWCOUNT;
+        SET @rows = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @rows;
 
         DROP TABLE #saldo_cliente;
 
-        SET @end_time = GETDATE();
-        PRINT 'Rows (customers with a balance): ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
+        EXEC control.log_step @proc, 'total', @t0;
     END TRY
     BEGIN CATCH
-        PRINT 'ERROR in gold.fact_saldo_cartera: ' + ERROR_MESSAGE();
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+        SELECT @err = ERROR_MESSAGE(), @line = ERROR_LINE();
+        EXEC control.log_step @proc, @step, @t, NULL, @err, @line;
         THROW;
-    END CATCH;
+    END CATCH
 END;
 GO
 
-PRINT 'Procedure gold.load_fact_saldo_cartera created successfully.';
-GO
-
--- ==========================================================
--- gold.load_fact_aplicacion_pagos was REMOVED 2026-08-19 along with the
--- gold.fact_aplicacion_pagos table - see the note in ddl_gold.sql (real
--- over-attribution bugs in the 3-tier matching). Replaced by
--- gold.load_fact_pagos_compensados / gold.load_fact_facturas_compensadas
--- below, plus gold.vw_pago_factura_simple for the relationship.
--- ==========================================================
-
--- ==========================================================
--- gold.load_fact_pagos_compensados
--- ==========================================================
+-- ----------------------------------------------------------------------------
+-- gold.load_fact_pagos_compensados: legacy raw deposits, merge by clearing date
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('gold.load_fact_pagos_compensados', 'P') IS NOT NULL
     DROP PROCEDURE gold.load_fact_pagos_compensados;
 GO
@@ -661,20 +577,20 @@ CREATE PROCEDURE gold.load_fact_pagos_compensados
 AS
 BEGIN
     SET NOCOUNT ON;
-    DECLARE @start_time DATETIME, @end_time DATETIME, @rows_count INT;
+
+    DECLARE @proc VARCHAR(128) = 'gold.load_fact_pagos_compensados',
+            @step VARCHAR(128) = 'start',
+            @t0   DATETIME2(0) = SYSDATETIME(),
+            @t    DATETIME2(0) = SYSDATETIME(),
+            @rows INT,
+            @err  VARCHAR(4000),
+            @line INT;
 
     BEGIN TRY
-        SET @start_time = GETDATE();
-        PRINT '>> Loading gold.fact_pagos_compensados (Incremental Merge)...';
+        SET @step = 'gold.fact_pagos_compensados merge'; SET @t = SYSDATETIME();
 
         DECLARE @mes_anterior_inicio DATE = DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()) - 1, 0);
 
-        -- fecha_contabilizacion added 2026-08-29: neither fecha_documento nor fecha_compensacion
-        -- matches how SAP's own monthly payment reports bucket a payment into a period - both
-        -- were tried and ruled out with real data during a reconciliation investigation (see
-        -- dwh-ciosa-project-status.md in memory). fecha_contabilizacion (posting/GL date) is the
-        -- field that actually matches. Use it, not fecha_documento/fecha_compensacion, for any
-        -- future report that needs to match a SAP-side "pagos del periodo" export.
         MERGE gold.fact_pagos_compensados AS tgt
         USING (
             SELECT
@@ -683,39 +599,14 @@ BEGIN
                 b.documento_compensacion, b.ejercicio_compensacion
             FROM silver.sap_bsad b
             WHERE b.clase_documento = 'DZ'
-              -- sgtxt = 'Asignación Aut. Deposito' OR sgtxt LIKE 'BB%' (not a bare sgtxt IS NOT NULL) -
-              -- fix 2026-08-29, refined same day, see dwh-ciosa-project-status.md in memory for the
-              -- full investigation. Went through 2 iterations the same day:
-              --   1. sgtxt = 'Asignación Aut. Deposito' (original) was too strict - excluded real
-              --      payments whose SAP text varies (e.g. a large payment reallocated across several
-              --      invoices, each losing that exact phrase).
-              --   2. sgtxt IS NOT NULL (tried next) turned out too loose in the other direction -
-              --      it let through 'CHEQUE DEVUELTO' (a BOUNCED check - not real collected cash)
-              --      and a long tail of other one-off reference texts (SPEI, DEPOSITO DE TERCERO,
-              --      PAGO FACTURAS, etc.) whose business legitimacy as "real cobranza" hasn't been
-              --      confirmed with someone who owns these rules.
-              -- CURRENT (deliberately conservative): only 'Asignación Aut. Deposito' (the confirmed-
-              -- safe original pattern) and 'BB%' (bank reference codes, confirmed safe by the user) -
-              -- covers 98.6% of July's non-null-sgtxt population ($166.5M of $168.85M) at essentially
-              -- no cost, while excluding CHEQUE DEVUELTO and every unreviewed pattern until someone
-              -- with more business-rule knowledge confirms which of them are genuinely collected cash.
-              -- Known to UNDER-count vs. sgtxt IS NOT NULL by design - do not "fix" this by widening
-              -- the pattern again without that confirmation.
+              -- Text 'Asignación Aut. Deposito' or bank references BB%; every other text
+              -- (bounced checks, unreviewed references) stays out.
               AND (b.sgtxt = 'Asignación Aut. Deposito' OR b.sgtxt LIKE 'BB%')
-              AND b.debe_haber <> 'S' -- excludes the "child" document's mirror/offsetting line (fix 2026-08-19, see ddl_gold.sql)
-              AND b.monto_moneda_local > 0 -- excludes $0 technical residuals (fix 2026-08-19, see ddl_gold.sql)
+              AND b.debe_haber <> 'S'          -- not the child document's mirror line
+              AND b.monto_moneda_local > 0     -- not a $0 residual
               AND b.fecha_compensacion >= @mes_anterior_inicio
-              -- Self-canceling internal pair excluded (fix 2026-08-29): a document can carry TWO of
-              -- its own lines in the SAME self-referencing compensation group (documento_compensacion
-              -- = documento_id) - one 'S' (already excluded above) and one 'H' with the exact same
-              -- amount, netting to zero. That 'H' line is an internal reclassification receiving its
-              -- own reversal, not a second real deposit - but without this exclusion it was counted
-              -- as a 2nd "candidate" alongside the real deposit (a different document) in the same
-              -- compensation group, making gold.vw_pago_factura_simple's num_pagos_candidatos=1 "don't
-              -- guess" rule wrongly treat the whole group as ambiguous. Confirmed against real July
-              -- data before implementing: resolves 102 of 133 previously-ambiguous groups (~$192K
-              -- recovered); the other 27 groups (genuinely 2+ different real deposits, different
-              -- amounts) correctly remain excluded - see dwh-ciosa-project-status.md in memory.
+              -- Not a self-canceling internal pair: an H line of a document cleared
+              -- against an S line of the same document and amount.
               AND NOT (
                   b.documento_compensacion = b.documento_id
                   AND EXISTS (
@@ -750,23 +641,23 @@ BEGIN
                 src.fecha_documento, src.fecha_contabilizacion, src.fecha_compensacion, src.monto_moneda_local,
                 src.documento_compensacion, src.ejercicio_compensacion);
 
-        SET @rows_count = @@ROWCOUNT;
-        SET @end_time = GETDATE();
-        PRINT 'Rows: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
+        SET @rows = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @rows;
+
+        EXEC control.log_step @proc, 'total', @t0;
     END TRY
     BEGIN CATCH
-        PRINT 'ERROR in gold.fact_pagos_compensados: ' + ERROR_MESSAGE();
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+        SELECT @err = ERROR_MESSAGE(), @line = ERROR_LINE();
+        EXEC control.log_step @proc, @step, @t, NULL, @err, @line;
         THROW;
-    END CATCH;
+    END CATCH
 END;
 GO
 
-PRINT 'Procedure gold.load_fact_pagos_compensados created successfully.';
-GO
-
--- ==========================================================
--- gold.load_fact_facturas_compensadas
--- ==========================================================
+-- ----------------------------------------------------------------------------
+-- gold.load_fact_facturas_compensadas: legacy cleared invoices, merge by clearing date
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('gold.load_fact_facturas_compensadas', 'P') IS NOT NULL
     DROP PROCEDURE gold.load_fact_facturas_compensadas;
 GO
@@ -775,11 +666,17 @@ CREATE PROCEDURE gold.load_fact_facturas_compensadas
 AS
 BEGIN
     SET NOCOUNT ON;
-    DECLARE @start_time DATETIME, @end_time DATETIME, @rows_count INT;
+
+    DECLARE @proc VARCHAR(128) = 'gold.load_fact_facturas_compensadas',
+            @step VARCHAR(128) = 'start',
+            @t0   DATETIME2(0) = SYSDATETIME(),
+            @t    DATETIME2(0) = SYSDATETIME(),
+            @rows INT,
+            @err  VARCHAR(4000),
+            @line INT;
 
     BEGIN TRY
-        SET @start_time = GETDATE();
-        PRINT '>> Loading gold.fact_facturas_compensadas (Incremental Merge)...';
+        SET @step = 'gold.fact_facturas_compensadas merge'; SET @t = SYSDATETIME();
 
         DECLARE @mes_anterior_inicio DATE = DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()) - 1, 0);
 
@@ -815,30 +712,23 @@ BEGIN
                 src.fecha_documento, src.fecha_vencimiento, src.fecha_compensacion, src.monto_moneda_local,
                 src.documento_compensacion, src.ejercicio_compensacion);
 
-        SET @rows_count = @@ROWCOUNT;
-        SET @end_time = GETDATE();
-        PRINT 'Rows: ' + CAST(@rows_count AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
+        SET @rows = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @rows;
+
+        EXEC control.log_step @proc, 'total', @t0;
     END TRY
     BEGIN CATCH
-        PRINT 'ERROR in gold.fact_facturas_compensadas: ' + ERROR_MESSAGE();
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+        SELECT @err = ERROR_MESSAGE(), @line = ERROR_LINE();
+        EXEC control.log_step @proc, @step, @t, NULL, @err, @line;
         THROW;
-    END CATCH;
+    END CATCH
 END;
 GO
 
-PRINT 'Procedure gold.load_fact_facturas_compensadas created successfully.';
-GO
-
--- ==========================================================
--- gold.load_dim_empleado (SCD Type 1)
--- Same explicit UPDATE+INSERT pattern as gold.load_dim_cliente (no
--- TRUNCATE, no MERGE - see ddl_gold.sql for why). Employees who no longer
--- have a current (ENDDA='99991231') row in silver.sap_pa0001 (left the
--- company) are not deleted here, same reasoning as dim_cliente not deleting
--- customers gone from kna1 - a historical vendedor_id/cobrador_id already
--- captured on an SCD2 dimension should keep resolving to the name that was
--- true at the time, not silently go orphaned.
--- ==========================================================
+-- ----------------------------------------------------------------------------
+-- gold.load_dim_empleado: SCD1 by UPDATE + INSERT. Employees who left are kept.
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('gold.load_dim_empleado', 'P') IS NOT NULL
     DROP PROCEDURE gold.load_dim_empleado;
 GO
@@ -847,21 +737,25 @@ CREATE PROCEDURE gold.load_dim_empleado
 AS
 BEGIN
     SET NOCOUNT ON;
-    DECLARE @start_time DATETIME, @end_time DATETIME, @rows_updated INT, @rows_inserted INT;
+
+    DECLARE @proc VARCHAR(128) = 'gold.load_dim_empleado',
+            @step VARCHAR(128) = 'start',
+            @t0   DATETIME2(0) = SYSDATETIME(),
+            @t    DATETIME2(0) = SYSDATETIME(),
+            @err  VARCHAR(4000),
+            @line INT;
+    DECLARE @rows_updated INT, @rows_inserted INT;
 
     BEGIN TRY
-        SET @start_time = GETDATE();
-        PRINT '>> Loading gold.dim_empleado...';
-
-        -- Step 1: update employees that already exist (SCD1 always
-        -- overwrites, there's no version to protect)
+        SET @step = 'gold.dim_empleado update'; SET @t = SYSDATETIME();
         UPDATE d
         SET d.nombre = f.nombre, d.fecha_actualizacion = GETDATE()
         FROM gold.dim_empleado d
         JOIN silver.sap_pa0001 f ON f.id_empleado = d.id_empleado;
         SET @rows_updated = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @rows_updated;
 
-        -- Step 2: insert new employees (didn't previously exist in dim_empleado)
+        SET @step = 'gold.dim_empleado insert'; SET @t = SYSDATETIME();
         INSERT INTO gold.dim_empleado (id_empleado, nombre)
         SELECT f.id_empleado, f.nombre
         FROM silver.sap_pa0001 f
@@ -869,174 +763,38 @@ BEGIN
             SELECT 1 FROM gold.dim_empleado d WHERE d.id_empleado = f.id_empleado
         );
         SET @rows_inserted = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @rows_inserted;
 
-        SET @end_time = GETDATE();
-        PRINT 'Rows updated: ' + CAST(@rows_updated AS NVARCHAR) + ' | New rows: ' + CAST(@rows_inserted AS NVARCHAR) + ' | Duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
+        EXEC control.log_step @proc, 'total', @t0;
     END TRY
     BEGIN CATCH
-        PRINT 'ERROR in gold.dim_empleado: ' + ERROR_MESSAGE();
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+        SELECT @err = ERROR_MESSAGE(), @line = ERROR_LINE();
+        EXEC control.log_step @proc, @step, @t, NULL, @err, @line;
         THROW;
-    END CATCH;
+    END CATCH
 END;
 GO
 
-PRINT 'Procedure gold.load_dim_empleado created successfully.';
-/*
-========================================================================================
-PROCEDIMIENTOS DE CARGA del modelo de aplicacion de pagos
-========================================================================================
-Cuatro procs, incrementales por ventana de fecha_compensacion del PAGO. Se corren SIEMPRE
-en este orden - cada uno depende del anterior:
+-- ============================================================================
+-- Payment application model
+-- Order (gold.load_gold keeps it): load_fact_pagos -> load_fact_facturas ->
+-- load_fact_aplicacion_pagos -> load_fact_facturas_pago_efectivo ->
+-- load_fact_pagos_sin_aplicacion.
+-- @fecha_desde NULL = first day of the previous month; @fecha_hasta NULL = no
+-- upper bound. The window is on the payment's clearing date.
+-- OPTION (RECOMPILE) on windowed statements: the procedure compiles with the
+-- value it receives, and a NULL @fecha_desde plans for one row.
+-- Delete and insert run in one transaction (XACT_ABORT ON, ROLLBACK in CATCH),
+-- so a failure never leaves the window empty and queryable.
+-- Open items (bsid) are a snapshot, reloaded whole on every run.
+-- Load history with backfill_fact_aplicacion_pagos.sql: one window from 2022
+-- fills the 2 GB log.
+-- ============================================================================
 
-    1. gold.load_fact_pagos
-    2. gold.load_fact_facturas
-    3. gold.load_fact_aplicacion_pagos
-    4. gold.load_fact_pagos_sin_aplicacion
-
-Firma comun: @fecha_desde DATE, @fecha_hasta DATE = NULL
-  @fecha_desde NULL  -> arranca en el primer dia del mes anterior (modo diario)
-  @fecha_hasta NULL  -> sin tope superior
-
---- EL DEFAULT NULL ENVENENA EL PLAN: POR ESO HAY OPTION (RECOMPILE) ---
-Los cuatro procs declaran @fecha_desde DATE = NULL y calculan el default adentro
-(primer dia del mes anterior). Eso parece inofensivo y NO LO ES.
-
-SQL Server compila el cuerpo del proc con el valor RECIBIDO, no con el calculado.
-Llamado sin parametros -como lo hace gold.load_gold-, compila con @fecha_desde = NULL:
-"fecha_compensacion >= NULL" nunca es cierto, asi que ESTIMA 1 FILA y arma bucles
-anidados. Despues, en ejecucion, la variable ya vale una fecha real que trae ~80,000
-filas, y ese plan de "1 fila" las recorre una por una contra tablas de millones.
-
-Medido el 2026-09-07 sobre gold.load_fact_facturas, misma ventana en los tres casos:
-    EXEC load_fact_facturas                            >20 min  (sin terminar)
-    EXEC load_fact_facturas WITH RECOMPILE             >200 s   (compila con NULL igual)
-    EXEC load_fact_facturas '2026-08-01' WITH RECOMPILE   9.1 s
-Las mismas 4 sentencias corridas sueltas, con fecha literal: 11.2 s en total. El proc
-no era lento por lo que hace - era lento por con que valor se compilo.
-
-OPTION (RECOMPILE) va a NIVEL DE SENTENCIA a proposito: se compila cuando la variable
-YA tiene su valor real, en cada corrida. WITH RECOMPILE en el EXEC no sirve - compila
-al ENTRAR, cuando todavia es NULL. Cuesta milisegundos en procs que corren pocas veces
-al dia.
-
-OJO AL DEBUGGEAR: llamarlos a mano con fecha explicita puede salir rapido y esconder el
-problema, porque reusa el plan bueno que quedo en cache. La prueba honesta es sin
-parametros, que es como corren en produccion.
-
---- ATOMICIDAD: EL DELETE Y EL INSERT VAN JUNTOS O NO VAN ---
-Cada proc borra su ventana antes de insertarla. Los dos van dentro de UNA transaccion,
-con XACT_ABORT ON y ROLLBACK en el CATCH.
-No es precaucion teorica: el 2026-09-07 estos procs fallaron dos veces en el dia y las
-dos dejaron la tabla mutilada, porque el DELETE ya habia entrado y el INSERT no.
-    load_fact_pagos     -> gold.fact_pagos bajo de 614,353 a 601,392 filas
-    load_fact_facturas  -> se perdieron las compensadas desde agosto (PK duplicada)
-Lo grave no fue perder las filas: fue que el proc muere con un mensaje que nadie tiene
-por que estar leyendo, y la tabla queda consultable, con menos dinero, sin senal alguna.
-Un reporte contra esa tabla se ve normal.
-
---- BORRADO POR LOTES, NO DE UN JALON ---
-El DELETE va en lotes de 50,000 filas con WHILE + TOP. OJO: adentro de la transaccion el
-loteo YA NO acota el log - el log no puede truncarse hasta el COMMIT, asi que la ventana
-completa vive ahi de todas formas. Lo que sigue haciendo es evitar un solo DELETE gigante
-(escalamiento de bloqueos y un rollback monstruoso si truena).
-Lo que acota el log es el TAMANO DE LA VENTANA, y por eso estos procs son SOLO para carga
-incremental: una ventana diaria/mensual son ~150K filas y corre en segundos. El backfill
-historico NO los usa - inserta por anio en backfill_fact_aplicacion_pagos.sql, justamente
-porque un solo INSERT de 3.2M filas llena los 2 GB de log de este servidor (ya provoco
-Msg 9002 en este proyecto). No llames a estos procs con @fecha_desde en 2022.
-
---- LAS FACTURAS LLEVAN UN PATRON MIXTO, Y NO ES UN DESCUIDO ---
-gold.fact_facturas junta dos poblaciones con ritmos distintos:
-  compensadas -> historia inmutable. Se cargan por ventana y ya no cambian.
-  abiertas    -> FOTO DEL PRESENTE. Cambian todos los dias: una factura abierta hoy
-                 puede estar compensada manana, y entonces tiene que DESAPARECER del
-                 lado abierto.
-Por eso el lado abierto se borra y recarga COMPLETO en cada corrida, sin ventana. Si se
-cargara por ventana, se acumularian facturas "abiertas" que se pagaron hace meses.
-Es la misma logica del reset FBRA aplicada a la carga: bsid manda sobre el estado de hoy.
-
-Desde el 2026-09-14 gold.fact_pagos lleva el MISMO patron: los pagos abiertos de bsid
-(depositos que entraron y nadie ha aplicado) se recargan completos en cada corrida, con
-fecha_compensacion NULL como marca. El puente nunca los liga, y gold.load_fact_pagos_sin_aplicacion
-los etiqueta PENDIENTE_DE_APLICAR, asi que la invariante "todo pago esta en el puente O en
-sin_aplicacion" sigue valiendo para ellos. Por eso los tres procs de pagos traen, ademas de
-su ventana, un paso por "fecha_compensacion IS NULL".
-
---- LOS TRES FILTROS QUE DEFINEN EL MODELO ---
-Aparecen en varios procs; si se cambian, hay que cambiarlos en todos:
-  1. alcance de cliente: canal 10/40/60, estatus <> FUERA_DE_ALCANCE
-  2. pagos: DZ + (texto 'Asignacion Aut. Deposito', o clave 11 con texto VACIO),
-     EXCLUYENDO lineas de documento hijo. La clave 11 sin texto entra desde el
-     2026-09-14 - ver el comentario en gold.load_fact_pagos. Compensados (bsad, sin
-     resets FBRA) y abiertos (bsid) con la misma regla. Las reversas FB08 de una linea
-     contada se restan, linea por linea (2026-09-14)
-  3. facturas: debe_haber='S', clase F% o D1, EXCLUYENDO resets FBRA del lado compensado
-========================================================================================
-*/
-GO
-
--- ==========================================================
--- gold.load_gold (orchestrator)
--- A single EXEC to run the whole gold refresh, in the correct order. Has
--- no logic of its own, just chains the procedures above via EXEC - each
--- one still exists and can still be run standalone for isolated
--- debugging/testing.
---
--- ORDER (fixed, don't change without understanding the dependencies):
---   1. gold.load_dim_fecha             - growing, no dependencies. Goes
---      first because gold.fact_saldo_cartera (step 8) has a real FK to
---      this table - it must be up to date before inserting there.
---   2. gold.load_dim_empleado          - SCD1, no dependencies. No FK from
---      any other gold object (see ddl_gold.sql), so its position here is
---      not load-bearing - kept next to dim_cliente since both are simple
---      SCD1 identity dimensions with no dependents.
---   3. gold.load_dim_cliente           - SCD1, no dependencies.
---   4. gold.load_dim_cliente_comercial - SCD2, no dependencies.
---   5. gold.load_dim_cliente_credito   - SCD2, requires (4) to have
---      already run in this refresh (uses its active version to resolve
---      analyst/collector on the same channel (4) chose).
---   6. gold.load_fact_pagos_compensados            - incremental MERGE, no dependencies.
---   7. gold.load_fact_facturas_compensadas         - incremental MERGE, no dependencies.
---   8. gold.load_fact_saldo_cartera    - requires (1)-(7) to have already
---      run: the per-customer balance has an FK to dim_cliente (if a bsid
---      customer isn't in dim_cliente yet, the snapshot's full INSERT
---      fails), and the DPP reads from
---      fact_pagos_compensados/fact_facturas_compensadas - if they weren't
---      refreshed earlier in this same run, the DPP ends up computed with
---      stale data, with no visible error.
---
--- NOT PREVIOUSLY TESTED on this SQL Server 2012 instance: a gold/dq
--- procedure had never been called from INSIDE another one before. The
--- only proc-calls-proc pattern confirmed broken on this server is
--- control.sp_log_load (see dwh-ciosa-sqlserver-constraints in memory),
--- which takes ~8 named parameters - a simple parameterless EXEC like the
--- ones below is a much simpler pattern, but it's untested. If this
--- procedure fails to compile or run with a hard-to-trace error, this
--- pattern is the first suspect - test it in isolation (a single EXEC to a
--- single empty test procedure) before investigating any other cause.
--- ==========================================================
--- ##################################################################################
--- MODELO DE APLICACION DE PAGOS  (movido aqui desde sp_load_fact_aplicacion_pagos.sql
--- el 2026-09-07)
---
--- Estos cuatro procs viven en ESTE archivo, con los demas de la capa, y no aparte.
--- La razon no es de estilo: gold.load_gold los llama, y SQL Server resuelve los
--- nombres de procedimiento de forma DIFERIDA - CREATE PROCEDURE gold.load_gold
--- compila sin una sola queja aunque los cuatro no existan, y revienta hasta que
--- alguien lo EJECUTA. Tenerlos en otro archivo significaba que correr solo
--- sp_load_gold.sql dejaba un orquestador roto que se descubre en produccion.
---
--- El DDL de las cuatro tablas esta en ddl_gold.sql, con las otras ocho, pero
--- con una diferencia: las suyas dicen IF OBJECT_ID(...) IS NULL en vez de IS
--- NOT NULL + DROP. Correr ddl_gold.sql NO las borra - contienen el backfill
--- historico y recargarlo cuesta horas, no minutos como el resto de la capa.
--- ##################################################################################
-
-
-
--- ========================================================================================
--- 1. gold.load_fact_pagos
--- ========================================================================================
+-- ----------------------------------------------------------------------------
+-- gold.load_fact_pagos
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('gold.load_fact_pagos', 'P') IS NOT NULL
     DROP PROCEDURE gold.load_fact_pagos;
 GO
@@ -1047,27 +805,35 @@ CREATE PROCEDURE gold.load_fact_pagos
 AS
 BEGIN
     SET NOCOUNT ON;
-    SET XACT_ABORT ON;   -- ver "ATOMICIDAD" en la cabecera
-    DECLARE @t0 DATETIME = GETDATE(), @n INT, @lote INT, @recomp INT, @n_abie INT, @descomp INT, @n_rev INT, @n_rev_fuera INT;
+    SET XACT_ABORT ON;
+
+    DECLARE @proc VARCHAR(128) = 'gold.load_fact_pagos',
+            @step VARCHAR(128) = 'start',
+            @t0   DATETIME2(0) = SYSDATETIME(),
+            @t    DATETIME2(0) = SYSDATETIME(),
+            @rows INT,
+            @err  VARCHAR(4000),
+            @line INT;
+    DECLARE @n INT, @lote INT, @recomp INT, @n_abie INT, @descomp INT, @n_rev INT, @n_rev_fuera INT;
 
     IF @fecha_desde IS NULL
         SET @fecha_desde = DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()) - 1, 0);
 
     BEGIN TRY
-        PRINT '>> gold.load_fact_pagos | fecha_compensacion >= ' + CONVERT(VARCHAR(10), @fecha_desde, 120)
-            + CASE WHEN @fecha_hasta IS NULL THEN ' (sin tope)'
-                   ELSE ' y < ' + CONVERT(VARCHAR(10), @fecha_hasta, 120) END;
+        SET @step = 'window from ' + CONVERT(VARCHAR(10), @fecha_desde, 120)
+                  + COALESCE(' to ' + CONVERT(VARCHAR(10), @fecha_hasta, 120), ', no upper bound');
+        EXEC control.log_step @proc, @step, @t0;
 
         BEGIN TRANSACTION;
 
-        /* El conjunto entrante se materializa antes de borrar: se necesita para saber
-           QUE borrar (ver la nota de recompensacion abajo) y para insertar. */
+        -- The incoming set is materialized first: it decides what to delete and what to insert.
+        SET @step = 'read cleared payments'; SET @t = SYSDATETIME();
         IF OBJECT_ID('tempdb..#pag') IS NOT NULL DROP TABLE #pag;
         SELECT
             b.sociedad, b.cliente_id, b.ejercicio, b.documento_id, b.posicion,
             b.documento_compensacion, b.ejercicio_compensacion,
             b.fecha_documento, b.fecha_contabilizacion, b.fecha_compensacion,
-            -- silver.sap_bsad NUNCA trae el monto firmado: siempre positivo.
+            -- bsad amounts are unsigned
             CASE WHEN b.debe_haber = 'H' THEN b.monto_moneda_local
                  ELSE -1 * b.monto_moneda_local END AS monto,
             b.sgtxt AS texto, b.clave_contabilizacion,
@@ -1075,12 +841,7 @@ BEGIN
             dcc.id_surrogate AS cliente_comercial_sk, dck.id_surrogate AS cliente_credito_sk
         INTO #pag
         FROM silver.sap_bsad b
-        /* CUENTA MAYOR (agregado 2026-09-14): la cuenta de efectivo donde cayo el dinero
-           -banco, caja o transitoria de pasarela-, tomada de la linea de banco del MISMO
-           documento. Sirve para filtrar por banco.
-           Una sola cuenta por documento, medido: ningun documento de 2026 cae en dos
-           cuentas de efectivo, asi que MIN() no elige, solo desempaca la unica que hay.
-           NULL = sin linea en una cuenta de efectivo (110 documentos en 2026). */
+        -- Cash account of the same document. One per document: MIN() only unpacks it.
         LEFT JOIN (SELECT documento_id, ejercicio, MIN(cuenta_mayor) AS cuenta_mayor
                    FROM (SELECT documento_id, ejercicio, cuenta_mayor FROM silver.sap_bsas WHERE clase_documento = 'DZ'
                          UNION ALL
@@ -1097,26 +858,11 @@ BEGIN
               AND (dck.fecha_fin_vigencia IS NULL OR b.fecha_contabilizacion <= dck.fecha_fin_vigencia)
         WHERE b.mandante = '400'
           AND b.clase_documento = 'DZ'
-          /* SIN prefijo N, y no es cosmetico. sgtxt es VARCHAR con collation
-             SQL_Latin1_General_CP850_BIN2; compararlo contra un literal Unicode fuerza
-             una conversion implicita de la COLUMNA y cambia la estimacion del plan.
-             Medido el 2026-09-09 sobre esta misma consulta: 2.4 s sin N, 149.6 s con N,
-             identicas 14,061 filas. Sin los LEFT JOIN a las dimensiones la diferencia no
-             aparece -por eso una prueba simplificada la deja pasar-. */
-          /* TEXTO (cambio 2026-09-14, decision del usuario). El filtro exigia el texto a todo,
-             y una comparacion contra NULL nunca da verdadero: una clave 11 -el programa
-             automatico de depositos, OS_APPLICATION- que llegaba SIN texto se perdia, aunque
-             es dinero que entra y el reporte del banco la trae (julio 2026: 88 docs,
-             $1,200,205.22 en las cuentas del reporte).
-             Por eso la clave 11 entra con texto VACIO, no con cualquier texto. Una clave 11
-             con otro texto es otra cosa: en julio y agosto el unico texto distinto fue
-             'CHEQUE DEVUELTO' (4 lineas, $124,643.65), ninguna en el reporte. Un cheque
-             devuelto no es cobranza, y "clave 11 con cualquier texto" los metia.
-             A lo que no es clave 11 se le sigue exigiendo el texto. Quitarlo por completo mete
-             clave 08 (consume un credito de OTRO documento), 07/17 (compensacion interna) y
-             15 re-aplicadas: julio +$569K de clave 15 contra -$985K de clave 08. El neto sale
-             chico por casualidad, no porque sea dinero nuevo.
-             Plan medido con los JOIN a dimensiones: 2.5 s con esta condicion, 3.1 s sin ella. */
+          -- No N'' prefix: sgtxt is VARCHAR with a binary collation and a Unicode literal
+          -- converts the column (the plan went from 2 s to 150 s).
+          -- Key 11 (automatic deposit) counts with empty text only; with another text it
+          -- was a bounced check. Other keys still need the text, or keys 08/07/17 and
+          -- re-applied 15s get in.
           AND (b.sgtxt = 'Asignación Aut. Deposito' OR (b.clave_contabilizacion = '11' AND b.sgtxt IS NULL))
           AND b.fecha_compensacion >= @fecha_desde
           AND (@fecha_hasta IS NULL OR b.fecha_compensacion < @fecha_hasta)
@@ -1124,50 +870,31 @@ BEGIN
                 SELECT c1.cliente_id FROM gold.dim_cliente_comercial c1
                 WHERE c1.estatus_comercial <> 'FUERA_DE_ALCANCE'
                   AND c1.canal_distribucion IN (10, 40, 60))
-          -- Excluye lineas de DOCUMENTO HIJO: su clave 15 reaplica dinero ya contado en
-          -- la clave 11 y su clave 08 es el espejo. Sin esto se cuenta dos veces.
-          -- El alias `b.` NO es cosmetico: sin calificar, la columna se resuelve contra
-          -- la tabla INTERNA y la condicion se vuelve siempre verdadera.
+          -- Not a line of a child document: its key 15 re-applies money already counted in
+          -- the key 11. Keep the alias b.: unqualified, the column binds to the inner table
+          -- and the condition is always true.
           AND NOT EXISTS (
                 SELECT 1 FROM silver.sap_bsad h
                 WHERE h.mandante = '400' AND h.clase_documento = 'DZ'
                   AND h.clave_contabilizacion = '11'
                   AND h.documento_compensacion = b.documento_id)
-          /* RESET DE COMPENSACION (FBRA): la linea sigue en bsad como compensada pero volvio a
-             bsid porque se deshizo la compensacion. GANA BSID, que es el estado de hoy - la
-             misma regla que gold.load_fact_facturas. Sin esto la llave entra dos veces, aqui y
-             en #abi, y el INSERT revienta. Medido 2026-09-14: 2 lineas, $54,480.88. */
+          -- Clearing reset: the line is back in bsid, bsid wins.
           AND NOT EXISTS (
                 SELECT 1 FROM silver.sap_bsid i
                 WHERE i.mandante = b.mandante AND i.sociedad = b.sociedad
                   AND i.cliente_id = b.cliente_id AND i.ejercicio = b.ejercicio
                   AND i.documento_id = b.documento_id AND i.posicion = b.posicion)
-        OPTION (RECOMPILE);   -- ver "EL DEFAULT NULL" en la cabecera
+        OPTION (RECOMPILE);
+        SET @rows = @@ROWCOUNT;
         CREATE UNIQUE CLUSTERED INDEX ix_pag ON #pag(sociedad, cliente_id, ejercicio, documento_id, posicion);
+        EXEC control.log_step @proc, @step, @t, @rows;
 
-        /* REVERSAS (agregado 2026-09-14, decision del usuario). Una reversa FB08 de un pago
-           contado se RESTA, linea por linea. Es la regla medida el 2026-09-11 (analisis
-           cobranza_regla_reversas.sql, retirado, en el historial de git): se resta una
-           reversa solo si lo que anula fue contado.
-           Por que hacia falta: FB08 compensa el documento original contra la reversa, asi que
-           la reversa de un deposito "compensa una clave 11" y la condicion de documento hijo
-           de arriba la tiraba; ademas trae clave 02 y casi siempre texto vacio. Resultado:
-           fact_pagos contaba el deposito y nunca su reversa, y el reporte los deja en cero.
-           Caso que lo destapo: un deposito automatico de $9,658.07 y su reversa el mismo dia,
-           julio 2026 - el reporte traia los dos, fact_pagos solo el deposito.
-           POR LINEA, NO POR DOCUMENTO: la reversa trae el espejo de TODAS las lineas del
-           original, contadas o no, y algunas ya estan en #pag por su texto. Meter el documento
-           completo sumaba dinero de mas (medido: 30 pares descuadrados, +$337K en un solo par
-           de junio 2024). Entra solo el espejo de una linea contada: mismo cliente, misma
-           posicion, monto con signo contrario, y que no este ya en #pag.
-           Medido 2022->hoy: 1,538 pares depositos/reversa, TODAS las lineas de reversa con
-           exactamente un espejo; con esta regla los 1,538 quedan en neto 0 al centavo.
-           Entran 564 lineas / -$14,512,695.16 (jul 2026 -$35,836.79, ago -$42,879.33).
-           La reversa se compensa el mismo dia que el original (1,538 de 1,538), asi que cae en
-           la misma ventana. indicador_reversa = '2' es el lado reversa del par (XREVERSAL): en
-           silver.sap_bkpf son exactamente los documentos FB08 que anulan otro.
-           El join a bkpf va DESDE #pag: bkpf no tiene indice por documento_reversa, y asi la
-           linea de bsad se busca por su llave completa. */
+        -- Reversals (FB08) of a counted line are subtracted, line by line: the mirror of a
+        -- counted line (same customer and position, opposite amount) not already in #pag.
+        -- By line because a reversal mirrors every line of the original, counted or not.
+        -- indicador_reversa = '2' is the reversal side. The join starts from #pag because
+        -- bkpf has no index on documento_reversa.
+        SET @step = 'add reversals of counted lines'; SET @t = SYSDATETIME();
         INSERT INTO #pag (
             sociedad, cliente_id, ejercicio, documento_id, posicion,
             documento_compensacion, ejercicio_compensacion,
@@ -1209,28 +936,22 @@ BEGIN
                ON dck.cliente_id = b.cliente_id
               AND b.fecha_contabilizacion >= dck.fecha_inicio_vigencia
               AND (dck.fecha_fin_vigencia IS NULL OR b.fecha_contabilizacion <= dck.fecha_fin_vigencia)
-        -- Ya contada por su texto: no se mete dos veces.
         WHERE NOT EXISTS (SELECT 1 FROM #pag x
                           WHERE x.sociedad = b.sociedad AND x.cliente_id = b.cliente_id
                             AND x.ejercicio = b.ejercicio AND x.documento_id = b.documento_id
                             AND x.posicion = b.posicion)
-          -- Mismo criterio FBRA que arriba: si volvio a bsid, gana bsid.
           AND NOT EXISTS (SELECT 1 FROM silver.sap_bsid i
                           WHERE i.mandante = b.mandante AND i.sociedad = b.sociedad
                             AND i.cliente_id = b.cliente_id AND i.ejercicio = b.ejercicio
                             AND i.documento_id = b.documento_id AND i.posicion = b.posicion)
         OPTION (RECOMPILE);
         SET @n_rev = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @n_rev;
 
-        /* LA OTRA MITAD DE LA REGLA: una reversa que YA estaba en #pag por su texto, pero cuyo
-           espejo en el original NO se conto, restaba dinero que nunca se sumo. Sale.
-           Medido 2022->hoy: 2 lineas, -$430,532.18. En los dos casos el original es una clave
-           15 capturada a mano (FBZ1/FB05) SIN texto -la regla de texto no la cuenta- y la
-           reversa FB08 clave 05 si trae 'Asignacion Aut. Deposito'. El mayor, -$428,552.29 en
-           noviembre 2025.
-           Depende de que original y reversa caigan en la MISMA ventana: FB08 compensa el
-           original contra la reversa, asi que comparten fecha de compensacion por construccion
-           (medido: 1,540 pares de 1,540). */
+        -- A reversal already in #pag by its text, whose original line was not counted,
+        -- subtracts money never added: it leaves. Original and reversal share the
+        -- clearing date, so both fall in the same window.
+        SET @step = 'remove reversals of uncounted lines'; SET @t = SYSDATETIME();
         DELETE x
         FROM   #pag x
         JOIN   silver.sap_bkpf k
@@ -1243,20 +964,11 @@ BEGIN
                              AND o.posicion = x.posicion AND o.monto = -1 * x.monto)
         OPTION (RECOMPILE);
         SET @n_rev_fuera = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @n_rev_fuera;
 
-        /* PAGOS ABIERTOS (agregado 2026-09-14, decision del usuario). Depositos que ya entraron al
-           banco y todavia nadie aplica a facturas. Viven en silver.sap_bsid, no en bsad, y hasta
-           ese dia fact_pagos no los veia: aparecian hasta que alguien los aplicaba.
-           Misma regla que las compensadas: DZ, texto, alcance, sin documento hijo.
-           ES UNA FOTO DEL PRESENTE, como las facturas abiertas de gold.load_fact_facturas: se
-           borran y recargan COMPLETOS en cada corrida, sin ventana, sin importar @fecha_desde.
-           Un deposito abierto hoy puede estar aplicado manana; entonces sale de aqui y entra por
-           la ventana de compensadas con la misma llave.
-           fecha_compensacion NULL = pago abierto. Se escribe NULL a proposito y no la columna de
-           bsid (que hoy siempre viene NULL): el borrado de abiertos va por IS NULL, y un valor
-           inesperado alla dejaria filas que ninguna corrida vuelve a borrar.
-           Medido 2026-09-14: 261 lineas / $9,674,832.04 (245 de 2026). Los 24 documentos de julio
-           y agosto en las cuentas del reporte estan en el export, identicos al centavo. */
+        -- Open payments (bsid): same rule, a snapshot of today. fecha_compensacion is
+        -- written as NULL because the open-payment delete filters on IS NULL.
+        SET @step = 'read open payments'; SET @t = SYSDATETIME();
         IF OBJECT_ID('tempdb..#abi') IS NOT NULL DROP TABLE #abi;
         SELECT
             b.sociedad, b.cliente_id, b.ejercicio, b.documento_id, b.posicion,
@@ -1290,17 +1002,18 @@ BEGIN
                 SELECT c1.cliente_id FROM gold.dim_cliente_comercial c1
                 WHERE c1.estatus_comercial <> 'FUERA_DE_ALCANCE'
                   AND c1.canal_distribucion IN (10, 40, 60))
-          -- Documento hijo: tambien hay lineas abiertas de hijo (la clave 15 que espera
-          -- aplicarse). Reaplican dinero ya contado; se excluyen igual que arriba.
+          -- Open lines of a child document stay out too.
           AND NOT EXISTS (
                 SELECT 1 FROM silver.sap_bsad h
                 WHERE h.mandante = '400' AND h.clase_documento = 'DZ'
                   AND h.clave_contabilizacion = '11'
                   AND h.documento_compensacion = b.documento_id)
         OPTION (RECOMPILE);
+        SET @rows = @@ROWCOUNT;
         CREATE UNIQUE CLUSTERED INDEX ix_abi ON #abi(sociedad, cliente_id, ejercicio, documento_id, posicion);
+        EXEC control.log_step @proc, @step, @t, @rows;
 
-        -- 1. Borrado de la ventana, en lotes (ver cabecera).
+        SET @step = 'delete window'; SET @t = SYSDATETIME(); SET @rows = 0;
         SET @lote = 1;
         WHILE @lote > 0
         BEGIN
@@ -1309,20 +1022,18 @@ BEGIN
               AND (@fecha_hasta IS NULL OR fecha_compensacion < @fecha_hasta)
               OPTION (RECOMPILE);
             SET @lote = @@ROWCOUNT;
+            SET @rows = @rows + @lote;
         END
+        EXEC control.log_step @proc, @step, @t, @rows;
 
-        -- 1b. Abiertos: TODOS, sin ventana - es una foto del presente (ver #abi arriba). El
-        --     borrado de la ventana no los toca: NULL >= fecha nunca es verdadero. Cientos de filas.
+        SET @step = 'delete open payments'; SET @t = SYSDATETIME();
         DELETE FROM gold.fact_pagos WHERE fecha_compensacion IS NULL;
+        SET @rows = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @rows;
 
-        /* 2. RECOMPENSACIONES. El borrado de arriba se guia por la fecha GUARDADA, y esa
-           fecha SE MUEVE: si a un pago se le deshace la compensacion y se le rehace
-           despues, en gold sigue con la fecha vieja -fuera de la ventana, asi que
-           sobrevive- y el INSERT lo trae con la nueva. Misma PK, dos filas, proc muerto.
-           Le paso a gold.fact_facturas el 2026-09-09 y tumbo la carga entera con UN solo
-           caso; aqui daba 0 ese dia, pero es el mismo hueco. Borrar por LLAVE contra lo
-           que va a entrar es lo unico que lo cierra: ampliar la ventana no basta, la
-           fecha nueva puede venir de cualquier momento. */
+        -- A re-cleared payment keeps its old stored date, outside the window: delete by
+        -- key against what comes in.
+        SET @step = 'delete re-cleared by key'; SET @t = SYSDATETIME();
         DELETE g
         FROM   gold.fact_pagos g
         JOIN   #pag c ON c.sociedad = g.sociedad AND c.cliente_id = g.cliente_id
@@ -1330,18 +1041,19 @@ BEGIN
                      AND c.posicion = g.posicion
         OPTION (RECOMPILE);
         SET @recomp = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @recomp;
 
-        /* 2b. DESCOMPENSADOS - el caso inverso. Un pago guardado como compensado que HOY esta
-           abierto (reset FBRA): su fila vieja tiene fecha, sobrevive a los borrados de arriba si
-           esa fecha cae fuera de la ventana, y choca con su version abierta. Por llave contra
-           lo que va a entrar, por la misma razon que el paso 2. */
+        -- The opposite: stored as cleared, open today.
+        SET @step = 'delete no longer cleared by key'; SET @t = SYSDATETIME();
         DELETE g
         FROM   gold.fact_pagos g
         JOIN   #abi c ON c.sociedad = g.sociedad AND c.cliente_id = g.cliente_id
                      AND c.ejercicio = g.ejercicio AND c.documento_id = g.documento_id
                      AND c.posicion = g.posicion;
         SET @descomp = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @descomp;
 
+        SET @step = 'insert cleared'; SET @t = SYSDATETIME();
         INSERT INTO gold.fact_pagos (
             sociedad, cliente_id, ejercicio, documento_id, posicion,
             documento_compensacion, ejercicio_compensacion,
@@ -1355,7 +1067,9 @@ BEGIN
                cliente_comercial_sk, cliente_credito_sk
         FROM #pag;
         SET @n = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @n;
 
+        SET @step = 'insert open'; SET @t = SYSDATETIME();
         INSERT INTO gold.fact_pagos (
             sociedad, cliente_id, ejercicio, documento_id, posicion,
             documento_compensacion, ejercicio_compensacion,
@@ -1369,34 +1083,24 @@ BEGIN
                cliente_comercial_sk, cliente_credito_sk
         FROM #abi;
         SET @n_abie = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @n_abie;
 
         COMMIT TRANSACTION;
 
-        PRINT '   Filas: ' + CAST(@n AS VARCHAR(12))
-            + ' (reversas restadas: ' + CAST(@n_rev AS VARCHAR(12))
-            + ', reversas de algo no contado quitadas: ' + CAST(@n_rev_fuera AS VARCHAR(12)) + ')'
-            + ' | Abiertos (bsid): ' + CAST(@n_abie AS VARCHAR(12))
-            + ' | Descompensados: ' + CAST(@descomp AS VARCHAR(12))
-            + ' | Recompensados rescatados: ' + CAST(@recomp AS VARCHAR(12))
-            + ' | Duracion: ' + CAST(DATEDIFF(SECOND, @t0, GETDATE()) AS VARCHAR(10)) + ' s';
+        EXEC control.log_step @proc, 'total', @t0;
     END TRY
     BEGIN CATCH
-        -- Sin esto la ventana queda con el hueco del DELETE y el proc muere
-        -- "limpio": el reporte del dia sale con menos dinero y nada avisa.
         IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
-        PRINT 'ERROR en gold.load_fact_pagos: ' + ERROR_MESSAGE();
+        SELECT @err = ERROR_MESSAGE(), @line = ERROR_LINE();
+        EXEC control.log_step @proc, @step, @t, NULL, @err, @line;
         THROW;
-    END CATCH;
+    END CATCH
 END;
 GO
 
-PRINT 'Procedure gold.load_fact_pagos created successfully.';
-GO
-
-
--- ========================================================================================
--- 2. gold.load_fact_facturas   (patron MIXTO - ver cabecera)
--- ========================================================================================
+-- ----------------------------------------------------------------------------
+-- gold.load_fact_facturas: cleared invoices by window, open invoices whole
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('gold.load_fact_facturas', 'P') IS NOT NULL
     DROP PROCEDURE gold.load_fact_facturas;
 GO
@@ -1408,26 +1112,25 @@ AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
-    DECLARE @t0 DATETIME = GETDATE(), @n_comp INT, @n_abie INT, @lote INT, @recomp INT;
+
+    DECLARE @proc VARCHAR(128) = 'gold.load_fact_facturas',
+            @step VARCHAR(128) = 'start',
+            @t0   DATETIME2(0) = SYSDATETIME(),
+            @t    DATETIME2(0) = SYSDATETIME(),
+            @rows INT,
+            @err  VARCHAR(4000),
+            @line INT;
+    DECLARE @n_comp INT, @n_abie INT, @lote INT, @recomp INT;
 
     IF @fecha_desde IS NULL
         SET @fecha_desde = DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()) - 1, 0);
 
-    /* @fecha_hasta SE IGNORA EN EL LADO COMPENSADO, Y ES DELIBERADO.
-       Un pago compensado en el mes puede alcanzar, via el segundo salto
-       (virgen -> hijo -> grupo final), una factura que se compenso DESPUES. Poner techo
-       trunca esas cadenas: probado el 2026-09-07, cargar agosto con @fecha_hasta
-       '2026-09-01' dejo fuera 181 lineas de factura cuyo grupo final cae en septiembre,
-       y el puente perdio exactamente esas 181 filas de SEGUNDO_SALTO. El parametro se
-       acepta por consistencia de firma, pero aqui no aplica. */
+    -- @fecha_hasta is ignored for cleared invoices: a payment of the window can reach,
+    -- through the second hop, an invoice cleared later, and a ceiling cuts those chains.
     BEGIN TRY
-        PRINT '>> gold.load_fact_facturas | compensadas desde la fecha (SIN techo) + abiertas recarga completa';
-
         BEGIN TRANSACTION;
 
-        /* LAS COMPENSADAS SE MATERIALIZAN ANTES DE BORRAR NADA.
-           Se necesitan DOS veces -para saber que borrar y para insertar- y es la consulta
-           cara del proc. Calcularla una vez y reusarla evita recorrer bsad dos veces. */
+        SET @step = 'read cleared invoices'; SET @t = SYSDATETIME();
         IF OBJECT_ID('tempdb..#comp') IS NOT NULL DROP TABLE #comp;
         SELECT b.sociedad, b.cliente_id, b.ejercicio, b.documento_id, b.posicion,
                b.documento_compensacion, b.ejercicio_compensacion, b.clase_documento,
@@ -1448,32 +1151,24 @@ BEGIN
           AND  b.debe_haber = 'S'
           AND (b.clase_documento LIKE 'F%' OR b.clase_documento = 'D1')
           AND  b.fecha_compensacion >= @fecha_desde
-          -- SIN tope superior, aunque venga @fecha_hasta. Ver la nota de arriba.
           AND  b.cliente_id IN (
                 SELECT c1.cliente_id FROM gold.dim_cliente_comercial c1
                 WHERE c1.estatus_comercial <> 'FUERA_DE_ALCANCE'
                   AND c1.canal_distribucion IN (10, 40, 60))
-          -- Reset de compensacion (FBRA): la linea sigue en bsad como compensada pero
-          -- volvio a bsid porque se deshizo la compensacion. GANA BSID, que es el estado
-          -- de hoy. Sin esto la PK revienta, y peor: el modelo diria que una factura esta
-          -- pagada cuando sigue abierta.
+          -- Clearing reset: bsid wins, or the key duplicates and a paid invoice shows open.
           AND  NOT EXISTS (
                 SELECT 1 FROM silver.sap_bsid i
                 WHERE i.mandante = b.mandante AND i.sociedad = b.sociedad
                   AND i.cliente_id = b.cliente_id AND i.ejercicio = b.ejercicio
                   AND i.documento_id = b.documento_id AND i.posicion = b.posicion)
         OPTION (RECOMPILE);
+        SET @rows = @@ROWCOUNT;
         CREATE UNIQUE CLUSTERED INDEX ix_comp ON #comp(sociedad, cliente_id, ejercicio, documento_id, posicion);
+        EXEC control.log_step @proc, @step, @t, @rows;
 
-        ------------------------------------------------------- BORRADO (LAS TRES)
-        /* LOS BORRADOS VAN ANTES DE LOS INSERT, Y NO ES ESTILO.
-           La PK es (sociedad, cliente_id, ejercicio, documento_id, posicion): NO lleva
-           flag_compensada. Una factura que estaba abierta y ya se compenso ocupa esa PK
-           dos veces - la fila vieja con flag 0 y la nueva con flag 1 - asi que si el
-           INSERT de compensadas corre antes de borrar las abiertas, choca contra su
-           propia version anterior. Probado el 2026-09-07: 845 facturas en ese estado. */
-
-        -- 1. Compensadas de la ventana: las que ya no deban existir se van.
+        -- All deletes run before the inserts: the key has no flag_compensada, so an
+        -- invoice that went from open to cleared would collide with its old row.
+        SET @step = 'delete cleared window'; SET @t = SYSDATETIME(); SET @rows = 0;
         SET @lote = 1;
         WHILE @lote > 0
         BEGIN
@@ -1482,17 +1177,12 @@ BEGIN
               AND fecha_compensacion >= @fecha_desde
               OPTION (RECOMPILE);
             SET @lote = @@ROWCOUNT;
+            SET @rows = @rows + @lote;
         END
+        EXEC control.log_step @proc, @step, @t, @rows;
 
-        /* 2. RECOMPENSACIONES - la tercera forma de romper esta PK, y la mas sutil.
-           El borrado de arriba se guia por la fecha GUARDADA, y esa fecha SE MUEVE: si a
-           una factura se le deshace la compensacion y se le rehace contra otro grupo, en
-           gold sigue con la fecha vieja -fuera de la ventana, asi que sobrevive- y el
-           INSERT la trae con la fecha nueva. Misma PK, dos filas, y el proc muere.
-           Paso el 2026-09-09: una factura guardada como compensada el 23-jul aparecio en
-           bsad compensada el 4-sep contra otro grupo. UN SOLO caso tumbo la carga entera.
-           No basta ampliar la ventana hacia atras - la fecha nueva puede venir de
-           cualquier momento. Hay que borrar por LLAVE contra lo que va a entrar. */
+        -- A re-cleared invoice keeps its old stored date: delete by key.
+        SET @step = 'delete re-cleared by key'; SET @t = SYSDATETIME();
         DELETE g
         FROM   gold.fact_facturas g
         JOIN   #comp c ON c.sociedad = g.sociedad AND c.cliente_id = g.cliente_id
@@ -1501,16 +1191,19 @@ BEGIN
         WHERE  g.flag_compensada = 1
         OPTION (RECOMPILE);
         SET @recomp = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @recomp;
 
-        -- 3. Abiertas: TODAS, sin ventana. Ver cabecera: es una foto del presente.
+        SET @step = 'delete open'; SET @t = SYSDATETIME(); SET @rows = 0;
         SET @lote = 1;
         WHILE @lote > 0
         BEGIN
             DELETE TOP (50000) FROM gold.fact_facturas WHERE flag_compensada = 0;
             SET @lote = @@ROWCOUNT;
+            SET @rows = @rows + @lote;
         END
+        EXEC control.log_step @proc, @step, @t, @rows;
 
-        ---------------------------------------------------------------- COMPENSADAS
+        SET @step = 'insert cleared'; SET @t = SYSDATETIME();
         INSERT INTO gold.fact_facturas (
             sociedad, cliente_id, ejercicio, documento_id, posicion,
             documento_compensacion, ejercicio_compensacion, clase_documento,
@@ -1524,8 +1217,9 @@ BEGIN
                cliente_comercial_sk, cliente_credito_sk
         FROM   #comp;
         SET @n_comp = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @n_comp;
 
-        ---------------------------------------------------------------- ABIERTAS
+        SET @step = 'insert open'; SET @t = SYSDATETIME();
         INSERT INTO gold.fact_facturas (
             sociedad, cliente_id, ejercicio, documento_id, posicion,
             documento_compensacion, ejercicio_compensacion, clase_documento,
@@ -1553,29 +1247,24 @@ BEGIN
                 WHERE c1.estatus_comercial <> 'FUERA_DE_ALCANCE'
                   AND c1.canal_distribucion IN (10, 40, 60));
         SET @n_abie = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @n_abie;
 
         COMMIT TRANSACTION;
 
-        PRINT '   Compensadas: ' + CAST(@n_comp AS VARCHAR(12))
-            + ' | Abiertas: ' + CAST(@n_abie AS VARCHAR(12))
-            + ' | Recompensadas rescatadas: ' + CAST(@recomp AS VARCHAR(12))
-            + ' | Duracion: ' + CAST(DATEDIFF(SECOND, @t0, GETDATE()) AS VARCHAR(10)) + ' s';
+        EXEC control.log_step @proc, 'total', @t0;
     END TRY
     BEGIN CATCH
         IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
-        PRINT 'ERROR en gold.load_fact_facturas: ' + ERROR_MESSAGE();
+        SELECT @err = ERROR_MESSAGE(), @line = ERROR_LINE();
+        EXEC control.log_step @proc, @step, @t, NULL, @err, @line;
         THROW;
-    END CATCH;
+    END CATCH
 END;
 GO
 
-PRINT 'Procedure gold.load_fact_facturas created successfully.';
-GO
-
-
--- ========================================================================================
--- 3. gold.load_fact_aplicacion_pagos   (las tres reglas)
--- ========================================================================================
+-- ----------------------------------------------------------------------------
+-- gold.load_fact_aplicacion_pagos: the bridge, three rules
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('gold.load_fact_aplicacion_pagos', 'P') IS NOT NULL
     DROP PROCEDURE gold.load_fact_aplicacion_pagos;
 GO
@@ -1586,35 +1275,38 @@ CREATE PROCEDURE gold.load_fact_aplicacion_pagos
 AS
 BEGIN
     SET NOCOUNT ON;
-    SET XACT_ABORT ON;   -- ver "ATOMICIDAD" en la cabecera
-    DECLARE @t0 DATETIME = GETDATE(), @n1 INT, @n2 INT, @n3 INT, @lote INT, @multi INT;
+    SET XACT_ABORT ON;
+
+    DECLARE @proc VARCHAR(128) = 'gold.load_fact_aplicacion_pagos',
+            @step VARCHAR(128) = 'start',
+            @t0   DATETIME2(0) = SYSDATETIME(),
+            @t    DATETIME2(0) = SYSDATETIME(),
+            @rows INT,
+            @err  VARCHAR(4000),
+            @line INT;
+    DECLARE @n1 INT, @n2 INT, @n3 INT, @lote INT, @multi INT;
 
     IF @fecha_desde IS NULL
         SET @fecha_desde = DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()) - 1, 0);
 
     BEGIN TRY
-        PRINT '>> gold.load_fact_aplicacion_pagos';
-
-        -- Ver "ATOMICIDAD" en la cabecera. Todo lo que sigue va junto o no va.
         BEGIN TRANSACTION;
 
+        SET @step = 'delete window'; SET @t = SYSDATETIME(); SET @rows = 0;
         SET @lote = 1;
         WHILE @lote > 0
         BEGIN
             DELETE TOP (50000) FROM gold.fact_aplicacion_pagos
             WHERE fecha_compensacion >= @fecha_desde
               AND (@fecha_hasta IS NULL OR fecha_compensacion < @fecha_hasta)
-              OPTION (RECOMPILE);   -- ver "EL DEFAULT NULL" en la cabecera
+              OPTION (RECOMPILE);
             SET @lote = @@ROWCOUNT;
+            SET @rows = @rows + @lote;
         END
+        EXEC control.log_step @proc, @step, @t, @rows;
 
-        /* RECOMPENSACIONES. El borrado de arriba usa la fecha GUARDADA en esta tabla, y
-           esa fecha se hereda del pago - que SE MUEVE si se le deshace y rehace la
-           compensacion. La fila vieja queda fuera de la ventana, sobrevive, y el INSERT
-           la vuelve a crear con la fecha nueva: misma PK, dos filas. Le paso a
-           gold.fact_facturas el 2026-09-09 y tumbo la carga entera con UN caso.
-           Se borra por LLAVE DEL PAGO: todo lo que este proc va a reconstruir, se va
-           primero, sin importar con que fecha estaba guardado. */
+        -- A rebuilt payment may carry an old stored date: delete by payment key as well.
+        SET @step = 'delete by payment key'; SET @t = SYSDATETIME();
         DELETE a
         FROM   gold.fact_aplicacion_pagos a
         JOIN   gold.fact_pagos p
@@ -1623,20 +1315,22 @@ BEGIN
         WHERE  p.fecha_compensacion >= @fecha_desde
           AND (@fecha_hasta IS NULL OR p.fecha_compensacion < @fecha_hasta)
         OPTION (RECOMPILE);
+        SET @rows = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @rows;
 
-        /* PAGOS QUE HOY ESTAN ABIERTOS (2026-09-14). Desde ese dia gold.fact_pagos trae los
-           pagos abiertos de bsid, con fecha_compensacion NULL. Ninguna regla de abajo los liga
-           -no tienen grupo- y la ventana nunca los toca. Pero un pago que estaba compensado y
-           se descompenso (reset FBRA) deja aqui sus filas viejas: si su fecha guardada cae fuera
-           de la ventana sobreviven, y el pago queda en el puente Y en sin_aplicacion. */
+        -- A payment open today (clearing reset) leaves its old bridge rows behind.
+        SET @step = 'delete payments open today'; SET @t = SYSDATETIME();
         DELETE a
         FROM   gold.fact_aplicacion_pagos a
         JOIN   gold.fact_pagos p
                ON  p.sociedad = a.sociedad AND p.ejercicio = a.ejercicio_pago
                AND p.documento_id = a.pago_id AND p.posicion = a.posicion_pago
         WHERE  p.fecha_compensacion IS NULL;
+        SET @rows = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @rows;
 
-        -------------------------------------------------------- REGLA 1: GRUPO
+        -- Rule 1 GRUPO: the payment's clearing group holds the invoices.
+        SET @step = 'insert GRUPO'; SET @t = SYSDATETIME();
         INSERT INTO gold.fact_aplicacion_pagos (
             sociedad, cliente_id, ejercicio_pago, pago_id, posicion_pago,
             ejercicio_factura, factura_id, posicion_factura,
@@ -1650,12 +1344,13 @@ BEGIN
                AND f.ejercicio_compensacion = p.ejercicio_compensacion
         WHERE  p.fecha_compensacion >= @fecha_desde
           AND (@fecha_hasta IS NULL OR p.fecha_compensacion < @fecha_hasta)
-          OPTION (RECOMPILE);   -- ver "EL DEFAULT NULL" en la cabecera
+          OPTION (RECOMPILE);
         SET @n1 = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @n1;
 
-        -------------------------------------------------------- apoyos para 2 y 3
-        -- El salto, al grano (hijo, grupo_final) AGREGADO. Por linea seria incorrecto:
-        -- un hijo con 3 lineas clave 15 al mismo grupo duplicaria cada factura 3 veces.
+        -- Hops aggregated to (child, final group): by line, a child with three key-15
+        -- lines to the same group would triple every invoice.
+        SET @step = 'insert SEGUNDO_SALTO'; SET @t = SYSDATETIME();
         IF OBJECT_ID('tempdb..#salto') IS NOT NULL DROP TABLE #salto;
         SELECT   h.documento_id           AS hijo,
                  h.documento_compensacion AS grupo_final,
@@ -1668,10 +1363,8 @@ BEGIN
         GROUP BY h.documento_id, h.documento_compensacion, h.ejercicio_compensacion;
         CREATE UNIQUE CLUSTERED INDEX ix_salto ON #salto(hijo, grupo_final, ejercicio_final);
 
-        -- Guarda: cuantos DOCUMENTOS DE PAGO alimentan al intermedio. Si es mas de uno,
-        -- el dinero se mezclo ahi dentro y no se puede decir cual financio que linea.
-        -- Cuenta claves 11 y 15, no solo virgenes: los pagos directos tambien participan
-        -- del salto y "un virgen detras" no significa nada cuando no hay virgen.
+        -- Guard: payment documents (keys 11 and 15) feeding each intermediate document.
+        -- More than one and the money is mixed: no way to tell which one paid which line.
         IF OBJECT_ID('tempdb..#guarda') IS NOT NULL DROP TABLE #guarda;
         SELECT   documento_compensacion AS intermedio,
                  COUNT(DISTINCT documento_id) AS n_pagos
@@ -1683,46 +1376,43 @@ BEGIN
         GROUP BY documento_compensacion;
         CREATE UNIQUE CLUSTERED INDEX ix_guarda ON #guarda(intermedio);
 
-        -------------------------------------------------------- REGLA 2: SEGUNDO_SALTO
+        -- Rule 2 SEGUNDO_SALTO: only where GRUPO found nothing. LEFT JOIN to the guard:
+        -- it is a control value, not a filter. Key 08 mirror lines are left out on purpose.
         INSERT INTO gold.fact_aplicacion_pagos (
             sociedad, cliente_id, ejercicio_pago, pago_id, posicion_pago,
             ejercicio_factura, factura_id, posicion_factura,
             documento_compensacion, fecha_compensacion, regla)
         SELECT p.sociedad, p.cliente_id, p.ejercicio, p.documento_id, p.posicion,
                f.ejercicio, f.documento_id, f.posicion,
-               s.grupo_final,          -- donde esta la factura, no el grupo del pago
+               s.grupo_final,
                p.fecha_compensacion, 'SEGUNDO_SALTO'
         FROM   gold.fact_pagos p
         JOIN   #salto s            ON s.hijo = p.documento_compensacion
         JOIN   gold.fact_facturas f ON f.documento_compensacion = s.grupo_final
                                    AND f.ejercicio_compensacion = s.ejercicio_final
-        -- LEFT JOIN, nunca INNER: la guarda es un dato de control, no un filtro. Con
-        -- INNER tiraba en silencio los pagos que no son virgenes y por tanto no estan
-        -- en #guarda (109 pagos legitimos en julio 2026).
         LEFT JOIN #guarda g        ON g.intermedio = p.documento_compensacion
         WHERE  p.fecha_compensacion >= @fecha_desde
           AND (@fecha_hasta IS NULL OR p.fecha_compensacion < @fecha_hasta)
-          -- Las lineas clave 08 quedan fuera POR DECISION, no por accidente de un join:
-          -- son debitos espejo y atribuirles facturas no significa nada.
           AND  p.clave_contabilizacion IN ('11','15')
           AND  ISNULL(g.n_pagos, 1) = 1
-          -- Solo donde GRUPO no encontro nada. Esto las hace excluyentes.
           AND  NOT EXISTS (SELECT 1 FROM gold.fact_facturas ff
                            WHERE ff.documento_compensacion = p.documento_compensacion
                              AND ff.ejercicio_compensacion = p.ejercicio_compensacion)
-                             OPTION (RECOMPILE);   -- ver "EL DEFAULT NULL" en la cabecera
+                             OPTION (RECOMPILE);
         SET @n2 = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @n2;
 
-        -------------------------------------------------------- REGLA 3: REFERENCIA
-        -- La unica que aterriza en facturas ABIERTAS. El deposito virgen NUNCA trae
-        -- REBZG (todos 'V'); la referencia vive en la linea clave 15 ABIERTA del hijo.
+        -- Rule 3 REFERENCIA: the child's open key-15 line points to an invoice that is
+        -- still open (partial payment). Open invoices only: an invoice settled elsewhere
+        -- is not a partial payment of this one.
+        SET @step = 'insert REFERENCIA'; SET @t = SYSDATETIME();
         INSERT INTO gold.fact_aplicacion_pagos (
             sociedad, cliente_id, ejercicio_pago, pago_id, posicion_pago,
             ejercicio_factura, factura_id, posicion_factura,
             documento_compensacion, fecha_compensacion, regla)
         SELECT p.sociedad, p.cliente_id, p.ejercicio, p.documento_id, p.posicion,
                f.ejercicio, f.documento_id, f.posicion,
-               p.documento_compensacion,   -- la factura abierta no tiene grupo propio
+               p.documento_compensacion,
                p.fecha_compensacion, 'REFERENCIA'
         FROM   gold.fact_pagos p
         JOIN   silver.sap_bsid a
@@ -1735,26 +1425,21 @@ BEGIN
         JOIN   gold.fact_facturas f
                ON  f.documento_id = a.factura_referencia_documento
                AND f.ejercicio    = a.factura_referencia_ejercicio
-               -- SOLO facturas ABIERTAS. Sin esto entran lineas donde el pago sigue
-               -- abierto pero la factura ya se liquido por otro lado: eso no es un pago
-               -- parcial, y atribuirsela diria que este pago la liquido.
                AND f.flag_compensada = 0
         LEFT JOIN #guarda g ON g.intermedio = p.documento_compensacion
         WHERE  p.fecha_compensacion >= @fecha_desde
           AND (@fecha_hasta IS NULL OR p.fecha_compensacion < @fecha_hasta)
           AND  p.clave_contabilizacion IN ('11','15')
           AND  ISNULL(g.n_pagos, 1) = 1
-          OPTION (RECOMPILE);   -- ver "EL DEFAULT NULL" en la cabecera
+          OPTION (RECOMPILE);
         SET @n3 = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @n3;
 
         COMMIT TRANSACTION;
 
-        -- INVARIANTE: pagos que la guarda dejo REALMENTE fuera - los que habrian entrado
-        -- por el segundo salto y no entraron por ambiguedad.
-        -- Una version anterior contaba todos los pagos con intermedio multi-pago SIN
-        -- excluir los que ya entraron por GRUPO: daba 1,893 en agosto 2026 cuando el
-        -- numero real es otro. Una invariante que grita de mas se aprende a ignorar, y
-        -- el dia que signifique algo nadie la ve.
+        -- Check: payments the guard really left out (they would have entered through
+        -- the second hop and were not linked by GRUPO).
+        SET @step = 'check: multi-payment intermediates excluded'; SET @t = SYSDATETIME();
         SELECT @multi = COUNT(DISTINCT p.documento_id)
         FROM   gold.fact_pagos p
         JOIN   #guarda g ON g.intermedio = p.documento_compensacion
@@ -1763,38 +1448,27 @@ BEGIN
           AND  p.fecha_compensacion >= @fecha_desde
           AND (@fecha_hasta IS NULL OR p.fecha_compensacion < @fecha_hasta)
           AND  p.clave_contabilizacion IN ('11','15')
-          -- solo los que NO entraron por GRUPO: esos son los que de verdad se pierden
           AND  NOT EXISTS (SELECT 1 FROM gold.fact_facturas ff
                            WHERE ff.documento_compensacion = p.documento_compensacion
                              AND ff.ejercicio_compensacion = p.ejercicio_compensacion)
-                             OPTION (RECOMPILE);   -- ver "EL DEFAULT NULL" en la cabecera
+                             OPTION (RECOMPILE);
+        EXEC control.log_step @proc, @step, @t, @multi;
 
-        PRINT '   GRUPO: ' + CAST(@n1 AS VARCHAR(12))
-            + ' | SEGUNDO_SALTO: ' + CAST(@n2 AS VARCHAR(12))
-            + ' | REFERENCIA: ' + CAST(@n3 AS VARCHAR(12));
-        PRINT '   Intermedios multi-pago excluidos por la guarda: ' + CAST(@multi AS VARCHAR(12));
-        PRINT '   Duracion: ' + CAST(DATEDIFF(SECOND, @t0, GETDATE()) AS VARCHAR(10)) + ' s';
+        EXEC control.log_step @proc, 'total', @t0;
     END TRY
     BEGIN CATCH
-        -- Sin esto la ventana queda con el hueco del DELETE y el proc muere
-        -- "limpio": el reporte del dia sale con menos dinero y nada avisa.
         IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
-        PRINT 'ERROR en gold.load_fact_aplicacion_pagos: ' + ERROR_MESSAGE();
+        SELECT @err = ERROR_MESSAGE(), @line = ERROR_LINE();
+        EXEC control.log_step @proc, @step, @t, NULL, @err, @line;
         THROW;
-    END CATCH;
+    END CATCH
 END;
 GO
-PRINT 'Procedure gold.load_fact_aplicacion_pagos created successfully.';
-GO
 
-
-
--- ========================================================================================
--- 4b. gold.load_fact_facturas_pago_efectivo
---     Corre DESPUES del puente, y no puede ser de otra forma: estas tres columnas salen
---     de gold.fact_aplicacion_pagos, que se carga despues de fact_facturas. Cuando corre
---     load_fact_facturas el puente todavia trae la ventana anterior.
--- ========================================================================================
+-- ----------------------------------------------------------------------------
+-- gold.load_fact_facturas_pago_efectivo: effective payment date, days and
+-- classification per invoice. Runs after the bridge, which it reads.
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('gold.load_fact_facturas_pago_efectivo', 'P') IS NOT NULL
     DROP PROCEDURE gold.load_fact_facturas_pago_efectivo;
 GO
@@ -1806,19 +1480,23 @@ AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
-    DECLARE @t0 DATETIME = GETDATE(), @n_comp INT, @n_abie INT;
+
+    DECLARE @proc VARCHAR(128) = 'gold.load_fact_facturas_pago_efectivo',
+            @step VARCHAR(128) = 'start',
+            @t0   DATETIME2(0) = SYSDATETIME(),
+            @t    DATETIME2(0) = SYSDATETIME(),
+            @rows INT,
+            @err  VARCHAR(4000),
+            @line INT;
+    DECLARE @n_comp INT, @n_abie INT;
 
     IF @fecha_desde IS NULL
         SET @fecha_desde = DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()) - 1, 0);
 
     BEGIN TRY
-        PRINT '>> gold.load_fact_facturas_pago_efectivo';
-
-        /* EL ULTIMO PAGO POR FACTURA SE PRECALCULA UNA VEZ, EN UNA TEMPORAL.
-           La version anterior traia un OUTER APPLY correlacionado y un OR en el WHERE
-           (abiertas O la ventana). Resultado: la subconsulta se evaluaba fila por fila
-           sobre las 3.27M, y el backfill llevaba 4,890 filas despues de varios minutos.
-           Precalcular y unir por JOIN convierte 3 millones de subconsultas en un join. */
+        -- Last payment per invoice, precomputed once: a correlated subquery ran row by
+        -- row over 3.27M invoices.
+        SET @step = 'last payment per invoice'; SET @t = SYSDATETIME();
         IF OBJECT_ID('tempdb..#fpe') IS NOT NULL DROP TABLE #fpe;
         SELECT   a.sociedad, a.ejercicio_factura, a.factura_id, a.posicion_factura,
                  MAX(p.fecha_documento) AS fpe
@@ -1828,12 +1506,13 @@ BEGIN
                  ON  p.sociedad = a.sociedad AND p.ejercicio = a.ejercicio_pago
                  AND p.documento_id = a.pago_id AND p.posicion = a.posicion_pago
         GROUP BY a.sociedad, a.ejercicio_factura, a.factura_id, a.posicion_factura;
+        SET @rows = @@ROWCOUNT;
         CREATE UNIQUE CLUSTERED INDEX ix_fpe ON #fpe(sociedad, ejercicio_factura, factura_id, posicion_factura);
+        EXEC control.log_step @proc, @step, @t, @rows;
 
-        /* DOS SENTENCIAS, NO UNA CON OR. Un OR entre 'abiertas' y 'ventana de
-           compensadas' no es sargable y obliga a recorrer la tabla entera. */
-
-        -- 1. Compensadas de la ventana
+        -- Two statements, not one with OR: the OR is not sargable.
+        -- LEFT JOIN: an invoice that lost its payment goes back to NULL.
+        SET @step = 'update cleared window'; SET @t = SYSDATETIME();
         UPDATE f
         SET    f.fecha_pago_efectiva = x.fpe,
                f.dias_pago = DATEDIFF(DAY, f.fecha_vencimiento, x.fpe),
@@ -1844,8 +1523,6 @@ BEGIN
                         WHEN f.fecha_vencimiento <= EOMONTH(x.fpe) THEN 'PAGO_A_MES'
                         ELSE 'PAGO_ANTICIPADO' END
         FROM   gold.fact_facturas f
-        /* LEFT JOIN, no INNER: una factura que PIERDE su pago -recompensacion- tiene
-           que volver a NULL, no quedarse con el valor viejo. */
         LEFT JOIN #fpe x ON x.sociedad = f.sociedad AND x.ejercicio_factura = f.ejercicio
                         AND x.factura_id = f.documento_id AND x.posicion_factura = f.posicion
         WHERE  f.flag_compensada = 1
@@ -1853,9 +1530,10 @@ BEGIN
           AND (@fecha_hasta IS NULL OR f.fecha_compensacion < @fecha_hasta)
         OPTION (RECOMPILE);
         SET @n_comp = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @n_comp;
 
-        -- 2. Abiertas: SIEMPRE todas. Ese lado se reconstruye completo en cada corrida,
-        --    y una factura abierta SI puede tener pago (regla REFERENCIA, pagos parciales).
+        -- Open invoices: always all of them; a partial payment (REFERENCIA) can reach them.
+        SET @step = 'update open'; SET @t = SYSDATETIME();
         UPDATE f
         SET    f.fecha_pago_efectiva = x.fpe,
                f.dias_pago = DATEDIFF(DAY, f.fecha_vencimiento, x.fpe),
@@ -1871,24 +1549,22 @@ BEGIN
         WHERE  f.flag_compensada = 0
         OPTION (RECOMPILE);
         SET @n_abie = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @n_abie;
 
-        PRINT '   Compensadas: ' + CAST(@n_comp AS VARCHAR(12))
-            + ' | Abiertas: ' + CAST(@n_abie AS VARCHAR(12))
-            + ' | Duracion: ' + CAST(DATEDIFF(SECOND, @t0, GETDATE()) AS VARCHAR(10)) + ' s';
+        EXEC control.log_step @proc, 'total', @t0;
     END TRY
     BEGIN CATCH
         IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
-        PRINT 'ERROR en gold.load_fact_facturas_pago_efectivo: ' + ERROR_MESSAGE();
+        SELECT @err = ERROR_MESSAGE(), @line = ERROR_LINE();
+        EXEC control.log_step @proc, @step, @t, NULL, @err, @line;
         THROW;
-    END CATCH;
+    END CATCH
 END;
 GO
-PRINT 'Procedure gold.load_fact_facturas_pago_efectivo created successfully.';
-GO
 
--- ========================================================================================
--- 4. gold.load_fact_pagos_sin_aplicacion
--- ========================================================================================
+-- ----------------------------------------------------------------------------
+-- gold.load_fact_pagos_sin_aplicacion: payments outside the bridge, with the reason
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('gold.load_fact_pagos_sin_aplicacion', 'P') IS NOT NULL
     DROP PROCEDURE gold.load_fact_pagos_sin_aplicacion;
 GO
@@ -1899,35 +1575,38 @@ CREATE PROCEDURE gold.load_fact_pagos_sin_aplicacion
 AS
 BEGIN
     SET NOCOUNT ON;
-    SET XACT_ABORT ON;   -- ver "ATOMICIDAD" en la cabecera
-    DECLARE @t0 DATETIME = GETDATE(), @n INT, @lote INT, @revisar INT, @huerfanos INT, @n_abie INT;
+    SET XACT_ABORT ON;
+
+    DECLARE @proc VARCHAR(128) = 'gold.load_fact_pagos_sin_aplicacion',
+            @step VARCHAR(128) = 'start',
+            @t0   DATETIME2(0) = SYSDATETIME(),
+            @t    DATETIME2(0) = SYSDATETIME(),
+            @rows INT,
+            @err  VARCHAR(4000),
+            @line INT;
+    DECLARE @n INT, @lote INT, @revisar INT, @huerfanos INT, @n_abie INT;
 
     IF @fecha_desde IS NULL
         SET @fecha_desde = DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()) - 1, 0);
 
     BEGIN TRY
-        PRINT '>> gold.load_fact_pagos_sin_aplicacion';
-
-        -- Ver "ATOMICIDAD" en la cabecera. Todo lo que sigue va junto o no va.
         BEGIN TRANSACTION;
 
+        SET @step = 'delete window'; SET @t = SYSDATETIME(); SET @rows = 0;
         SET @lote = 1;
         WHILE @lote > 0
         BEGIN
             DELETE TOP (50000) FROM gold.fact_pagos_sin_aplicacion
             WHERE fecha_compensacion >= @fecha_desde
               AND (@fecha_hasta IS NULL OR fecha_compensacion < @fecha_hasta)
-              OPTION (RECOMPILE);   -- ver "EL DEFAULT NULL" en la cabecera
+              OPTION (RECOMPILE);
             SET @lote = @@ROWCOUNT;
+            SET @rows = @rows + @lote;
         END
+        EXEC control.log_step @proc, @step, @t, @rows;
 
-        /* RECOMPENSACIONES. El borrado de arriba usa la fecha GUARDADA en esta tabla, y
-           esa fecha se hereda del pago - que SE MUEVE si se le deshace y rehace la
-           compensacion. La fila vieja queda fuera de la ventana, sobrevive, y el INSERT
-           la vuelve a crear con la fecha nueva: misma PK, dos filas. Le paso a
-           gold.fact_facturas el 2026-09-09 y tumbo la carga entera con UN caso.
-           Se borra por LLAVE DEL PAGO: todo lo que este proc va a reconstruir, se va
-           primero, sin importar con que fecha estaba guardado. */
+        -- A rebuilt payment may carry an old stored date: delete by payment key as well.
+        SET @step = 'delete by payment key'; SET @t = SYSDATETIME();
         DELETE a
         FROM   gold.fact_pagos_sin_aplicacion a
         JOIN   gold.fact_pagos p
@@ -1936,18 +1615,24 @@ BEGIN
         WHERE  p.fecha_compensacion >= @fecha_desde
           AND (@fecha_hasta IS NULL OR p.fecha_compensacion < @fecha_hasta)
         OPTION (RECOMPILE);
+        SET @rows = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @rows;
 
-        /* PAGOS ABIERTOS (2026-09-14): foto del presente, igual que en gold.load_fact_pagos.
-           Se van los que se guardaron abiertos -aunque hoy ya no lo esten- y los que hoy estan
-           abiertos aunque se hubieran guardado compensados (reset FBRA). Abajo se reinsertan. */
+        -- Open payments are a snapshot: out go the rows stored as open and the rows of
+        -- payments that are open today even if they were stored as cleared.
+        SET @step = 'delete open payments'; SET @t = SYSDATETIME();
         DELETE FROM gold.fact_pagos_sin_aplicacion WHERE fecha_compensacion IS NULL;
+        SET @rows = @@ROWCOUNT;
         DELETE a
         FROM   gold.fact_pagos_sin_aplicacion a
         JOIN   gold.fact_pagos p
                ON  p.sociedad = a.sociedad AND p.ejercicio = a.ejercicio
                AND p.documento_id = a.documento_id AND p.posicion = a.posicion
         WHERE  p.fecha_compensacion IS NULL;
+        SET @rows = @rows + @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @rows;
 
+        SET @step = 'insert cleared'; SET @t = SYSDATETIME();
         IF OBJECT_ID('tempdb..#salto2') IS NOT NULL DROP TABLE #salto2;
         SELECT DISTINCT h.documento_id AS hijo, h.documento_compensacion AS grupo_final,
                h.ejercicio_compensacion AS ejercicio_final
@@ -1958,8 +1643,7 @@ BEGIN
           AND  h.documento_compensacion IS NOT NULL;
         CREATE UNIQUE CLUSTERED INDEX ix_s2 ON #salto2(hijo, grupo_final, ejercicio_final);
 
-        -- Misma guarda que usa el puente: cuantos documentos de pago alimentan al
-        -- intermedio. Se necesita aqui para poder ETIQUETAR lo que el puente excluyo.
+        -- Same guard as the bridge, to label what the bridge excluded.
         IF OBJECT_ID('tempdb..#guarda2') IS NOT NULL DROP TABLE #guarda2;
         SELECT   documento_compensacion AS intermedio,
                  COUNT(DISTINCT documento_id) AS n_pagos
@@ -1976,20 +1660,13 @@ BEGIN
             documento_compensacion, fecha_compensacion, motivo)
         SELECT x.sociedad, x.cliente_id, x.ejercicio, x.documento_id, x.posicion,
                x.documento_compensacion, x.fecha_compensacion,
-               -- EL ORDEN DE ESTAS RAMAS ES LA DEFINICION DE CADA ETIQUETA.
-               -- CADENA_AMBIGUA va AL FINAL, no antes de las del salto: solo aplica
-               -- cuando el salto SI llegaba a facturas y la guarda lo excluyo. Un pago
-               -- sin salto es SIN_APLICACION aunque su intermedio sea multi-pago - ahi
-               -- la ambiguedad no es la razon por la que no se ligo.
-               -- (2026-09-07: se puso segunda por error y CADENA_AMBIGUA paso de 62 a
-               --  3,025 pagos. Las invariantes NO lo detectaron: verifican que todo este
-               --  clasificado, no que este bien clasificado.)
+               -- The order of the branches defines the labels. CADENA_AMBIGUA goes last: it
+               -- applies only when the hop did reach invoices and the guard excluded it.
+               -- REVISAR is the unknown case and must be 0.
                CASE WHEN x.clave_contabilizacion NOT IN ('11','15') THEN 'LINEA_TECNICA'
                     WHEN x.tiene_salto      = 0        THEN 'SIN_APLICACION'
                     WHEN x.salto_a_facturas = 0        THEN 'LIQUIDA_NO_FACTURA'
                     WHEN x.n_pagos_intermedio > 1      THEN 'CADENA_AMBIGUA'
-                    -- Rama final a proposito: un ELSE que dice 'OTRO' y se olvida es la
-                    -- forma habitual de esconder casos nuevos. Debe dar 0.
                     ELSE 'REVISAR' END
         FROM (
             SELECT p.sociedad, p.cliente_id, p.ejercicio, p.documento_id, p.posicion,
@@ -1999,8 +1676,7 @@ BEGIN
                    MAX(ISNULL(g.n_pagos, 1)) AS n_pagos_intermedio
             FROM   gold.fact_pagos p
             LEFT JOIN #guarda2 g ON g.intermedio = p.documento_compensacion
-            -- LEFT JOIN: el pago debe sobrevivir aunque no tenga salto - justamente eso
-            -- es lo que lo clasifica como SIN_APLICACION.
+            -- LEFT JOIN: a payment with no hop must survive; that makes it SIN_APLICACION.
             LEFT JOIN #salto2 s ON s.hijo = p.documento_compensacion
             LEFT JOIN (SELECT DISTINCT documento_compensacion, ejercicio_compensacion
                        FROM gold.fact_facturas WHERE documento_compensacion IS NOT NULL) f
@@ -2016,15 +1692,13 @@ BEGIN
             GROUP BY p.sociedad, p.cliente_id, p.ejercicio, p.documento_id, p.posicion,
                      p.documento_compensacion, p.fecha_compensacion, p.clave_contabilizacion
         ) x
-        OPTION (RECOMPILE);   -- ver "EL DEFAULT NULL" en la cabecera
+        OPTION (RECOMPILE);
         SET @n = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @n;
 
-        /* PENDIENTE_DE_APLICAR: el deposito ya entro al banco y nadie lo ha aplicado. No es un
-           caso de las ramas de arriba -esas explican por que un pago COMPENSADO no llego a
-           facturas; este todavia no se compensa-. Sale de aqui el dia que se aplica.
-           Ningun pago abierto puede estar en el puente: no tiene grupo, y REFERENCIA sale de la
-           clave 15 abierta del HIJO, que fact_pagos excluye (medido 2026-09-14: 0 lineas
-           abiertas con REBZG hacia factura). La clave distinta de 11/15 sigue siendo tecnica. */
+        -- PENDIENTE_DE_APLICAR: open payments. None can be in the bridge (no clearing
+        -- group); a key other than 11/15 is still LINEA_TECNICA.
+        SET @step = 'insert open'; SET @t = SYSDATETIME();
         INSERT INTO gold.fact_pagos_sin_aplicacion (
             sociedad, cliente_id, ejercicio, documento_id, posicion,
             documento_compensacion, fecha_compensacion, motivo)
@@ -2035,18 +1709,21 @@ BEGIN
         FROM   gold.fact_pagos p
         WHERE  p.fecha_compensacion IS NULL;
         SET @n_abie = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @n_abie;
 
         COMMIT TRANSACTION;
 
-        -- Las invariantes van FUERA de la transaccion, a proposito: solo leen, y si algo
-        -- salio mal se quiere ver el estado ya confirmado, no el de adentro.
+        -- Checks run after COMMIT, on the committed state. Both must be 0.
+        SET @step = 'check: REVISAR (must be 0)'; SET @t = SYSDATETIME();
         SELECT @revisar = COUNT(*) FROM gold.fact_pagos_sin_aplicacion
         WHERE motivo = 'REVISAR'
           AND fecha_compensacion >= @fecha_desde
           AND (@fecha_hasta IS NULL OR fecha_compensacion < @fecha_hasta)
-          OPTION (RECOMPILE);   -- ver "EL DEFAULT NULL" en la cabecera
+          OPTION (RECOMPILE);
+        EXEC control.log_step @proc, @step, @t, @revisar;
 
-        -- INVARIANTE DEL MODELO: todo pago esta en el puente O aqui, nunca en ninguno.
+        -- Every payment is in the bridge or here.
+        SET @step = 'check: unclassified payments (must be 0)'; SET @t = SYSDATETIME();
         SELECT @huerfanos = COUNT(*)
         FROM   gold.fact_pagos p
         WHERE  p.fecha_compensacion >= @fecha_desde
@@ -2057,9 +1734,9 @@ BEGIN
           AND  NOT EXISTS (SELECT 1 FROM gold.fact_pagos_sin_aplicacion s
                            WHERE s.sociedad=p.sociedad AND s.ejercicio=p.ejercicio
                              AND s.documento_id=p.documento_id AND s.posicion=p.posicion)
-                             OPTION (RECOMPILE);   -- ver "EL DEFAULT NULL" en la cabecera
+                             OPTION (RECOMPILE);
 
-        -- Los abiertos no tienen fecha: la consulta de arriba no los ve. Mismo invariante.
+        -- Open payments have no date: checked separately.
         SELECT @huerfanos = @huerfanos + COUNT(*)
         FROM   gold.fact_pagos p
         WHERE  p.fecha_compensacion IS NULL
@@ -2069,26 +1746,25 @@ BEGIN
           AND  NOT EXISTS (SELECT 1 FROM gold.fact_pagos_sin_aplicacion s
                            WHERE s.sociedad=p.sociedad AND s.ejercicio=p.ejercicio
                              AND s.documento_id=p.documento_id AND s.posicion=p.posicion);
+        EXEC control.log_step @proc, @step, @t, @huerfanos;
 
-        PRINT '   Filas: ' + CAST(@n AS VARCHAR(12))
-            + ' | Pendientes de aplicar (abiertos): ' + CAST(@n_abie AS VARCHAR(12))
-            + ' | Duracion: ' + CAST(DATEDIFF(SECOND, @t0, GETDATE()) AS VARCHAR(10)) + ' s';
-        PRINT '   INVARIANTES (las dos deben ser 0) -> etiqueta REVISAR: ' + CAST(@revisar AS VARCHAR(12))
-            + ' | pagos sin clasificar: ' + CAST(@huerfanos AS VARCHAR(12));
+        EXEC control.log_step @proc, 'total', @t0;
     END TRY
     BEGIN CATCH
-        -- Sin esto la ventana queda con el hueco del DELETE y el proc muere
-        -- "limpio": el reporte del dia sale con menos dinero y nada avisa.
         IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
-        PRINT 'ERROR en gold.load_fact_pagos_sin_aplicacion: ' + ERROR_MESSAGE();
+        SELECT @err = ERROR_MESSAGE(), @line = ERROR_LINE();
+        EXEC control.log_step @proc, @step, @t, NULL, @err, @line;
         THROW;
-    END CATCH;
+    END CATCH
 END;
 GO
-PRINT 'Procedure gold.load_fact_pagos_sin_aplicacion created successfully.';
-GO
 
-
+-- ----------------------------------------------------------------------------
+-- gold.load_gold: the daily gold refresh
+-- Dimensions first (facts resolve SCD2 keys; fact_saldo_cartera has foreign keys
+-- to them), then the payment application model in its fixed order. Changing the
+-- order raises no error: it silently loses rows.
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('gold.load_gold', 'P') IS NOT NULL
     DROP PROCEDURE gold.load_gold;
 GO
@@ -2097,62 +1773,50 @@ CREATE PROCEDURE gold.load_gold
 AS
 BEGIN
     SET NOCOUNT ON;
-    DECLARE @start_time DATETIME, @end_time DATETIME;
+
+    DECLARE @proc VARCHAR(128) = 'gold.load_gold',
+            @step VARCHAR(128) = 'start',
+            @t0   DATETIME2(0) = SYSDATETIME(),
+            @t    DATETIME2(0) = SYSDATETIME(),
+            @err  VARCHAR(4000),
+            @line INT;
 
     BEGIN TRY
-        SET @start_time = GETDATE();
-        PRINT '===================================================';
-        PRINT '>> Starting full gold refresh...';
-        PRINT '===================================================';
-
+        SET @step = 'gold.load_dim_fecha';
         EXEC gold.load_dim_fecha;
+        SET @step = 'gold.load_dim_empleado';
         EXEC gold.load_dim_empleado;
+        SET @step = 'gold.load_dim_cliente';
         EXEC gold.load_dim_cliente;
+        SET @step = 'gold.load_dim_cliente_comercial';
         EXEC gold.load_dim_cliente_comercial;
+        SET @step = 'gold.load_dim_cliente_credito';
         EXEC gold.load_dim_cliente_credito;
+        SET @step = 'gold.load_fact_pagos_compensados';
         EXEC gold.load_fact_pagos_compensados;
+        SET @step = 'gold.load_fact_facturas_compensadas';
         EXEC gold.load_fact_facturas_compensadas;
+        SET @step = 'gold.load_fact_saldo_cartera';
         EXEC gold.load_fact_saldo_cartera;
 
-        -- ------------------------------------------------------------------
-        -- Modelo de aplicacion de pagos (agregado 2026-09-07).
-        -- Los cuatro procs estan definidos ARRIBA, en este mismo archivo.
-        -- DDL en 03_gold/ddl_gold.sql (sin DROP, ver la nota de alla),
-        -- historia 2022-> cargada con 03_gold/backfill_fact_aplicacion_pagos.sql.
-        --
-        -- EL ORDEN ENTRE ESTOS CUATRO NO ES NEGOCIABLE: el puente necesita
-        -- pagos y facturas ya cargados, y la clasificacion de lo no ligado
-        -- necesita el puente terminado. Cambiar el orden no da error - da
-        -- filas faltantes en silencio.
-        --
-        -- Van DESPUES de las dimensiones porque resuelven llaves SCD2 por
-        -- vigencia contra fecha_contabilizacion.
-        --
-        -- Sin parametros = modo diario: desde el primer dia del mes anterior.
-        -- load_fact_facturas ademas recarga TODAS las abiertas (es una foto
-        -- del presente) e ignora el tope superior a proposito.
-        --
-        -- Conviven con fact_pagos_compensados / fact_facturas_compensadas y
-        -- vw_pago_factura_simple, que siguen vivos hasta que el reporte nuevo
-        -- este listo (decision del usuario 2026-09-07).
-        -- ------------------------------------------------------------------
+        SET @step = 'gold.load_fact_pagos';
         EXEC gold.load_fact_pagos;
+        SET @step = 'gold.load_fact_facturas';
         EXEC gold.load_fact_facturas;
+        SET @step = 'gold.load_fact_aplicacion_pagos';
         EXEC gold.load_fact_aplicacion_pagos;
+        SET @step = 'gold.load_fact_facturas_pago_efectivo';
         EXEC gold.load_fact_facturas_pago_efectivo;
+        SET @step = 'gold.load_fact_pagos_sin_aplicacion';
         EXEC gold.load_fact_pagos_sin_aplicacion;
 
-        SET @end_time = GETDATE();
-        PRINT '===================================================';
-        PRINT '>> Full gold refresh finished. Total duration: ' + CAST(DATEDIFF(SECOND, @start_time, @end_time) AS NVARCHAR) + ' s';
-        PRINT '===================================================';
+        EXEC control.log_step @proc, 'total', @t0;
     END TRY
     BEGIN CATCH
-        PRINT 'ERROR in gold.load_gold: ' + ERROR_MESSAGE();
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+        SELECT @err = ERROR_MESSAGE(), @line = ERROR_LINE();
+        EXEC control.log_step @proc, @step, @t, NULL, @err, @line;
         THROW;
-    END CATCH;
+    END CATCH
 END;
-GO
-
-PRINT 'Procedure gold.load_gold created successfully.';
 GO

@@ -1,37 +1,17 @@
-/* =====================================================================================
-   COMO DEFENDER EL DESGLOSE DE UN MES
-   dwh_architecture/04_pronostico/demostrar_desglose.sql              (2026-09-09)
-   =====================================================================================
+/* ============================================================================
+   Monthly breakdown: supporting queries
+   Purpose : One query per question about desglose_cobranza_mes.sql.
+   Run     : any time; read-only. Run one batch at a time; change @ini in each.
+   Notes   : Settled invoices (face value) and the month's cash measure different
+             things; query 6 splits payments instead of invoices and adds up to
+             the cash exactly.
+   ============================================================================ */
+USE ANALISIS_DATOS;
+GO
 
-   Seis consultas, una por objecion. El resumen esta en desglose_cobranza_mes.sql;
-   este archivo es para cuando alguien pregunta "y eso de donde sale".
-   Cambiar @ini y sirve para cualquier mes. Correr de una en una.
-
-   Julio 2026 da:
-
-       Cartera del mes (vencia en julio, facturada antes)   $ 89.66M   64.2%
-       Facturado y cobrado dentro de julio                  $ 26.75M   19.1%
-       Anticipado (vencia en meses posteriores)             $ 11.39M    8.2%
-       Cartera vencida (vencio antes de julio)              $ 11.90M    8.5%
-       = FACTURAS LIQUIDADAS EN JULIO                       $139.70M  100.0%
-       = CAJA DE JULIO                                      $151.81M
-
-   LAS DOS CIFRAS MIDEN COSAS DISTINTAS, Y ESA ES LA PREGUNTA DIFICIL
-   ------------------------------------------------------------------
-   $139.70M es el VALOR NOMINAL de las facturas que se terminaron de pagar en julio.
-   $151.81M es el DINERO que entro en julio.
-   No tienen por que ser iguales, y la consulta 6 desarma la diferencia hasta el peso.
-
-   Se mide por FACTURA y no por pago porque un deposito puede liquidar tres facturas
-   -una del mes, una vencida y un anticipo- y no hay forma confiable de decir que parte
-   del deposito fue a cual. El puente liga pagos con facturas pero NO reparte montos, a
-   proposito. Contando facturas, cada monto tiene una sola categoria.
-   ===================================================================================== */
-
--- =====================================================================================
--- CONSULTA 1 -- "Por que dicen 151.8 si nosotros siempre decimos 149?"
--- Los mismos pagos, tres fechas distintas. Ninguna esta mal; miden tres momentos.
--- =====================================================================================
+-- ----------------------------------------------------------------------------
+-- 1. The same payments by three dates: payment, clearing and posting.
+-- ----------------------------------------------------------------------------
 DECLARE @ini DATE = '2026-07-01';
 DECLARE @fin DATE = EOMONTH(@ini);
 
@@ -48,12 +28,9 @@ SELECT 'fecha_contabilizacion (cuando lo capturo contabilidad)',
 FROM   gold.fact_pagos WHERE fecha_contabilizacion BETWEEN @ini AND @fin;
 GO
 
-
--- =====================================================================================
--- CONSULTA 2 -- "De donde sale cada rebanada?"
--- La regla de cada categoria, escrita con las fechas a la vista. Nadie tiene que
--- confiar en una etiqueta: se ve la comparacion que la produce.
--- =====================================================================================
+-- ----------------------------------------------------------------------------
+-- 2. Each slice with the dates that define it in view.
+-- ----------------------------------------------------------------------------
 DECLARE @ini DATE = '2026-07-01';
 DECLARE @fin DATE = EOMONTH(@ini);
 
@@ -80,12 +57,9 @@ GROUP BY CASE
 ORDER BY categoria;
 GO
 
-
--- =====================================================================================
--- CONSULTA 3 -- "Como se que no estan contando lo mismo dos veces?"
--- Prueba de particion: cada factura cae en UNA categoria y el total cuadra.
--- Las tres filas deben decir SI / 0 / 0.
--- =====================================================================================
+-- ----------------------------------------------------------------------------
+-- 3. Partition test: every invoice in one slice, total matches. Expect SI / 0 / 0.
+-- ----------------------------------------------------------------------------
 DECLARE @ini DATE = '2026-07-01';
 DECLARE @fin DATE = EOMONTH(@ini);
 
@@ -117,13 +91,10 @@ SELECT 'Facturas sin categoria (NULL)',
        CAST(COUNT(*) AS VARCHAR(20)) FROM #cat WHERE cat IS NULL;
 GO
 
-
--- =====================================================================================
--- CONSULTA 4 -- "Ensename las facturas de esa rebanada"
--- El detalle. Cambiar @categoria: 1 cartera del mes, 2 facturado y cobrado en el mes,
--- 3 anticipado, 4 cartera vencida. Las tres fechas van a la vista para que cualquiera
--- verifique la clasificacion sin creerle a nadie.
--- =====================================================================================
+-- ----------------------------------------------------------------------------
+-- 4. Invoices of one slice. @categoria: 1 cartera del mes, 2 facturado y cobrado
+--    en el mes, 3 anticipado, 4 cartera vencida.
+-- ----------------------------------------------------------------------------
 DECLARE @ini DATE = '2026-07-01';
 DECLARE @fin DATE = EOMONTH(@ini);
 DECLARE @categoria INT = 1;
@@ -148,12 +119,9 @@ WHERE  f.fecha_pago_efectiva BETWEEN @ini AND @fin
 ORDER BY f.monto DESC;
 GO
 
-
--- =====================================================================================
--- CONSULTA 5 -- "Que son los 5.5 millones que no liquidan factura?"
--- No son errores. LIQUIDA_NO_FACTURA es dinero que salda algo que no es una factura.
--- Se listan uno por uno: son 53 pagos, caben en una pantalla.
--- =====================================================================================
+-- ----------------------------------------------------------------------------
+-- 5. Payments that settle no invoice, one by one.
+-- ----------------------------------------------------------------------------
 DECLARE @ini DATE = '2026-07-01';
 DECLARE @fin DATE = EOMONTH(@ini);
 
@@ -168,29 +136,13 @@ WHERE  p.fecha_documento BETWEEN @ini AND @fin
 ORDER BY s.motivo, p.monto DESC;
 GO
 
-
--- =====================================================================================
--- CONSULTA 6 -- "Y los 12 millones de diferencia contra la caja?"
--- Esta es la pregunta dificil, y se contesta cambiando de lado: en vez de partir las
--- FACTURAS, se parten los PAGOS. Cada pago se cuenta una sola vez, asi que suma exacto
--- a la caja del mes y no hay reparto que suponer.
---
--- Julio 2026:
---     todas sus facturas se liquidaron en julio   11,908 pagos   $145.51M
---     sus facturas se liquidaron en otro mes          92 pagos   $  0.65M
---     mezcla de las dos                               14 pagos   $  0.11M
---     no liga a ninguna factura                       53 pagos   $  5.54M
---                                                              = $151.81M
---
--- LEER ESTO ANTES DE PRESENTARLO: la diferencia contra los $139.70M NO es
--- principalmente "pagos a facturas de otro mes" - eso son $0.76M. El grueso es que
--- $145.51M de pagos liquidaron facturas cuyo valor nominal suma menos: el puente liga
--- pago con factura pero NO reparte montos, asi que un pago puede traer mas o menos que
--- la suma de las facturas que salda (sobrepagos, coberturas parciales, saldos a cuenta).
--- Son dos formas de medir el mismo mes, no un descuadre.
---
--- Tarda ~1 minuto: cruza el puente completo. No es para correr en vivo frente a nadie.
--- =====================================================================================
+-- ----------------------------------------------------------------------------
+-- 6. The difference against cash, splitting payments instead of invoices: each
+--    payment counts once, so the classes add up to the month's cash.
+--    Most of the gap is payments bringing more or less than the face value of
+--    the invoices they settled, not payments to invoices of another month.
+--    Crosses the whole bridge (~1 minute).
+-- ----------------------------------------------------------------------------
 DECLARE @ini DATE = '2026-07-01';
 DECLARE @fin DATE = EOMONTH(@ini);
 

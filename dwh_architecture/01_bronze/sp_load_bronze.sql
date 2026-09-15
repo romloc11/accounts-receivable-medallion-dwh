@@ -1,197 +1,78 @@
-/*
-========================================================================================
-PROJECT: Data Centralization - Medallion Architecture (Bronze Layer)
-SOURCE SYSTEM: SAP ERP (Instance P01) / Database: P01
-TARGET SYSTEM: SQL Server (DWH) / Database: ANALISIS_DATOS
-SCHEMA: bronze
-OBJECT: bronze.load_bronze (Stored Procedure)
-
-NOTE ON STYLE: mirrors the structure, punctuation and syntax of a previously working
-backup procedure on this SQL Server 2012 instance (bronze.load_bronze_bk) - no
-semicolons after simple statements, DATETIME/GETDATE() instead of DATETIME2/
-SYSDATETIME(). Earlier versions with extra syntax (explicit column lists in large
-INSERT...SELECT, CREATE OR ALTER) repeatedly failed with "Incorrect syntax near ')'"
-on this instance for reasons that could not be pinned down after extensive isolated
-testing.
-
-CONFIRMED CAUSE: calling control.sp_log_load (the audit-logging procedure defined in
-ddl_bronze.sql) from within this procedure reproduces the same "Incorrect syntax near
-')'" error, even though control.sp_log_load compiles and can presumably be called on
-its own. It was removed from every section (and from the CATCH block) for that reason.
-control.sap_load_control therefore is NOT populated by this procedure - there is
-currently no persisted audit trail of runs, only the PRINT output visible while it
-runs. THROW is still active in the CATCH block, so a failure still propagates to
-whatever called this procedure (a SQL Agent job will correctly report failure) - it
-is only the row-level audit logging that had to be dropped.
-
-If the audit trail is needed later, investigate calling control.sp_log_load in
-isolation (outside this procedure, with hardcoded literal arguments) before
-re-attempting to wire it back in here - do not re-add it directly into this procedure
-without that isolated confirmation first, since every previous attempt to do so broke
-the whole batch.
-========================================================================================
-
-OVERVIEW:
-Loads the 8 core SAP tables plus 2 reference/lookup tables from P01.p01 into
-the Bronze staging area of ANALISIS_DATOS, in one sequential run:
-- sap_kna1, sap_knvp, sap_knkk, sap_knvv, sap_bsid, sap_knb1, sap_knb5,
-  sap_tvv1t, sap_pa0001: Full Truncate & Load (current SAP snapshot fully
-  replaces what's in bronze each run).
-- sap_bkpf: Incremental MERGE by primary key (MANDT, BUKRS, BELNR, GJAHR), filtered
-  to BLART = 'DZ' and to the current + previous month via BUDAT. Gives the document
-  header that BSAD/BSID lack: STBLG/STJAH (which document reverses which), STGRD
-  (why) and TCODE/USNAM (which transaction and user created it). History loaded once
-  via sp_backfill_bkpf.sql.
-- sap_bsad: Incremental MERGE by primary key (MANDT, BUKRS, KUNNR, GJAHR, BELNR,
-  BUZEI), filtered to the current + previous month via AUGDT. The full multi-year
-  history was loaded once via a separate one-time backfill (see sp_backfill_bsad.sql);
-  this keeps only the recent window in sync going forward.
-- sap_bsas: Incremental MERGE by primary key (MANDT, BUKRS, HKONT, GJAHR, BELNR, BUZEI),
-  filtered to cash accounts (HKONT 111xxx/113xxx) and to the current + previous month via
-  AUGDT - the clearing date, because a line enters BSAS when it is cleared and keeps an
-  old BUDAT (see the section note). The BANK side of a payment, which BSAD cannot show: BSAD's HKONT is the customer
-  reconciliation account, never the bank. This is what the company's own monthly cash
-  report is built on. History loaded once via sp_backfill_bsas.sql.
-- sap_bsis: Two steps, same cash-account scope. Accounts that never clear (99.76% of
-  the rows) are merged on a BUDAT window - their lines never leave BSIS. The clearing
-  accounts (SKB1.XOPVW = 'X') are deleted and reloaded whole on every run, because an
-  open item disappears the day it is cleared. Full reload, for recovery only:
-  sp_recargar_bsis.sql.
-- sap_tvv1t / sap_pa0001: added to support the customer active/legal/inactive
-  classification logic (see ciosa.py business rules, being ported to silver).
-  sap_tvv1t resolves KVGR1 "ruta" codes to their readable BEZEI name;
-  sap_pa0001 resolves PERNR to the employee's real name (ENAME) for the
-  vendedor/ejecutivo de credito/gerente/cobrador partner-function roles.
-
-NOTE ON sap_ausp / sap_bseg / sap_vbrk / sap_vbrp: intentionally not implemented.
-sap_bseg additionally CANNOT be implemented - it is an SAP cluster table and does not
-exist in P01 (verified 2026-09-11). bronze.sap_bsas/sap_bsis are the readable secondary
-indexes that replace it for G/L line items.
-See ddl_bronze.sql for the full notes on each. sap_bkpf WAS in that list and came
-back 2026-09-11 with a concrete consumer - see its note in ddl_bronze.sql.
-========================================================================================
-*/
-
-USE [ANALISIS_DATOS]
+/* ============================================================================
+   bronze.load_bronze
+   Purpose : Daily load of the SAP tables from P01 into bronze.
+   Run     : EXEC bronze.load_bronze;   first step of the daily chain
+   Loads   : full reload   kna1, knvp, knkk, knvv, bsid, knb1, knb5, tvv1t, pa0001
+             merge window  bsad (AUGDT), bkpf (BUDAT, DZ only), bsas (AUGDT),
+                           bsis (two steps, see the section)
+             The window starts on the first day of the previous month. History
+             comes from the backfill procedures in this folder.
+   ============================================================================ */
+USE ANALISIS_DATOS;
 GO
 
 IF OBJECT_ID('bronze.load_bronze', 'P') IS NOT NULL
-    DROP PROCEDURE bronze.load_bronze
-GO
-SET ANSI_NULLS ON
-GO
-SET QUOTED_IDENTIFIER ON
+    DROP PROCEDURE bronze.load_bronze;
 GO
 
-CREATE PROCEDURE [bronze].[load_bronze]
+CREATE PROCEDURE bronze.load_bronze
 AS
 BEGIN
     SET NOCOUNT ON;
 
-    DECLARE @start_time DATETIME,
-            @end_time DATETIME,
-            @batch_start_time DATETIME,
-            @batch_end_time DATETIME,
-            @mes_anterior_inicio NVARCHAR(8),
-            @current_table NVARCHAR(128)
+    DECLARE @proc VARCHAR(128) = 'bronze.load_bronze',
+            @step VARCHAR(128) = 'start',
+            @t0   DATETIME2(0) = SYSDATETIME(),
+            @t    DATETIME2(0) = SYSDATETIME(),
+            @rows INT,
+            @err  VARCHAR(4000),
+            @line INT,
+            @mes_anterior_inicio NVARCHAR(8);
 
     BEGIN TRY
-
-        SET @batch_start_time = GETDATE()
-
-        PRINT '=================================================='
-        PRINT '             Loading Bronze Layer (SAP)           '
-        PRINT '=================================================='
-
-        /* ==========================================================
-           1. CUSTOMER MASTER (KNA1) - Full Truncate & Load
-        ========================================================== */
-        SET @current_table = 'bronze.sap_kna1'
-        SET @start_time = GETDATE()
-        PRINT '>> Loading bronze.sap_kna1 (Full Load)...'
-
-        TRUNCATE TABLE bronze.sap_kna1
-
+        -- --------------------------------------------------------------------
+        -- Customer master and reference tables: full reload
+        -- --------------------------------------------------------------------
+        SET @step = 'bronze.sap_kna1 full'; SET @t = SYSDATETIME();
+        TRUNCATE TABLE bronze.sap_kna1;
         INSERT INTO bronze.sap_kna1
-        SELECT * FROM P01.p01.KNA1 WITH (NOLOCK)
+        SELECT * FROM P01.p01.KNA1 WITH (NOLOCK);
+        SET @rows = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @rows;
 
-        SET @end_time = GETDATE()
-        PRINT 'Duration: ' + CAST(DATEDIFF(second,@start_time,@end_time) AS NVARCHAR) + ' seconds'
-
-
-        /* ==========================================================
-           2. CUSTOMER PARTNER FUNCTIONS (KNVP) - Full Truncate & Load
-        ========================================================== */
-        SET @current_table = 'bronze.sap_knvp'
-        SET @start_time = GETDATE()
-        PRINT '>> Loading bronze.sap_knvp (Full Load)...'
-
-        TRUNCATE TABLE bronze.sap_knvp
-
+        SET @step = 'bronze.sap_knvp full'; SET @t = SYSDATETIME();
+        TRUNCATE TABLE bronze.sap_knvp;
         INSERT INTO bronze.sap_knvp
-        SELECT * FROM P01.p01.KNVP WITH (NOLOCK)
+        SELECT * FROM P01.p01.KNVP WITH (NOLOCK);
+        SET @rows = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @rows;
 
-        SET @end_time = GETDATE()
-        PRINT 'Duration: ' + CAST(DATEDIFF(second,@start_time,@end_time) AS NVARCHAR) + ' seconds'
-
-
-        /* ==========================================================
-           3. CREDIT CONTROL (KNKK) - Full Truncate & Load
-        ========================================================== */
-        SET @current_table = 'bronze.sap_knkk'
-        SET @start_time = GETDATE()
-        PRINT '>> Loading bronze.sap_knkk (Full Load)...'
-
-        TRUNCATE TABLE bronze.sap_knkk
-
+        SET @step = 'bronze.sap_knkk full'; SET @t = SYSDATETIME();
+        TRUNCATE TABLE bronze.sap_knkk;
         INSERT INTO bronze.sap_knkk
-        SELECT * FROM P01.p01.KNKK WITH (NOLOCK)
+        SELECT * FROM P01.p01.KNKK WITH (NOLOCK);
+        SET @rows = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @rows;
 
-        SET @end_time = GETDATE()
-        PRINT 'Duration: ' + CAST(DATEDIFF(second,@start_time,@end_time) AS NVARCHAR) + ' seconds'
-
-
-        /* ==========================================================
-           4. CUSTOMER SALES DATA (KNVV) - Full Truncate & Load
-        ========================================================== */
-        SET @current_table = 'bronze.sap_knvv'
-        SET @start_time = GETDATE()
-        PRINT '>> Loading bronze.sap_knvv (Full Load)...'
-
-        TRUNCATE TABLE bronze.sap_knvv
-
+        SET @step = 'bronze.sap_knvv full'; SET @t = SYSDATETIME();
+        TRUNCATE TABLE bronze.sap_knvv;
         INSERT INTO bronze.sap_knvv
-        SELECT * FROM P01.p01.KNVV WITH (NOLOCK)
+        SELECT * FROM P01.p01.KNVV WITH (NOLOCK);
+        SET @rows = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @rows;
 
-        SET @end_time = GETDATE()
-        PRINT 'Duration: ' + CAST(DATEDIFF(second,@start_time,@end_time) AS NVARCHAR) + ' seconds'
-
-
-        /* ==========================================================
-           5. OPEN ITEMS (BSID) - Full Truncate & Load
-           (Emptied daily because paid invoices disappear from here)
-        ========================================================== */
-        SET @current_table = 'bronze.sap_bsid'
-        SET @start_time = GETDATE()
-        PRINT '>> Loading bronze.sap_bsid (Snapshot Open Items)...'
-
-        TRUNCATE TABLE bronze.sap_bsid
-
+        -- Open items: a paid invoice leaves BSID, so only a full reload is correct.
+        SET @step = 'bronze.sap_bsid full'; SET @t = SYSDATETIME();
+        TRUNCATE TABLE bronze.sap_bsid;
         INSERT INTO bronze.sap_bsid
-        SELECT * FROM P01.p01.BSID WITH (NOLOCK)
+        SELECT * FROM P01.p01.BSID WITH (NOLOCK);
+        SET @rows = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @rows;
 
-        SET @end_time = GETDATE()
-        PRINT 'Duration: ' + CAST(DATEDIFF(second,@start_time,@end_time) AS NVARCHAR) + ' seconds'
-
-
-        /* ==========================================================
-           6. CLEARED ITEMS (BSAD) - Incremental Merge
-           (Only processes settlements from the current + previous month.
-            The complete history was loaded separately via sp_backfill_bsad.sql)
-        ========================================================== */
-        SET @current_table = 'bronze.sap_bsad'
-        SET @start_time = GETDATE()
-        PRINT '>> Loading bronze.sap_bsad (Incremental Merge)...'
+        -- --------------------------------------------------------------------
+        -- Cleared customer items (BSAD): merge by clearing date
+        -- --------------------------------------------------------------------
+        SET @step = 'bronze.sap_bsad merge'; SET @t = SYSDATETIME();
 
         SET @mes_anterior_inicio =
             CONVERT(NVARCHAR(8),
@@ -200,7 +81,7 @@ BEGIN
                         MONTH(DATEADD(MONTH, -1, GETDATE())),
                         1
                     ),
-                    112)
+                    112);
 
         MERGE bronze.sap_bsad AS tgt
         USING (
@@ -280,29 +161,16 @@ BEGIN
             src.GMVKZ, src.SRTYPE, src.LOTKZ, src.FKBER, src.INTRENO, src.PPRCT, src.BUZID, src.AUGGJ, src.HKTID, src.BUDGET_PD,
             src.PAYS_PROV, src.PAYS_TRAN, src.MNDID, src.KONTT, src.KONTL, src.UEBGDAT, src.VNAME, src.EGRUP, src.BTYPE, src.PROPMANO
         );
+        SET @rows = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @rows;
 
-        SET @end_time = GETDATE()
-        PRINT 'Duration: ' + CAST(DATEDIFF(second,@start_time,@end_time) AS NVARCHAR) + ' seconds'
-
-
-
-        /* ==========================================================
-           7. ACCOUNTING DOCUMENT HEADER (BKPF) - Incremental Merge
-           Only BLART = 'DZ'. See the scope note in ddl_bronze.sql.
-           Windowed by BUDAT, not by a change date: SAP leaves AEDAT at
-           '00000000' on virtually every row here (measured on August 2026:
-           23,518 of 23,518), so there is no reliable "changed since" field.
-           A reversal rewrites STBLG on the ORIGINAL document, which is why
-           the window has to reach back a month instead of only loading what
-           is new - and why STBLG is in the UPDATE list below.
-           LIMITATION: a document reversed more than ~1 month after it was
-           posted falls outside the window and keeps a stale STBLG here.
-           Measured over 2026, every reversal landed in the same month as its
-           original, so the window holds today; widen it if that changes.
-        ========================================================== */
-        SET @current_table = 'bronze.sap_bkpf'
-        SET @start_time = GETDATE()
-        PRINT '>> Loading bronze.sap_bkpf (Incremental Merge)...'
+        -- --------------------------------------------------------------------
+        -- Document headers (BKPF, DZ only): merge by posting date
+        -- A reversal rewrites STBLG on the ORIGINAL document, so matched rows
+        -- update it. A reversal posted more than a month after its original
+        -- falls outside the window and leaves STBLG stale here.
+        -- --------------------------------------------------------------------
+        SET @step = 'bronze.sap_bkpf merge'; SET @t = SYSDATETIME();
 
         MERGE bronze.sap_bkpf AS tgt
         USING (
@@ -367,108 +235,45 @@ BEGIN
             src.EXCLUDE_FLAG, src.BLIND, src.OFFSET_STATUS, src.OFFSET_REFER_DAT, src.PENRC,
             src.KNUMV
         );
+        SET @rows = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @rows;
 
-        SET @end_time = GETDATE()
-        PRINT 'Duration: ' + CAST(DATEDIFF(second,@start_time,@end_time) AS NVARCHAR) + ' seconds'
-
-        /* ==========================================================
-           8. CUSTOMER COMPANY CODE DATA (KNB1) - Full Truncate & Load
-        ========================================================== */
-        SET @current_table = 'bronze.sap_knb1'
-        SET @start_time = GETDATE()
-        PRINT '>> Loading bronze.sap_knb1 (Full Load)...'
-
-        TRUNCATE TABLE bronze.sap_knb1
-
+        SET @step = 'bronze.sap_knb1 full'; SET @t = SYSDATETIME();
+        TRUNCATE TABLE bronze.sap_knb1;
         INSERT INTO bronze.sap_knb1
-        SELECT * FROM P01.p01.KNB1 WITH (NOLOCK)
+        SELECT * FROM P01.p01.KNB1 WITH (NOLOCK);
+        SET @rows = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @rows;
 
-        SET @end_time = GETDATE()
-        PRINT 'Duration: ' + CAST(DATEDIFF(second,@start_time,@end_time) AS NVARCHAR) + ' seconds'
-
-
-        /* ==========================================================
-           8. CUSTOMER DUNNING DATA (KNB5) - Full Truncate & Load
-        ========================================================== */
-        SET @current_table = 'bronze.sap_knb5'
-        SET @start_time = GETDATE()
-        PRINT '>> Loading bronze.sap_knb5 (Full Load)...'
-
-        TRUNCATE TABLE bronze.sap_knb5
-
+        SET @step = 'bronze.sap_knb5 full'; SET @t = SYSDATETIME();
+        TRUNCATE TABLE bronze.sap_knb5;
         INSERT INTO bronze.sap_knb5
-        SELECT * FROM P01.p01.KNB5 WITH (NOLOCK)
+        SELECT * FROM P01.p01.KNB5 WITH (NOLOCK);
+        SET @rows = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @rows;
 
-        SET @end_time = GETDATE()
-        PRINT 'Duration: ' + CAST(DATEDIFF(second,@start_time,@end_time) AS NVARCHAR) + ' seconds'
-
-
-        /* ==========================================================
-           9. ROUTE TEXT - CUSTOMER GROUP 1 (TVV1T) - Full Truncate & Load
-           (Standard SAP text table, resolves KVGR1 -> readable name BEZEI)
-        ========================================================== */
-        SET @current_table = 'bronze.sap_tvv1t'
-        SET @start_time = GETDATE()
-        PRINT '>> Loading bronze.sap_tvv1t (Full Load)...'
-
-        TRUNCATE TABLE bronze.sap_tvv1t
-
+        SET @step = 'bronze.sap_tvv1t full'; SET @t = SYSDATETIME();
+        TRUNCATE TABLE bronze.sap_tvv1t;
         INSERT INTO bronze.sap_tvv1t
-        SELECT * FROM P01.p01.TVV1T WITH (NOLOCK)
+        SELECT * FROM P01.p01.TVV1T WITH (NOLOCK);
+        SET @rows = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @rows;
 
-        SET @end_time = GETDATE()
-        PRINT 'Duration: ' + CAST(DATEDIFF(second,@start_time,@end_time) AS NVARCHAR) + ' seconds'
-
-
-        /* ==========================================================
-           10. INFOTYPE 0001 - HR ORGANIZATIONAL ASSIGNMENT (PA0001) - Full Truncate & Load
-           (Resolves PERNR -> the employee's real name, ENAME)
-        ========================================================== */
-        SET @current_table = 'bronze.sap_pa0001'
-        SET @start_time = GETDATE()
-        PRINT '>> Loading bronze.sap_pa0001 (Full Load)...'
-
-        TRUNCATE TABLE bronze.sap_pa0001
-
+        SET @step = 'bronze.sap_pa0001 full'; SET @t = SYSDATETIME();
+        TRUNCATE TABLE bronze.sap_pa0001;
         INSERT INTO bronze.sap_pa0001
-        SELECT * FROM P01.p01.PA0001 WITH (NOLOCK)
+        SELECT * FROM P01.p01.PA0001 WITH (NOLOCK);
+        SET @rows = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @rows;
 
-        SET @end_time = GETDATE()
-        PRINT 'Duration: ' + CAST(DATEDIFF(second,@start_time,@end_time) AS NVARCHAR) + ' seconds'
-
-
-        /* ==========================================================
-           11. G/L CLEARED LINE ITEMS - CASH ACCOUNTS (BSAS) - Incremental Merge
-
-           The bank side of a payment. BSAD only carries the CUSTOMER line, whose
-           HKONT is the reconciliation account (121001), so the bank account the
-           money actually landed in was invisible until this table. This is what
-           the company's own monthly cash report is built on - reproduced exactly
-           for July 2026, document by document.
-
-           SCOPE: HKONT 111xxx (cash on hand + payment-gateway transit accounts)
-           and 113xxx (banks). See the long note in ddl_bronze.sql for why the
-           111xxx half is not optional.
-
-           WINDOW: AUGDT (clearing date), current + previous month - same as BSAD,
-           and NOT BUDAT like BKPF. A line ENTERS BSAS the day it is cleared, and it
-           keeps its original BUDAT, which can be months old: a bank line posted in
-           March and cleared in September arrives with BUDAT = March. A BUDAT window
-           has already moved past it and never loads it - every line that takes more
-           than a month to clear would be lost after the backfill, with no error.
-           The first version of this section had exactly that bug. Measured before
-           it shipped: of the lines cleared in July 2026, 97 ($424,511.58) had a
-           BUDAT before June - small in one month, but lost for good every month.
-
-           The MERGE matches on 6 columns, not on the 9 of P01's own key (BSAS~0:
-           MANDT, BUKRS, HKONT, AUGDT, AUGBL, ZUONR, GJAHR, BELNR, BUZEI). With the
-           9, a line that is un-cleared and re-cleared carries a new AUGDT/AUGBL,
-           matches nothing, and gets inserted as a SECOND row next to the stale one.
-           See THE KEY in ddl_bronze.sql.
-        ========================================================== */
-        SET @current_table = 'bronze.sap_bsas'
-        SET @start_time = GETDATE()
-        PRINT '>> Loading bronze.sap_bsas (Incremental Merge)...'
+        -- --------------------------------------------------------------------
+        -- Cleared G/L lines, cash accounts (BSAS): merge by clearing date
+        -- AUGDT and not BUDAT: a line enters BSAS when it is cleared and keeps
+        -- its original BUDAT, so a BUDAT window never sees slow clearings.
+        -- Matched on 6 key columns, not on P01's 9 (which include AUGDT/AUGBL):
+        -- a re-cleared line would otherwise be inserted a second time.
+        -- --------------------------------------------------------------------
+        SET @step = 'bronze.sap_bsas merge'; SET @t = SYSDATETIME();
 
         MERGE bronze.sap_bsas AS tgt
         USING (
@@ -492,10 +297,7 @@ BEGIN
         AND tgt.BELNR = src.BELNR
         AND tgt.BUZEI = src.BUZEI
 
-        -- Only what can change after the line is first posted: the clearing link
-        -- (a line can be cleared, un-cleared and re-cleared), the assignment and
-        -- text (both editable afterwards in FB02) and the reversal and archive
-        -- flags. The amount and the account never move.
+        -- Only what can change after posting: clearing link, assignment, text, flags.
         WHEN MATCHED THEN UPDATE SET
             tgt.AUGDT = src.AUGDT,
             tgt.AUGBL = src.AUGBL,
@@ -531,47 +333,19 @@ BEGIN
             src.MEASURE, src.BUDGET_PD, src.PBUDGET_PD, src.FIPEX, src.PRODPER, src.QSSKZ,
             src.PROPMANO
         );
+        SET @rows = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @rows;
 
-        SET @end_time = GETDATE()
-        PRINT 'Duration: ' + CAST(DATEDIFF(second,@start_time,@end_time) AS NVARCHAR) + ' seconds'
-
-
-        /* ==========================================================
-           12. G/L OPEN LINE ITEMS - CASH ACCOUNTS (BSIS) - two steps
-
-           BSIS holds two kinds of line that behave differently. Until 2026-09-14
-           this section reloaded all ~2.9M rows on every run (134 s, 56% of the
-           whole bronze load), because an open item DISAPPEARS the day it is
-           cleared and no date window can follow that. But only accounts managed
-           by open items can clear, and that is a small set:
-
-           a) Accounts WITHOUT open-item management - cash on hand, the
-              payment-gateway transit accounts, the base bank accounts. Their
-              lines can never be cleared, so they never leave BSIS: this part
-              only grows. 99.76% of the rows (2,923,834 of 2,930,779). Merged on
-              a BUDAT window, which P01 can serve from its own index on BUDAT.
-
-           b) Accounts WITH it - the NC/ND/CH clearing sub-accounts, ~7,000 rows.
-              Deleted and reloaded whole on every run, inside a transaction, so a
-              failure cannot leave those accounts without their open items.
-
-           WHICH ACCOUNT IS WHICH comes from the G/L account master (SKB1.XOPVW),
-           not from the data already in bronze: a new clearing account would never
-           appear in a list derived from bronze, and its lines would fall through
-           both steps. Verified 2026-09-14: SKB1 flags 60 cash accounts - the 27
-           that have lines since 2022 plus 33 with no movement yet - and no account
-           with open-item lines is missing from it. silver.load_silver makes the
-           same split from the line flag (XOPVW), which matched SKB1 on every row.
-
-           LIMITATIONS, both covered by bronze.recargar_bsis (sp_recargar_bsis.sql,
-           a full reload - run it off-hours when needed):
-             - a line posted into a period older than the previous month (possible
-               only while that period is still open) is not picked up by step a;
-             - a line archived out of SAP stays in bronze.
-        ========================================================== */
-        SET @current_table = 'bronze.sap_bsis (a: accounts that never clear)'
-        SET @start_time = GETDATE()
-        PRINT '>> Loading bronze.sap_bsis (a: accounts that never clear - Incremental Merge)...'
+        -- --------------------------------------------------------------------
+        -- Open G/L lines, cash accounts (BSIS): two steps
+        -- a) Accounts without open-item management never clear, so their lines
+        --    never leave BSIS: merge on a BUDAT window (99.8% of the rows).
+        -- b) Open-item accounts (SKB1.XOPVW = 'X'): a line leaves BSIS the day
+        --    it is cleared, so they are reloaded whole, in a transaction.
+        -- The split comes from SKB1, not from bronze, so a new clearing account
+        -- is not missed. What no window sees is recovered with bronze.recargar_bsis.
+        -- --------------------------------------------------------------------
+        SET @step = 'bronze.sap_bsis a: merge, accounts that never clear'; SET @t = SYSDATETIME();
 
         MERGE bronze.sap_bsis AS tgt
         USING (
@@ -599,7 +373,6 @@ BEGIN
         AND tgt.BELNR = src.BELNR
         AND tgt.BUZEI = src.BUZEI
 
-        -- A line in these accounts never clears; only what FB02 can still edit changes.
         WHEN MATCHED THEN UPDATE SET
             tgt.ZUONR = src.ZUONR,
             tgt.XBLNR = src.XBLNR,
@@ -631,22 +404,19 @@ BEGIN
             src.MEASURE, src.BUDGET_PD, src.PBUDGET_PD, src.FIPEX, src.PRODPER, src.QSSKZ,
             src.PROPMANO
         );
+        SET @rows = @@ROWCOUNT;
+        EXEC control.log_step @proc, @step, @t, @rows;
 
-        SET @end_time = GETDATE()
-        PRINT 'Duration: ' + CAST(DATEDIFF(second,@start_time,@end_time) AS NVARCHAR) + ' seconds'
+        SET @step = 'bronze.sap_bsis b: full, open-item accounts'; SET @t = SYSDATETIME();
 
-        SET @current_table = 'bronze.sap_bsis (b: accounts that clear)'
-        SET @start_time = GETDATE()
-        PRINT '>> Loading bronze.sap_bsis (b: accounts that clear - Full Reload)...'
-
-        BEGIN TRANSACTION
+        BEGIN TRANSACTION;
 
         DELETE b
         FROM bronze.sap_bsis b
         WHERE EXISTS (
             SELECT 1 FROM P01.p01.SKB1 k WITH (NOLOCK)
             WHERE k.MANDT = b.MANDT AND k.BUKRS = b.BUKRS
-              AND k.SAKNR = b.HKONT AND k.XOPVW = 'X')
+              AND k.SAKNR = b.HKONT AND k.XOPVW = 'X');
 
         INSERT INTO bronze.sap_bsis
         SELECT *
@@ -656,43 +426,19 @@ BEGIN
           AND EXISTS (
               SELECT 1 FROM P01.p01.SKB1 k WITH (NOLOCK)
               WHERE k.MANDT = b.MANDT AND k.BUKRS = b.BUKRS
-                AND k.SAKNR = b.HKONT AND k.XOPVW = 'X')
+                AND k.SAKNR = b.HKONT AND k.XOPVW = 'X');
+        SET @rows = @@ROWCOUNT;
 
-        PRINT '   ' + CAST(@@ROWCOUNT AS NVARCHAR) + ' rows'
+        COMMIT TRANSACTION;
+        EXEC control.log_step @proc, @step, @t, @rows;
 
-        COMMIT TRANSACTION
-
-        SET @end_time = GETDATE()
-        PRINT 'Duration: ' + CAST(DATEDIFF(second,@start_time,@end_time) AS NVARCHAR) + ' seconds'
-
-
-        -- END OF FULL PROCESS
-        SET @batch_end_time = GETDATE()
-
-        PRINT '=================================================='
-        PRINT '          Bronze Load Completed Successfully      '
-        PRINT 'Total Duration: ' + CAST(DATEDIFF(second,@batch_start_time,@batch_end_time) AS NVARCHAR) + ' seconds'
-        PRINT '=================================================='
-
+        EXEC control.log_step @proc, 'total', @t0;
     END TRY
     BEGIN CATCH
-
-        -- Section 12 step b is the only transaction in this procedure. Without the
-        -- rollback a failure there would leave the delete half-applied and locked.
-        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION
-
-        PRINT '=================================================='
-        PRINT '             ERROR DURING BRONZE LOAD             '
-        PRINT 'Table: '    + ISNULL(@current_table, 'UNKNOWN')
-        PRINT 'Message: ' + ERROR_MESSAGE()
-        PRINT 'Line: '    + CAST(ERROR_LINE() AS VARCHAR(10))
-        PRINT '==================================================';
-
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+        SELECT @err = ERROR_MESSAGE(), @line = ERROR_LINE();
+        EXEC control.log_step @proc, @step, @t, NULL, @err, @line;
         THROW;
-
     END CATCH
-END
-GO
-
-PRINT 'Procedure bronze.load_bronze created successfully.'
+END;
 GO

@@ -1,27 +1,29 @@
+/* ============================================================================
+   Silver tables
+   Purpose : Cleaned SAP tables: trimmed text, real dates, customer ids without
+             leading zeros, mandante 400 only, curated columns.
+   Run     : on an empty server only. Every table is dropped and recreated, and
+             the history loaded by the silver backfills is lost.
+   Notes   : Amounts are never signed: apply debe_haber.
+             sap_bsid and sap_bsad have the same columns in a different order;
+             a UNION between them must list the columns.
+   ============================================================================ */
 USE ANALISIS_DATOS;
 GO
 
-/*
-===============================================================================
-PROJECT: Enterprise Data Warehouse (dwh-ciosa)
-LAYER: Silver (Clean Data Staging)
-===============================================================================
-*/
-
-
--- ==========================================================
--- 1. CUSTOMER MASTER (silver.sap_kna1)
--- ==========================================================
+-- ----------------------------------------------------------------------------
+-- silver.sap_kna1: customer master
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('silver.sap_kna1', 'U') IS NOT NULL DROP TABLE silver.sap_kna1;
 CREATE TABLE silver.sap_kna1 (
     mandante                VARCHAR(3)   NOT NULL,
     cliente_id              VARCHAR(10)  NOT NULL,
     rfc                     VARCHAR(16),   -- STCD1
     nombre                  VARCHAR(35),   -- NAME1
-    nombre2                 VARCHAR(35),   -- NAME2 (when the name is too long)
+    nombre2                 VARCHAR(35),   -- NAME2
     pais                    VARCHAR(3),    -- LAND1
-    estado                  VARCHAR(3),    -- REGIO (customer's state code; renamed from "region" to avoid confusion with silver.sap_knvv.region, which is the sales region/BZIRK)
-    poblacion                VARCHAR(35),  -- ORT01 (city)
+    estado                  VARCHAR(3),    -- REGIO
+    poblacion                VARCHAR(35),  -- ORT01
     codigo_postal           VARCHAR(10),   -- PSTLZ
     calle                   VARCHAR(35),   -- STRAS
     bloqueo_pedido          VARCHAR(2),    -- AUFSD
@@ -46,9 +48,9 @@ CREATE TABLE silver.sap_kna1 (
     CONSTRAINT PK_silver_sap_kna1 PRIMARY KEY (mandante, cliente_id)
 );
 
--- ==========================================================
--- 2. CUSTOMER PARTNER FUNCTIONS (silver.sap_knvp)
--- ==========================================================
+-- ----------------------------------------------------------------------------
+-- silver.sap_knvp: customer partner functions
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('silver.sap_knvp', 'U') IS NOT NULL DROP TABLE silver.sap_knvp;
 CREATE TABLE silver.sap_knvp (
     mandante                VARCHAR(3)   NOT NULL,
@@ -57,20 +59,20 @@ CREATE TABLE silver.sap_knvp (
     canal_distribucion      VARCHAR(2)   NOT NULL,
     sector                  VARCHAR(2)   NOT NULL,
     funcion_interlocutor    VARCHAR(2)   NOT NULL,
-    descripcion_funcion     VARCHAR(40),  -- derived from PARVW (business catalog, see sp_load_silver.sql)
-    contador                VARCHAR(3)   NOT NULL,  -- PARZA, completes the PK (bronze uses the same field)
+    descripcion_funcion     VARCHAR(40),  -- from PARVW
+    contador                VARCHAR(3)   NOT NULL,  -- PARZA
     cliente_asociado        VARCHAR(10),  -- KUNN2
     id_interlocutor         VARCHAR(8),   -- PERNR
-    nombre_interlocutor     VARCHAR(40),  -- ENAME resolved from bronze.sap_pa0001 (PERNR, current record ENDDA='99991231'). Only applies when id_interlocutor is a real employee (VE/E1/GR/CC roles); used in the active/legal/inactive classification (see ciosa.py)
+    nombre_interlocutor     VARCHAR(40),  -- ENAME from bronze.sap_pa0001, current record
     id_paqueteria           VARCHAR(10),  -- LIFNR
     flag_default            BIT,          -- DEFPA
     fecha_carga             DATETIME DEFAULT GETDATE(),
     CONSTRAINT PK_silver_sap_knvp PRIMARY KEY (mandante, cliente_id, organizacion_ventas, canal_distribucion, sector, funcion_interlocutor, contador)
 );
 
--- ==========================================================
--- 3. CREDIT LIMITS (silver.sap_knkk)
--- ==========================================================
+-- ----------------------------------------------------------------------------
+-- silver.sap_knkk: credit control
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('silver.sap_knkk', 'U') IS NOT NULL DROP TABLE silver.sap_knkk;
 CREATE TABLE silver.sap_knkk (
     mandante                      VARCHAR(3)   NOT NULL,
@@ -98,27 +100,17 @@ CREATE TABLE silver.sap_knkk (
     monto_ultimo_pago              DECIMAL(15,2),-- CASHA
     moneda_ultimo_pago             VARCHAR(5),   -- CASHC
     clasificacion_riesgo           VARCHAR(5),   -- DBRTG
-    fecha_ultima_modificacion_texto DATE,        -- AETXT: date of the last modification to the text attached to the credit record. Used, among other things, to track promissory notes (confirmed with the credit department)
-    grupo_credito                  VARCHAR(4),   -- GRUPP: special credit group/status code (real observed values: MORA, PPC, DEPU, ALTO, COM, ESPP, ESPI, FOT1-3, CV1-2, COVI, RESP, among others); exact meaning of each code pending a business catalog
-    indicador_pago_db              VARCHAR(3),   -- DBPAY: payment indicator (Dun & Bradstreet integration), observed mix of percentages ('5%','7%'...) and letter ratings ('A'-'D')
-    limite_credito_recomendado_db  DECIMAL(15,2),-- DBEKR: recommended credit limit (Dun & Bradstreet). Always in MXN on p01 (see DBWAE in bronze.sap_knkk, a column with a single constant value, not replicated in silver since it adds no information)
+    fecha_ultima_modificacion_texto DATE,        -- AETXT
+    grupo_credito                  VARCHAR(4),   -- GRUPP
+    indicador_pago_db              VARCHAR(3),   -- DBPAY (D&B)
+    limite_credito_recomendado_db  DECIMAL(15,2),-- DBEKR (D&B, MXN)
     fecha_carga                    DATETIME DEFAULT GETDATE(),
     CONSTRAINT PK_silver_sap_knkk PRIMARY KEY (mandante, cliente_id, area_control_credito)
 );
 
--- ==========================================================
--- NOTE: bronze.sap_knkk columns deliberately NOT included in silver:
--- XCHNG, DBRAT, ABSBT -> 0% of rows have data on p01 (confirmed by count).
--- DTREV, PAYDB, DBMON -> ~99.9%-100% of rows carry only the technical
---   default value ('00000000' or '00'), with no real variation; the rest is
---   scattered noise (a handful of loose rows). They add no business
---   information. If SAP starts actively using them in the future, revalidate
---   with the same kind of count before adding them.
--- ==========================================================
-
--- ==========================================================
--- 4. SALES AREA DATA (silver.sap_knvv)
--- ==========================================================
+-- ----------------------------------------------------------------------------
+-- silver.sap_knvv: customer sales area data
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('silver.sap_knvv', 'U') IS NOT NULL DROP TABLE silver.sap_knvv;
 CREATE TABLE silver.sap_knvv (
     mandante               VARCHAR(3)   NOT NULL,
@@ -126,21 +118,15 @@ CREATE TABLE silver.sap_knvv (
     organizacion_ventas    VARCHAR(4)   NOT NULL,
     canal_distribucion     VARCHAR(2)   NOT NULL,
     sector                 VARCHAR(2)   NOT NULL,
-
-    -- Commercial Organization and Structure
     oficina_ventas         VARCHAR(4),   -- VKBUR
     grupo_vendedores       VARCHAR(3),   -- VKGRP
     region                 VARCHAR(6),   -- BZIRK
-    ruta                   VARCHAR(3),   -- KVGR1 (SAP route code)
-    ruta_nombre            VARCHAR(20),  -- BEZEI resolved from bronze.sap_tvv1t (MANDT+SPRAS='S'+KVGR1), used in the active/legal/inactive classification (see ciosa.py)
+    ruta                   VARCHAR(3),   -- KVGR1
+    ruta_nombre            VARCHAR(20),  -- BEZEI from bronze.sap_tvv1t
     centro_suministrador   VARCHAR(4),   -- VWERK
-
-    -- Classification and Categories
     grupo_clientes         VARCHAR(2),   -- KDGRP
     grupo_precios          VARCHAR(2),   -- KONDA
     lista_precios          VARCHAR(2),   -- PLTYP
-
-    -- Incoterms and Deliveries
     incoterm               VARCHAR(3),   -- INCO1
     incoterm_descripcion   VARCHAR(28),  -- INCO2
     entregas_parciales_max DECIMAL(1,0), -- ANTLF
@@ -148,43 +134,24 @@ CREATE TABLE silver.sap_knvv (
     tiempo_entrega         VARCHAR(3),   -- KVGR2
     tipo_servicio          VARCHAR(3),   -- KVGR3
     tipo_servicio_2        VARCHAR(3),   -- KVGR4
-    condicion_expedicion   VARCHAR(2),   -- VSBED: normalized ('1' -> '01') to line up with the 2-digit code already present in the source, see sp_load_silver.sql
-
-    -- Financial Terms
+    condicion_expedicion   VARCHAR(2),   -- VSBED, padded to 2 digits
     condicion_pago         VARCHAR(4),   -- ZTERM
     moneda                 VARCHAR(5),   -- WAERS
-
-    -- Blocks and Control Flags
     bloqueo_entrega        VARCHAR(2),   -- LIFSD
     bloqueo_factura        VARCHAR(2),   -- FAKSD
     bloqueo_pedido         VARCHAR(2),   -- AUFSD
-    bloqueo_contacto_deudor VARCHAR(2),  -- CASSD: "Dunning contact block" (sales area), confirmed via SE11. Real flag (X/blank, 4.3% of rows), distinct from AUFSD
-
-    -- Dates and Audit
+    bloqueo_contacto_deudor VARCHAR(2),  -- CASSD
     fecha_creacion         DATE,         -- ERDAT
     creado_por             VARCHAR(12),  -- ERNAM
     fecha_carga            DATETIME DEFAULT GETDATE(),
-
     CONSTRAINT PK_silver_sap_knvv PRIMARY KEY (mandante, cliente_id, organizacion_ventas, canal_distribucion, sector)
 );
 
--- ==========================================================
--- NOTE: bronze.sap_knvv columns deliberately NOT included in silver
--- (beyond the ~50 execution-logistics/pricing/beverage-industry columns
--- already dropped for scope, see the bkpf/vbrk/vbrp note in ddl_bronze.sql):
--- LOEVM -> not replicated as a column, used as an exclusion FILTER
---   (75 of 29,374 rows flagged 'X', same criterion as kna1).
--- KLABC -> 0.03% of rows have data, no real use.
--- KKBER -> 0% of rows have data at this level (already available via silver.sap_knkk).
--- VERSG -> 98.4% of rows share the same constant value, no real variation.
--- KTGRD -> 97.3% of rows share the same constant value ('Z1'), no real variation.
--- AWAHR -> 99.7% of rows at '100' (order probability, SAP default), no real variation.
--- KVGR5 -> 0% of rows have data.
--- ==========================================================
-
--- ==========================================================
--- 5. OPEN ITEMS (silver.sap_bsid)
--- ==========================================================
+-- ----------------------------------------------------------------------------
+-- silver.sap_bsid: open customer items
+-- The three clearing columns are always NULL here; they go last because the
+-- server received them by ALTER.
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('silver.sap_bsid', 'U') IS NOT NULL DROP TABLE silver.sap_bsid;
 CREATE TABLE silver.sap_bsid (
     mandante                 VARCHAR(3)   NOT NULL,
@@ -195,76 +162,40 @@ CREATE TABLE silver.sap_bsid (
     documento_id             VARCHAR(10)  NOT NULL,
     asignacion               VARCHAR(18),   -- ZUONR
     referencia               VARCHAR(16),   -- XBLNR
-    documento_ventas         VARCHAR(10),   -- VBELN: reference to the sales document (SD), 86,961 distinct values out of 88,022 rows, virtually 1:1
+    documento_ventas         VARCHAR(10),   -- VBELN
     posicion                 INT          NOT NULL,
     fecha_contabilizacion    DATE,          -- BUDAT
     fecha_documento          DATE,          -- BLDAT
     fecha_registro_sistema   DATE,          -- CPUDT
-    fecha_vencimiento        DATE,          -- ZFBDT
+    fecha_vencimiento        DATE,          -- ZFBDT + ZBD1T
     clase_documento          VARCHAR(2),    -- BLART
-    codigo_impuesto          VARCHAR(2),    -- MWSKZ: VAT code (real observed catalog: B4, B5, B0, WJ)
+    codigo_impuesto          VARCHAR(2),    -- MWSKZ
     debe_haber               CHAR(1),       -- SHKZG
     monto_moneda_local       DECIMAL(15,2), -- DMBTR
     monto_moneda_doc         DECIMAL(15,2), -- WRBTR
     moneda                   VARCHAR(5),    -- WAERS
     condicion_pago           VARCHAR(4),    -- ZTERM
     dias_plazo               DECIMAL(15,2), -- ZBD1T
-
-    -- Added 2026-09-03 for the fact_aplicacion v2 design (see DESIGN.md): open items are a
-    -- source of applications too (a partial payment in progress and the invoice it references
-    -- both live only here), so bsid needs the same application fields bsad already has.
-    clave_contabilizacion         VARCHAR(2),  -- BSCHL: SAP posting key. The single most informative field for the application logic: 11 = virgin deposit (with REBZG='V'), 15 = referenced payment, 08 = child mirror, 17 = credit re-applied, 02/05/12 = reversal of 11/15/01. Verified against SAP GUI (FB03) 2026-09-03.
-    sgtxt                         VARCHAR(50), -- SGTXT: line item text ('Asignación Aut. Deposito' = virgin deposit)
-    factura_referencia_documento  VARCHAR(10), -- REBZG: invoice this line references. 'V' is a SAP marker ("no invoice reference, own due date"), not a document number - treat as NULL
+    clave_contabilizacion         VARCHAR(2),  -- BSCHL
+    sgtxt                         VARCHAR(50), -- SGTXT
+    factura_referencia_documento  VARCHAR(10), -- REBZG ('V' = no invoice reference)
     factura_referencia_ejercicio  INT,         -- REBZJ
     factura_referencia_posicion   INT,         -- REBZZ
-
-    -- Dunning at the line-item level
     area_reclamacion              VARCHAR(2), -- MABER
     nivel_reclamacion             CHAR(1),    -- MANST
     clave_reclamacion_legal       CHAR(1),    -- MSCHL
     bloqueo_reclamacion_temporal  CHAR(1),    -- MANSP
     fecha_ultima_reclamacion      DATE,       -- MADAT
-
-    -- Added 2026-09-05 (user decision): bsid carries the SAME column set as bsad, so the
-    -- two can be read as one population without remembering which one lacks what. These
-    -- three are ALWAYS NULL here and that is correct, not a gap: BSID is SAP's OPEN items
-    -- table and a line moves to BSAD precisely when it gets cleared, so an open item has
-    -- no clearing document by definition. Verified on real data 2026-09-05: 0 of the
-    -- 83,653 bronze.sap_bsid rows carry AUGBL, AUGDT or AUGGJ. sp_load_silver.sql still
-    -- maps them from those fields with bsad's exact parsing rather than writing literal
-    -- NULL, so the loader documents its own source and a future non-NULL would surface
-    -- instead of being silently discarded.
-    --
-    -- POSITION: bsad keeps these at ordinals 14-16; here they are last, because the live
-    -- server got them via ALTER TABLE ADD (one-time script, retired 2026-09-14 - in git history)
-    -- and this file must describe the server as it actually is. Same column SET, different
-    -- ORDER - so any UNION between bsid and bsad MUST list columns explicitly. A
-    -- 'SELECT * FROM bsid UNION ALL SELECT * FROM bsad' compiles and silently pairs the
-    -- wrong columns.
-    fecha_compensacion            DATE,        -- AUGDT (always NULL in bsid)
-    documento_compensacion        VARCHAR(10), -- AUGBL (always NULL in bsid)
-    ejercicio_compensacion        INT,         -- AUGGJ (always NULL in bsid)
-
+    fecha_compensacion            DATE,        -- AUGDT
+    documento_compensacion        VARCHAR(10), -- AUGBL
+    ejercicio_compensacion        INT,         -- AUGGJ
     fecha_carga              DATETIME DEFAULT GETDATE(),
     CONSTRAINT PK_silver_sap_bsid PRIMARY KEY (mandante, sociedad, cliente_id, ejercicio, documento_id, posicion)
 );
 
--- ==========================================================
--- NOTE: bronze.sap_bsid columns deliberately NOT included in silver:
--- ZLSPR, RSTGR, BSTAT, UMSKS, UMSKZ, GSBER -> 0% of rows have data on p01.
--- ZLSCH -> 0.05% of rows (43 of 91,235), scattered noise.
--- SKNTO, WSKTO -> 0% of rows (the early-payment discount amount taken is
---   never recorded, even though a discount base exists in SKFBT).
--- SKFBT -> dropped despite 95.1% coverage: in 86,774 of 86,799 rows
---   (99.97%) it's identical to DMBTR, i.e. it's not a real discount base
---   distinct from the total amount, just a copy. The high number of distinct
---   values that seemed to suggest real data is actually inherited from DMBTR.
--- ==========================================================
-
--- ==========================================================
--- 6. CLEARED ITEMS (silver.sap_bsad)
--- ==========================================================
+-- ----------------------------------------------------------------------------
+-- silver.sap_bsad: cleared customer items
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('silver.sap_bsad', 'U') IS NOT NULL DROP TABLE silver.sap_bsad;
 CREATE TABLE silver.sap_bsad (
     mandante VARCHAR(3) NOT NULL,
@@ -275,53 +206,46 @@ CREATE TABLE silver.sap_bsad (
     documento_id VARCHAR(10) NOT NULL,
     asignacion VARCHAR(18), -- ZUONR
     referencia VARCHAR(16), -- XBLNR
-    documento_ventas VARCHAR(10), -- VBELN: reference to the sales document (SD), same as in silver.sap_bsid
+    documento_ventas VARCHAR(10), -- VBELN
     posicion INT NOT NULL,
-    fecha_contabilizacion DATE,
-    fecha_documento DATE,
+    fecha_contabilizacion DATE, -- BUDAT
+    fecha_documento DATE, -- BLDAT
     fecha_registro_sistema DATE, -- CPUDT
-    fecha_compensacion DATE,
-    documento_compensacion VARCHAR(10),
-    ejercicio_compensacion INT, -- AUGGJ: fiscal year of documento_compensacion - AUGBL gets reassigned every fiscal year, so without this field the same documento_compensacion number could correspond to different settlements in different years. Added 2026-08-12 to be able to walk the raw-payment -> child -> invoice chain (see gold.fact_pago_factura).
-    clase_documento VARCHAR(2),
-    codigo_impuesto VARCHAR(2), -- MWSKZ: VAT code, same as in silver.sap_bsid
+    fecha_compensacion DATE, -- AUGDT
+    documento_compensacion VARCHAR(10), -- AUGBL
+    ejercicio_compensacion INT, -- AUGGJ: AUGBL numbers restart every fiscal year
+    clase_documento VARCHAR(2), -- BLART
+    codigo_impuesto VARCHAR(2), -- MWSKZ
     debe_haber CHAR(1), -- SHKZG
-    clave_contabilizacion VARCHAR(2), -- BSCHL: SAP posting key. Added 2026-09-03 (fact_aplicacion v2, see DESIGN.md): decides the role of an AB line (07/17 at $0 = clearing anchor, 17 with amount = credit re-applied, 15 = credit balance from pool account), separates the DZ virgin (11) from a referenced payment (15) and from the child mirror (08), and is the only signal of an FB08 reversal (paired keys 11<->02, 15<->05, 01<->12) since XSTOV is blank on every row. It reached the live server through a one-time ALTER + year-chunked backfill from bronze (script retired 2026-09-14, kept in git history) - re-running this file would DROP the table.
-    fecha_vencimiento DATE, -- ZFBDT: kept from bsid to be able to measure late payments (fecha_compensacion - fecha_vencimiento)
-    monto_moneda_local DECIMAL(15,2),
-    monto_moneda_doc DECIMAL(15,2),
-    moneda VARCHAR(5),
-    condicion_pago VARCHAR(4),
+    clave_contabilizacion VARCHAR(2), -- BSCHL: 11 deposit, 15 payment, 08 mirror, 02/05 reversal
+    fecha_vencimiento DATE, -- ZFBDT + ZBD1T
+    monto_moneda_local DECIMAL(15,2), -- DMBTR
+    monto_moneda_doc DECIMAL(15,2), -- WRBTR
+    moneda VARCHAR(5), -- WAERS
+    condicion_pago VARCHAR(4), -- ZTERM
     dias_plazo DECIMAL(15,2), -- ZBD1T
-    sgtxt VARCHAR(50), -- SGTXT: line item text. 'Asignación Aut. Deposito' identifies the raw payment (the original bank deposit before being applied to invoices) - see gold.fact_pago_factura.
-    factura_referencia_documento VARCHAR(10), -- REBZG: invoice document this line directly references (native SAP field) - added 2026-08-13, much more precise than the shared documento_compensacion for tying a payment/credit note/debit note/return/adjustment to ITS specific invoice when the same compensation group bundles several invoices and several applications (see gold.fact_aplicacion_pagos).
-    factura_referencia_ejercicio INT, -- REBZJ: fiscal year of factura_referencia_documento
-    factura_referencia_posicion INT, -- REBZZ: line item of factura_referencia_documento
-
-    -- Dunning at the line-item level
+    sgtxt VARCHAR(50), -- SGTXT
+    factura_referencia_documento VARCHAR(10), -- REBZG ('V' = no invoice reference)
+    factura_referencia_ejercicio INT, -- REBZJ
+    factura_referencia_posicion INT, -- REBZZ
     area_reclamacion              VARCHAR(2), -- MABER
     nivel_reclamacion             CHAR(1),    -- MANST
     clave_reclamacion_legal       CHAR(1),    -- MSCHL
     bloqueo_reclamacion_temporal  CHAR(1),    -- MANSP
     fecha_ultima_reclamacion      DATE,       -- MADAT
-
     fecha_carga DATETIME DEFAULT GETDATE(),
     CONSTRAINT PK_silver_sap_bsad PRIMARY KEY (mandante, sociedad, cliente_id, ejercicio, documento_id, posicion)
 );
 
--- Added 2026-09-07. gold's child-document rule and second-hop chains correlate against bsad
--- BY documento_compensacion, which the PK does not cover. Without this index the plan was
--- not stable: gold.load_fact_pagos ran in 6 s one morning and >7 min that afternoon with
--- the same query. FILTERED because the predicate always carries DZ and a non-null clearing
--- document (14% of the table). A filtered index is only used with ANSI_NULLS and
--- QUOTED_IDENTIFIER ON (the SSMS default); a tool that turns them off silently ignores it.
+-- Gold's child-document rule and second-hop chains look bsad up by clearing
+-- document. Filtered: only used with ANSI_NULLS and QUOTED_IDENTIFIER ON.
 CREATE NONCLUSTERED INDEX IX_sap_bsad_dz_compensacion
     ON silver.sap_bsad (documento_compensacion, clave_contabilizacion)
     WHERE clase_documento = 'DZ' AND documento_compensacion IS NOT NULL;
 
--- ==========================================================
--- 7. CUSTOMER COMPANY CODE DATA (silver.sap_knb1)
--- ==========================================================
+-- ----------------------------------------------------------------------------
+-- silver.sap_knb1: customer company code data
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('silver.sap_knb1', 'U') IS NOT NULL DROP TABLE silver.sap_knb1;
 CREATE TABLE silver.sap_knb1 (
     mandante                              VARCHAR(3)   NOT NULL,
@@ -331,7 +255,7 @@ CREATE TABLE silver.sap_knb1 (
     usuario_creacion                      VARCHAR(12),   -- ERNAM
     cuenta_mayor                          VARCHAR(10),   -- AKONT (reconciliation account)
     clave_orden_partidas                  VARCHAR(3),    -- ZUAWA
-    grupo_planificacion_tesoreria         VARCHAR(10),   -- FDGRV (widened from VARCHAR(4) to VARCHAR(10): caused a "String or binary data would be truncated" error when running silver.load_silver, bronze.sap_knb1.FDGRV is NVARCHAR(10))
+    grupo_planificacion_tesoreria         VARCHAR(10),   -- FDGRV
     condicion_pago                        VARCHAR(4),    -- ZTERM
     indicador_intereses                   VARCHAR(2),    -- VZSKZ
     fecha_ultima_liquidacion_intereses     DATE,          -- ZINDT
@@ -344,33 +268,14 @@ CREATE TABLE silver.sap_knb1 (
     cuenta_pagador_alterno                VARCHAR(10),   -- KNRZE
     banco_propio                          VARCHAR(5),    -- HBKID
     vias_pago                             VARCHAR(10),   -- ZWELS
-    flag_compensacion_cliente_proveedor   BIT,           -- XZVER: 88.6% of rows are 'X', real variation (vs. 11.4% blank)
+    flag_compensacion_cliente_proveedor   BIT,           -- XZVER
     fecha_carga                           DATETIME DEFAULT GETDATE(),
     CONSTRAINT PK_silver_sap_knb1 PRIMARY KEY (mandante, sociedad, cliente_id)
 );
 
--- ==========================================================
--- NOTE: bronze.sap_knb1.QSSKZ DOES NOT EXIST - the "indicador_retencion"
--- column (mapped here from QSSKZ) was defined in earlier versions of this
--- file, but QSSKZ was never a real column of bronze.sap_knb1 (see
--- ddl_bronze.sql, the table doesn't have it). sp_load_silver.sql referenced
--- that nonexistent column in its SELECT - never caught because
--- silver.load_silver had never run successfully. The column was removed
--- from silver.
---
--- NOTE: bronze.sap_knb1 columns deliberately NOT included in silver:
--- BUSAB, ZAHLS, VRBKZ, VLIBB, VRSNR, CESSION_KZ, KVERM -> 0% (or practically
---   0%, BUSAB with 1 of 24,244) of rows have data.
--- VRSPR -> 100% of rows at 0 (constant), no real variation.
--- VERDT -> 100% of rows at '00000000' (default), no real variation.
---   (The three credit-insurance fields VRBKZ/VRSPR/VRSNR/VERDT at 0% or
---   constant are consistent with each other: the credit insurance module
---   isn't in use for this SAP client.)
--- ==========================================================
-
--- ==========================================================
--- 8. CUSTOMER DUNNING DATA (silver.sap_knb5)
--- ==========================================================
+-- ----------------------------------------------------------------------------
+-- silver.sap_knb5: customer dunning data
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('silver.sap_knb5', 'U') IS NOT NULL DROP TABLE silver.sap_knb5;
 CREATE TABLE silver.sap_knb5 (
     mandante                    VARCHAR(3)   NOT NULL,
@@ -384,90 +289,22 @@ CREATE TABLE silver.sap_knb5 (
     CONSTRAINT PK_silver_sap_knb5 PRIMARY KEY (mandante, cliente_id, sociedad, area_reclamacion)
 );
 
--- ==========================================================
--- NOTE: bronze.sap_knb5 does NOT have MANST, MSCHL, or ZTERM columns - they
--- exist in bsid/bsad (same "line-item dunning" block) but KNB5 is a
--- different, smaller table (only 11 columns: MANDT, KUNNR, BUKRS, MABER,
--- MAHNA, MANSP, MADAT, MAHNS, KNRMA, GMVDT, BUSAB). The
--- "nivel_reclamacion"/"clave_reclamacion_legal"/"condicion_pago" columns
--- (previously mapped from MANST/MSCHL/ZTERM) were removed for the same
--- reason as QSSKZ in silver.sap_knb1: they referenced columns that never
--- existed in the real bronze table, never caught because
--- silver.load_silver had never run successfully.
---
--- NOTE: real bronze.sap_knb5 columns deliberately NOT included:
--- KNRMA, GMVDT, BUSAB, MANSP -> 0% (or practically 0%, BUSAB 1 of 15,726)
---   of rows have data.
--- ==========================================================
-
--- ==========================================================
--- 9. EMPLOYEE MASTER (silver.sap_pa0001)
--- Added 2026-08-27 as the source for gold.dim_empleado (conformed
--- vendedor/gerente/analista_credito/cobrador dimension). Curated to the
--- only 5 bronze.sap_pa0001 columns any consumer in this project has ever
--- used (MANDT/PERNR/ENAME/BEGDA/ENDDA - see the "51-column full mirror"
--- note on bronze.sap_pa0001 in ddl_bronze.sql) - unlike bronze's
--- exact-mirror philosophy, silver curates to what's actually used, same as
--- every other table in this file.
--- FILTERED TO ENDDA = '99991231', same filter silver.sap_knvp already
--- applies ad-hoc when resolving nombre_interlocutor. CONFIRMED 2026-08-27
--- with real data: this filter is currently a NO-OP - 100% of
--- bronze.sap_pa0001 rows (MANDT='400') have ENDDA='99991231', and 0 PERNR
--- values have 2+ rows. This SAP extract simply doesn't delimit old
--- infotype 0001 records when they're superseded (no real historical
--- versioning captured here, despite BEGDA/ENDDA looking like a temporal
--- range) - there's no field anywhere on this table that flags "is this the
--- current record" (checked, doesn't exist). The filter is kept anyway as a
--- forward-looking safety net: if this data source ever starts properly
--- end-dating old records, the filter starts doing real work with zero code
--- changes - and it's free today since it excludes nothing. If a future
--- session finds 2+ rows for the same PERNR (this WOULD break the PK below
--- and fail the load), don't reach for ENDDA - re-check with the same query
--- used to confirm this note, then pick the latest by BEGDA
--- (ROW_NUMBER() OVER (PARTITION BY MANDT, PERNR ORDER BY BEGDA DESC) = 1),
--- same tiebreak pattern gold.vw_cliente_canal_estatus already uses for
--- vendedor/ejecutivo/gerente.
--- id_empleado (PERNR) is NOT zero-stripped, unlike cliente_id - kept in its
--- raw SAP format to match silver.sap_knvp.id_interlocutor (also raw PERNR,
--- see sp_load_silver.sql) so the two can join with no transformation.
--- ==========================================================
+-- ----------------------------------------------------------------------------
+-- silver.sap_pa0001: employees, current record only
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('silver.sap_pa0001', 'U') IS NOT NULL DROP TABLE silver.sap_pa0001;
 CREATE TABLE silver.sap_pa0001 (
     mandante                VARCHAR(3)   NOT NULL,
-    id_empleado             VARCHAR(8)   NOT NULL,  -- PERNR, raw format (not zero-stripped)
+    id_empleado             VARCHAR(8)   NOT NULL,  -- PERNR, not zero-stripped: matches sap_knvp.id_interlocutor
     nombre                  VARCHAR(40),             -- ENAME
     fecha_carga             DATETIME DEFAULT GETDATE(),
     CONSTRAINT PK_silver_sap_pa0001 PRIMARY KEY (mandante, id_empleado)
 );
 GO
 
--- ==========================================================
--- 11. ACCOUNTING DOCUMENT HEADER (silver.sap_bkpf)
--- Added 2026-09-11. BSAD/BSID carry the payment LINES; this is the DOCUMENT.
---
--- WHY IT EXISTS: without the header there is no way to know which document
--- reverses which. Reversals had to be matched by guessing on customer+amount+
--- assignment: 73 of 188 clave-05 reversals came out ambiguous and 46 had no
--- match at all. documento_reversa (STBLG) makes the link exact.
---
--- It also settles what the posting keys mean, with evidence instead of
--- inference: crossing transaccion (TCODE) against the line's posting key on
--- August 2026 showed all 10,553 key-11 lines come from OS_APPLICATION (the
--- automatic deposit program), while key 15 comes from FBZ1/FB05 (manual entry
--- / entry with clearing) and every reversal from FB08.
---
--- Only a curated subset of BKPF's 111 columns is kept - silver is cleaned, not
--- a raw copy. Measured population over the 1,259,262 loaded rows:
---     usuario 100%   transaccion 99.4%   texto_cabecera 50.6%   referencia 50%
---     documento_reversa 0.66% (8,261)    motivo_reversa 4,120   XSTOV 0
--- XSTOV is blank on every row (same as in BSAD - see clave_contabilizacion's
--- note above), but XREVERSAL is filled on exactly the same 8,261 rows that
--- carry STBLG, so indicador_reversa tells which SIDE of the pair a document is
--- on without having to follow the link.
---
--- SCOPE: bronze.sap_bkpf only holds BLART = 'DZ' (see its note in
--- ddl_bronze.sql), so this table inherits that scope.
--- ==========================================================
+-- ----------------------------------------------------------------------------
+-- silver.sap_bkpf: document headers (DZ only)
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('silver.sap_bkpf', 'U') IS NOT NULL
     DROP TABLE silver.sap_bkpf;
 GO
@@ -482,72 +319,25 @@ CREATE TABLE silver.sap_bkpf (
     fecha_contabilizacion   DATE,         -- BUDAT
     fecha_registro_sistema  DATE,         -- CPUDT
     mes                     VARCHAR(2),   -- MONAT
-    usuario                 VARCHAR(12),  -- USNAM: who posted it
-    transaccion             VARCHAR(20),  -- TCODE: FBZ1 incoming payment, FB05 post with clearing,
-                                          --        FB08 reverse, FBZ2 outgoing payment,
-                                          --        OS_APPLICATION automatic deposit assignment
+    usuario                 VARCHAR(12),  -- USNAM
+    transaccion             VARCHAR(20),  -- TCODE: OS_APPLICATION, FBZ1, FB05, FB08, FBZ2
     referencia              VARCHAR(16),  -- XBLNR
-    texto_cabecera          VARCHAR(25),  -- BKTXT: header text. Half the documents have it; worth
-                                          --        checking as a replacement for the line-level
-                                          --        sgtxt filter, which loses deposits with empty text.
-    documento_reversa       VARCHAR(10),  -- STBLG: THE point of this table
+    texto_cabecera          VARCHAR(25),  -- BKTXT
+    documento_reversa       VARCHAR(10),  -- STBLG: the other document of a reversal pair
     ejercicio_reversa       INT,          -- STJAH
-    motivo_reversa          VARCHAR(2),   -- STGRD: filled on only half the reversals
-    indicador_reversa       VARCHAR(1),   -- XREVERSAL: which side of the pair this document is
+    motivo_reversa          VARCHAR(2),   -- STGRD
+    indicador_reversa       VARCHAR(1),   -- XREVERSAL: 1 = reversed original, 2 = reversal
     moneda                  VARCHAR(5),   -- WAERS
-
     fecha_carga             DATETIME DEFAULT GETDATE(),
     CONSTRAINT PK_silver_sap_bkpf PRIMARY KEY (mandante, sociedad, ejercicio, documento_id)
 );
 GO
-PRINT 'Table silver.sap_bkpf created successfully.';
-GO
 
--- ==========================================================
--- 12. G/L LINE ITEMS, CASH ACCOUNTS - CLEARED (silver.sap_bsas)
--- 13. G/L LINE ITEMS, CASH ACCOUNTS - OPEN    (silver.sap_bsis)
--- Added 2026-09-14. sap_bsad/sap_bsid carry the CUSTOMER side of a payment; these
--- carry the BANK side: which account the money actually landed in.
---
--- WHY THEY EXIST: the report the company uses to state monthly cash collections is
--- built on these lines, not on customer lines - reproduced from bronze to the cent for
--- July 2026. They also explain why gold.fact_pagos runs above that report every month:
--- online payments settle the customer debt but sit in the payment-gateway transit
--- accounts, which the report never reads.
---
--- SCOPE: inherited from bronze (cash accounts, HKONT 111xxx/113xxx). The MANDT = '400'
--- filter lives here, as everywhere in silver.
---
--- CURATED, NOT COPIED: 23 of the 82 bronze columns. Measured over 2026 (305,181 BSAS
--- and 489,691 BSIS rows):
---   - 58 columns carry nothing: empty, all zeros, or one value everywhere (cost
---     objects, tax, funds management, segment, baseline date...).
---   - BSCHL is left out ON PURPOSE. On G/L lines it only takes 40/50, and 40 = S and
---     50 = H on every row of both tables: a copy of debe_haber. Not so in sap_bsad,
---     where the posting key means much more and is kept.
---   - DMBE2/DMBE3/PSWBT are the same amount in other currencies/ledgers; PSWSL is a
---     constant.
---
--- SAME COLUMNS IN BOTH TABLES, deliberately, as with sap_bsid/sap_bsad: gold can UNION
--- them into "every cash line, open or cleared" with no special cases. The clearing
--- columns are simply always NULL in sap_bsis.
---
--- cuenta_mayor KEEPS its leading zeros, unlike cliente_id. It is the same kind of value
--- as sap_knb1.cuenta_mayor, which keeps them, and one column name should mean one format
--- across the layer. Stripping for display belongs in gold.
---
--- AMOUNTS ARE NEVER SIGNED, the same trap as bsad/bsid: apply debe_haber. On a cash
--- account S (debit) is money coming IN.
---
--- indicador_partidas_abiertas (XOPVW) decides how sap_bsis is loaded - see section 6d
--- of sp_load_silver.sql. It is an attribute of the ACCOUNT, verified: no account has
--- mixed values. Only the NC/ND/CH clearing sub-accounts of the banks carry it, and only
--- their lines ever get cleared: no other cash account appears in BSAS at all.
---
--- indicador_compensacion_revertida (XRAGL): the line had its clearing reset at some
--- point. 57,003 BSAS lines carry it. Re-clearing is routine here, which is why the
--- clearing fields cannot be part of the key (see THE KEY in ddl_bronze.sql).
--- ==========================================================
+-- ----------------------------------------------------------------------------
+-- silver.sap_bsas / silver.sap_bsis: cleared and open G/L lines, cash accounts
+-- Same columns in both, so gold can UNION them. cuenta_mayor keeps its
+-- leading zeros. On a cash account S (debit) is money in.
+-- ----------------------------------------------------------------------------
 IF OBJECT_ID('silver.sap_bsas', 'U') IS NOT NULL
     DROP TABLE silver.sap_bsas;
 GO
@@ -555,41 +345,36 @@ GO
 CREATE TABLE silver.sap_bsas (
     mandante                          VARCHAR(3)  NOT NULL,
     sociedad                          VARCHAR(4)  NOT NULL,
-    cuenta_mayor                      VARCHAR(10) NOT NULL, -- HKONT: leading zeros KEPT, same as sap_knb1.cuenta_mayor
+    cuenta_mayor                      VARCHAR(10) NOT NULL, -- HKONT
     ejercicio                         INT         NOT NULL, -- GJAHR
     documento_id                      VARCHAR(10) NOT NULL, -- BELNR
     posicion                          INT         NOT NULL, -- BUZEI
     mes                               VARCHAR(2),           -- MONAT
     clase_documento                   VARCHAR(2),           -- BLART
-    fecha_contabilizacion             DATE,                 -- BUDAT: the date the company cash report buckets by
+    fecha_contabilizacion             DATE,                 -- BUDAT
     fecha_documento                   DATE,                 -- BLDAT
-    fecha_valor                       DATE,                 -- VALUT: value date - when the bank actually moves the money
-    debe_haber                        CHAR(1),              -- SHKZG: on a cash account S (debit) = money IN
-    monto_moneda_local                DECIMAL(15,2),        -- DMBTR: NEVER signed, same trap as bsad - apply debe_haber
-    monto_moneda_doc                  DECIMAL(15,2),        -- WRBTR: differs from DMBTR only on USD/EUR lines
+    fecha_valor                       DATE,                 -- VALUT
+    debe_haber                        CHAR(1),              -- SHKZG
+    monto_moneda_local                DECIMAL(15,2),        -- DMBTR
+    monto_moneda_doc                  DECIMAL(15,2),        -- WRBTR
     moneda                            VARCHAR(5),           -- WAERS
-    asignacion                        VARCHAR(18),          -- ZUONR: editable afterwards in FB02
+    asignacion                        VARCHAR(18),          -- ZUONR
     referencia                        VARCHAR(16),          -- XBLNR
-    sgtxt                             VARCHAR(50),          -- SGTXT: same name as in sap_bsad; editable in FB02
-    fecha_compensacion                DATE,                 -- AUGDT: always NULL in sap_bsis
-    documento_compensacion            VARCHAR(10),          -- AUGBL: always NULL in sap_bsis
-    ejercicio_compensacion            INT,                  -- AUGGJ: BSIS stores '0000' -> NULL here
+    sgtxt                             VARCHAR(50),          -- SGTXT
+    fecha_compensacion                DATE,                 -- AUGDT
+    documento_compensacion            VARCHAR(10),          -- AUGBL
+    ejercicio_compensacion            INT,                  -- AUGGJ ('0000' -> NULL)
     indicador_partidas_abiertas       VARCHAR(1),           -- XOPVW: 'X' = account whose lines get cleared
-    indicador_compensacion_revertida  VARCHAR(1),           -- XRAGL: 'X' = this line had its clearing reset once
-
+    indicador_compensacion_revertida  VARCHAR(1),           -- XRAGL: the clearing was reset once
     fecha_carga                       DATETIME DEFAULT GETDATE(),
     CONSTRAINT PK_silver_sap_bsas PRIMARY KEY (mandante, sociedad, cuenta_mayor, ejercicio, documento_id, posicion)
 );
 GO
 
--- gold joins these to sap_bsad/sap_bkpf by document; the PK leads with the account and
--- cannot serve that. A missing index of exactly this kind on sap_bsad is what once made
--- the gold procs crawl.
+-- The PK leads with the account; gold looks lines up by document and by date.
 CREATE NONCLUSTERED INDEX IX_silver_sap_bsas_documento ON silver.sap_bsas (documento_id, ejercicio);
 CREATE NONCLUSTERED INDEX IX_silver_sap_bsas_fecha ON silver.sap_bsas (fecha_contabilizacion)
     INCLUDE (cuenta_mayor, clase_documento, debe_haber, monto_moneda_local);
-GO
-PRINT 'Table silver.sap_bsas created successfully.';
 GO
 
 IF OBJECT_ID('silver.sap_bsis', 'U') IS NOT NULL
@@ -599,39 +384,33 @@ GO
 CREATE TABLE silver.sap_bsis (
     mandante                          VARCHAR(3)  NOT NULL,
     sociedad                          VARCHAR(4)  NOT NULL,
-    cuenta_mayor                      VARCHAR(10) NOT NULL, -- HKONT: leading zeros KEPT, same as sap_knb1.cuenta_mayor
+    cuenta_mayor                      VARCHAR(10) NOT NULL, -- HKONT
     ejercicio                         INT         NOT NULL, -- GJAHR
     documento_id                      VARCHAR(10) NOT NULL, -- BELNR
     posicion                          INT         NOT NULL, -- BUZEI
     mes                               VARCHAR(2),           -- MONAT
     clase_documento                   VARCHAR(2),           -- BLART
-    fecha_contabilizacion             DATE,                 -- BUDAT: the date the company cash report buckets by
+    fecha_contabilizacion             DATE,                 -- BUDAT
     fecha_documento                   DATE,                 -- BLDAT
-    fecha_valor                       DATE,                 -- VALUT: value date - when the bank actually moves the money
-    debe_haber                        CHAR(1),              -- SHKZG: on a cash account S (debit) = money IN
-    monto_moneda_local                DECIMAL(15,2),        -- DMBTR: NEVER signed, same trap as bsad - apply debe_haber
-    monto_moneda_doc                  DECIMAL(15,2),        -- WRBTR: differs from DMBTR only on USD/EUR lines
+    fecha_valor                       DATE,                 -- VALUT
+    debe_haber                        CHAR(1),              -- SHKZG
+    monto_moneda_local                DECIMAL(15,2),        -- DMBTR
+    monto_moneda_doc                  DECIMAL(15,2),        -- WRBTR
     moneda                            VARCHAR(5),           -- WAERS
-    asignacion                        VARCHAR(18),          -- ZUONR: editable afterwards in FB02
+    asignacion                        VARCHAR(18),          -- ZUONR
     referencia                        VARCHAR(16),          -- XBLNR
-    sgtxt                             VARCHAR(50),          -- SGTXT: same name as in sap_bsad; editable in FB02
-    fecha_compensacion                DATE,                 -- AUGDT: always NULL in sap_bsis
-    documento_compensacion            VARCHAR(10),          -- AUGBL: always NULL in sap_bsis
-    ejercicio_compensacion            INT,                  -- AUGGJ: BSIS stores '0000' -> NULL here
-    indicador_partidas_abiertas       VARCHAR(1),           -- XOPVW: 'X' = account whose lines get cleared
-    indicador_compensacion_revertida  VARCHAR(1),           -- XRAGL: 'X' = this line had its clearing reset once
-
+    sgtxt                             VARCHAR(50),          -- SGTXT
+    fecha_compensacion                DATE,                 -- AUGDT, always NULL here
+    documento_compensacion            VARCHAR(10),          -- AUGBL, always NULL here
+    ejercicio_compensacion            INT,                  -- AUGGJ, always NULL here
+    indicador_partidas_abiertas       VARCHAR(1),           -- XOPVW
+    indicador_compensacion_revertida  VARCHAR(1),           -- XRAGL
     fecha_carga                       DATETIME DEFAULT GETDATE(),
     CONSTRAINT PK_silver_sap_bsis PRIMARY KEY (mandante, sociedad, cuenta_mayor, ejercicio, documento_id, posicion)
 );
 GO
 
--- gold joins these to sap_bsad/sap_bkpf by document; the PK leads with the account and
--- cannot serve that. A missing index of exactly this kind on sap_bsad is what once made
--- the gold procs crawl.
 CREATE NONCLUSTERED INDEX IX_silver_sap_bsis_documento ON silver.sap_bsis (documento_id, ejercicio);
 CREATE NONCLUSTERED INDEX IX_silver_sap_bsis_fecha ON silver.sap_bsis (fecha_contabilizacion)
     INCLUDE (cuenta_mayor, clase_documento, debe_haber, monto_moneda_local);
-GO
-PRINT 'Table silver.sap_bsis created successfully.';
 GO
