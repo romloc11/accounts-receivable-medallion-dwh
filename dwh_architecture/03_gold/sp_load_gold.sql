@@ -155,12 +155,12 @@ BEGIN
             k.rfc,
             CASE
                 -- Payment-gateway clearing accounts that move money: first.
+                -- OPENPAY is an exact match because a real customer is named OPENPAY SAPI DE CV.
                 WHEN k.nombre LIKE 'KUSHKY%' OR k.nombre LIKE 'CONEKTA%'
+                     OR k.nombre = 'OPENPAY INGRESOS TRANSITORIA'
                     THEN 'TRANSITORIA'
-                -- Before the RFC rules: these accounts span every RFC case. OPENPAY is an
-                -- exact match because a real customer is named OPENPAY SAPI DE CV.
-                WHEN k.nombre = 'OPENPAY INGRESOS TRANSITORIA'
-                     OR k.nombre LIKE 'MERCADO LIBRE%' OR k.nombre LIKE 'MERCADO PAGO%'
+                -- Before the RFC rules: these accounts span every RFC case.
+                WHEN k.nombre LIKE 'MERCADO LIBRE%' OR k.nombre LIKE 'MERCADO PAGO%'
                      OR k.nombre LIKE '%AMAZON%' OR k.nombre LIKE 'CLAROSHOP%'
                     THEN 'MARKETPLACE'
                 WHEN kk.etiqueta_credito = 'FILIAL' THEN 'FILIAL'
