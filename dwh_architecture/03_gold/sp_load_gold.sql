@@ -884,6 +884,13 @@ BEGIN
                 WHERE i.mandante = b.mandante AND i.sociedad = b.sociedad
                   AND i.cliente_id = b.cliente_id AND i.ejercicio = b.ejercicio
                   AND i.documento_id = b.documento_id AND i.posicion = b.posicion)
+          -- Gateway settlements (TRANSITORIA customers) duplicate the customer's own payment,
+          -- already counted on the gateway clearing account; excluded cash accounts are listed
+          -- in gold.cuenta_mayor_excluida.
+          AND NOT EXISTS (SELECT 1 FROM gold.dim_cliente x
+                          WHERE x.cliente_id = b.cliente_id AND x.tipo_cliente = 'TRANSITORIA')
+          AND NOT EXISTS (SELECT 1 FROM gold.cuenta_mayor_excluida x
+                          WHERE x.cuenta_mayor = cta.cuenta_mayor)
         OPTION (RECOMPILE);
         SET @rows = @@ROWCOUNT;
         CREATE UNIQUE CLUSTERED INDEX ix_pag ON #pag(sociedad, cliente_id, ejercicio, documento_id, posicion);
@@ -1008,6 +1015,11 @@ BEGIN
                 WHERE h.mandante = '400' AND h.clase_documento = 'DZ'
                   AND h.clave_contabilizacion = '11'
                   AND h.documento_compensacion = b.documento_id)
+          -- Same exclusions as the cleared side.
+          AND NOT EXISTS (SELECT 1 FROM gold.dim_cliente x
+                          WHERE x.cliente_id = b.cliente_id AND x.tipo_cliente = 'TRANSITORIA')
+          AND NOT EXISTS (SELECT 1 FROM gold.cuenta_mayor_excluida x
+                          WHERE x.cuenta_mayor = cta.cuenta_mayor)
         OPTION (RECOMPILE);
         SET @rows = @@ROWCOUNT;
         CREATE UNIQUE CLUSTERED INDEX ix_abi ON #abi(sociedad, cliente_id, ejercicio, documento_id, posicion);
