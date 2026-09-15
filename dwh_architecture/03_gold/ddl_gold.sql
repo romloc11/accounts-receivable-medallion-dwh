@@ -741,6 +741,12 @@ cobertura observada y pasa a ser exacta.
 --                         fecha_compensacion NULL es la marca. Se recargan completos en cada
 --                         corrida; el dia que se aplican salen de aqui y vuelven por la ventana.
 -- Reset FBRA (linea en bsad y en bsid a la vez): GANA BSID, es el estado de hoy.
+--
+-- REVERSAS (desde 2026-09-14): la linea de una reversa FB08 entra, con su monto negativo,
+-- cuando es el espejo de una linea contada (mismo cliente, posicion y monto contrario). Antes
+-- la regla de documento hijo la tiraba, y fact_pagos contaba el deposito sin restar su
+-- reversa: -$14.5M en 2022->2026. La reversa de algo NO contado no entra, aunque traiga el
+-- texto (2 lineas, -$430,532.18, que antes restaban dinero nunca sumado).
 -- ========================================================================================
 -- IS NULL, no IS NOT NULL: si ya existe se respeta. Ver la nota de la cabecera.
 IF OBJECT_ID('gold.fact_pagos', 'U') IS NULL

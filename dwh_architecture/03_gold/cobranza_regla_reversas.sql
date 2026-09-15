@@ -13,6 +13,9 @@
    --------------------------------
    fact_pagos filtra por el texto de la linea (sgtxt = 'Asignación Aut. Deposito') y
    NUNCA resta una reversa. Las dos cosas se arreglan aqui:
+   (Nota 2026-09-14: gold.fact_pagos ya hace las dos cosas - la clave 11 entra sin texto
+   y resta la reversa de una linea contada, linea por linea. Este archivo queda como la
+   medicion original que llevo a esos cambios.)
 
      - el texto era un proxy de la clave 11: acierta el 99% de las veces en esa clave,
        pero solo el 19% en las lineas 15 que entran solas. Con BKPF cargado ya no hay

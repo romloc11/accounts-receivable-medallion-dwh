@@ -968,7 +968,8 @@ Aparecen en varios procs; si se cambian, hay que cambiarlos en todos:
   2. pagos: DZ + (texto 'Asignacion Aut. Deposito', o clave 11 con texto VACIO),
      EXCLUYENDO lineas de documento hijo. La clave 11 sin texto entra desde el
      2026-09-14 - ver el comentario en gold.load_fact_pagos. Compensados (bsad, sin
-     resets FBRA) y abiertos (bsid) con la misma regla
+     resets FBRA) y abiertos (bsid) con la misma regla. Las reversas FB08 de una linea
+     contada se restan, linea por linea (2026-09-14)
   3. facturas: debe_haber='S', clase F% o D1, EXCLUYENDO resets FBRA del lado compensado
 ========================================================================================
 */
@@ -1047,7 +1048,7 @@ AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;   -- ver "ATOMICIDAD" en la cabecera
-    DECLARE @t0 DATETIME = GETDATE(), @n INT, @lote INT, @recomp INT, @n_abie INT, @descomp INT;
+    DECLARE @t0 DATETIME = GETDATE(), @n INT, @lote INT, @recomp INT, @n_abie INT, @descomp INT, @n_rev INT, @n_rev_fuera INT;
 
     IF @fecha_desde IS NULL
         SET @fecha_desde = DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()) - 1, 0);
@@ -1143,6 +1144,104 @@ BEGIN
                   AND i.documento_id = b.documento_id AND i.posicion = b.posicion)
         OPTION (RECOMPILE);   -- ver "EL DEFAULT NULL" en la cabecera
         CREATE UNIQUE CLUSTERED INDEX ix_pag ON #pag(sociedad, cliente_id, ejercicio, documento_id, posicion);
+
+        /* REVERSAS (agregado 2026-09-14, decision del usuario). Una reversa FB08 de un pago
+           contado se RESTA, linea por linea. Es la regla de cobranza_regla_reversas.sql:
+           se resta una reversa solo si lo que anula fue contado.
+           Por que hacia falta: FB08 compensa el documento original contra la reversa, asi que
+           la reversa de un deposito "compensa una clave 11" y la condicion de documento hijo
+           de arriba la tiraba; ademas trae clave 02 y casi siempre texto vacio. Resultado:
+           fact_pagos contaba el deposito y nunca su reversa, y el reporte los deja en cero.
+           Caso que lo destapo: un deposito automatico de $9,658.07 y su reversa el mismo dia,
+           julio 2026 - el reporte traia los dos, fact_pagos solo el deposito.
+           POR LINEA, NO POR DOCUMENTO: la reversa trae el espejo de TODAS las lineas del
+           original, contadas o no, y algunas ya estan en #pag por su texto. Meter el documento
+           completo sumaba dinero de mas (medido: 30 pares descuadrados, +$337K en un solo par
+           de junio 2024). Entra solo el espejo de una linea contada: mismo cliente, misma
+           posicion, monto con signo contrario, y que no este ya en #pag.
+           Medido 2022->hoy: 1,538 pares depositos/reversa, TODAS las lineas de reversa con
+           exactamente un espejo; con esta regla los 1,538 quedan en neto 0 al centavo.
+           Entran 564 lineas / -$14,512,695.16 (jul 2026 -$35,836.79, ago -$42,879.33).
+           La reversa se compensa el mismo dia que el original (1,538 de 1,538), asi que cae en
+           la misma ventana. indicador_reversa = '2' es el lado reversa del par (XREVERSAL): en
+           silver.sap_bkpf son exactamente los documentos FB08 que anulan otro.
+           El join a bkpf va DESDE #pag: bkpf no tiene indice por documento_reversa, y asi la
+           linea de bsad se busca por su llave completa. */
+        INSERT INTO #pag (
+            sociedad, cliente_id, ejercicio, documento_id, posicion,
+            documento_compensacion, ejercicio_compensacion,
+            fecha_documento, fecha_contabilizacion, fecha_compensacion,
+            monto, texto, clave_contabilizacion, cuenta_mayor,
+            cliente_comercial_sk, cliente_credito_sk)
+        SELECT
+            b.sociedad, b.cliente_id, b.ejercicio, b.documento_id, b.posicion,
+            b.documento_compensacion, b.ejercicio_compensacion,
+            b.fecha_documento, b.fecha_contabilizacion, b.fecha_compensacion,
+            CASE WHEN b.debe_haber = 'H' THEN b.monto_moneda_local
+                 ELSE -1 * b.monto_moneda_local END,
+            b.sgtxt, b.clave_contabilizacion,
+            cta.cuenta_mayor,
+            dcc.id_surrogate, dck.id_surrogate
+        FROM #pag o
+        JOIN silver.sap_bkpf k
+               ON  k.mandante = '400' AND k.sociedad = o.sociedad
+               AND k.ejercicio_reversa = o.ejercicio AND k.documento_reversa = o.documento_id
+               AND k.indicador_reversa = '2'
+        JOIN silver.sap_bsad b
+               ON  b.mandante = '400' AND b.sociedad = o.sociedad AND b.cliente_id = o.cliente_id
+               AND b.ejercicio = k.ejercicio AND b.documento_id = k.documento_id
+               AND b.posicion = o.posicion
+               AND b.clase_documento = 'DZ'
+               AND o.monto = CASE WHEN b.debe_haber = 'H' THEN -1 * b.monto_moneda_local
+                                  ELSE b.monto_moneda_local END
+        LEFT JOIN (SELECT documento_id, ejercicio, MIN(cuenta_mayor) AS cuenta_mayor
+                   FROM (SELECT documento_id, ejercicio, cuenta_mayor FROM silver.sap_bsas WHERE clase_documento = 'DZ'
+                         UNION ALL
+                         SELECT documento_id, ejercicio, cuenta_mayor FROM silver.sap_bsis WHERE clase_documento = 'DZ') e
+                   GROUP BY documento_id, ejercicio) cta
+               ON cta.documento_id = b.documento_id AND cta.ejercicio = b.ejercicio
+        LEFT JOIN gold.dim_cliente_comercial dcc
+               ON dcc.cliente_id = b.cliente_id
+              AND b.fecha_contabilizacion >= dcc.fecha_inicio_vigencia
+              AND (dcc.fecha_fin_vigencia IS NULL OR b.fecha_contabilizacion <= dcc.fecha_fin_vigencia)
+        LEFT JOIN gold.dim_cliente_credito dck
+               ON dck.cliente_id = b.cliente_id
+              AND b.fecha_contabilizacion >= dck.fecha_inicio_vigencia
+              AND (dck.fecha_fin_vigencia IS NULL OR b.fecha_contabilizacion <= dck.fecha_fin_vigencia)
+        -- Ya contada por su texto: no se mete dos veces.
+        WHERE NOT EXISTS (SELECT 1 FROM #pag x
+                          WHERE x.sociedad = b.sociedad AND x.cliente_id = b.cliente_id
+                            AND x.ejercicio = b.ejercicio AND x.documento_id = b.documento_id
+                            AND x.posicion = b.posicion)
+          -- Mismo criterio FBRA que arriba: si volvio a bsid, gana bsid.
+          AND NOT EXISTS (SELECT 1 FROM silver.sap_bsid i
+                          WHERE i.mandante = b.mandante AND i.sociedad = b.sociedad
+                            AND i.cliente_id = b.cliente_id AND i.ejercicio = b.ejercicio
+                            AND i.documento_id = b.documento_id AND i.posicion = b.posicion)
+        OPTION (RECOMPILE);
+        SET @n_rev = @@ROWCOUNT;
+
+        /* LA OTRA MITAD DE LA REGLA: una reversa que YA estaba en #pag por su texto, pero cuyo
+           espejo en el original NO se conto, restaba dinero que nunca se sumo. Sale.
+           Medido 2022->hoy: 2 lineas, -$430,532.18. En los dos casos el original es una clave
+           15 capturada a mano (FBZ1/FB05) SIN texto -la regla de texto no la cuenta- y la
+           reversa FB08 clave 05 si trae 'Asignacion Aut. Deposito'. El mayor, -$428,552.29 en
+           noviembre 2025.
+           Depende de que original y reversa caigan en la MISMA ventana: FB08 compensa el
+           original contra la reversa, asi que comparten fecha de compensacion por construccion
+           (medido: 1,540 pares de 1,540). */
+        DELETE x
+        FROM   #pag x
+        JOIN   silver.sap_bkpf k
+               ON  k.mandante = '400' AND k.sociedad = x.sociedad
+               AND k.ejercicio = x.ejercicio AND k.documento_id = x.documento_id
+               AND k.indicador_reversa = '2'
+        WHERE  NOT EXISTS (SELECT 1 FROM #pag o
+                           WHERE o.sociedad = x.sociedad AND o.cliente_id = x.cliente_id
+                             AND o.ejercicio = k.ejercicio_reversa AND o.documento_id = k.documento_reversa
+                             AND o.posicion = x.posicion AND o.monto = -1 * x.monto)
+        OPTION (RECOMPILE);
+        SET @n_rev_fuera = @@ROWCOUNT;
 
         /* PAGOS ABIERTOS (agregado 2026-09-14, decision del usuario). Depositos que ya entraron al
            banco y todavia nadie aplica a facturas. Viven en silver.sap_bsid, no en bsad, y hasta
@@ -1273,6 +1372,8 @@ BEGIN
         COMMIT TRANSACTION;
 
         PRINT '   Filas: ' + CAST(@n AS VARCHAR(12))
+            + ' (reversas restadas: ' + CAST(@n_rev AS VARCHAR(12))
+            + ', reversas de algo no contado quitadas: ' + CAST(@n_rev_fuera AS VARCHAR(12)) + ')'
             + ' | Abiertos (bsid): ' + CAST(@n_abie AS VARCHAR(12))
             + ' | Descompensados: ' + CAST(@descomp AS VARCHAR(12))
             + ' | Recompensados rescatados: ' + CAST(@recomp AS VARCHAR(12))
